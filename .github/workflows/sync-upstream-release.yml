@@ -94,6 +94,7 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: write
+      workflows: write
     outputs:
       version: ${{ steps.version.outputs.version }}
     steps:
