@@ -151,6 +151,8 @@ celerybeat.pid
 # Environments
 .env
 .venv
+.venv-riscv64
+.venv-riscv64-test
 env/
 venv/
 ENV/
