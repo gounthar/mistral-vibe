@@ -1,0 +1,268 @@
+name: Sync Upstream Release and Build RISC-V 64
+
+on:
+  schedule:
+    - cron: "0 6 * * *" # Daily at 06:00 UTC
+  workflow_dispatch:
+    inputs:
+      force:
+        description: "Release even if versions match (retry failed builds)"
+        required: false
+        type: boolean
+        default: false
+      upstream_tag:
+        description: "Sync a specific upstream tag instead of latest"
+        required: false
+        type: string
+        default: ""
+
+concurrency:
+  group: sync-upstream-release
+  cancel-in-progress: false
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Job 1: Check if upstream has a newer release than the fork
+  # ---------------------------------------------------------------------------
+  check-upstream:
+    name: Check for new upstream release
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      new_release: ${{ steps.compare.outputs.new_release }}
+      upstream_tag: ${{ steps.compare.outputs.upstream_tag }}
+      upstream_release_body_b64: ${{ steps.compare.outputs.upstream_release_body_b64 }}
+    steps:
+      - name: Get upstream latest release
+        id: upstream
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          if [[ -n "${{ inputs.upstream_tag }}" ]]; then
+            TAG="${{ inputs.upstream_tag }}"
+            BODY="$(gh release view "$TAG" --repo mistralai/mistral-vibe --json body --jq '.body' 2>/dev/null || echo '')"
+          else
+            TAG="$(gh release view --repo mistralai/mistral-vibe --json tagName --jq '.tagName')"
+            BODY="$(gh release view --repo mistralai/mistral-vibe --json body --jq '.body' 2>/dev/null || echo '')"
+          fi
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          # Base64-encode body for multiline-safe output passing
+          echo "body_b64=$(echo "$BODY" | base64 -w 0)" >> "$GITHUB_OUTPUT"
+          echo "Upstream latest: $TAG"
+
+      - name: Get fork latest release
+        id: fork
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="$(gh release view --repo "${{ github.repository }}" --json tagName --jq '.tagName' 2>/dev/null || echo '')"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "Fork latest: ${TAG:-<none>}"
+
+      - name: Compare versions
+        id: compare
+        run: |
+          UPSTREAM="${{ steps.upstream.outputs.tag }}"
+          FORK="${{ steps.fork.outputs.tag }}"
+          FORCE="${{ inputs.force }}"
+
+          echo "Upstream tag: $UPSTREAM"
+          echo "Fork tag:     ${FORK:-<none>}"
+          echo "Force:        ${FORCE:-false}"
+
+          if [[ "$FORCE" == "true" ]] || [[ "$UPSTREAM" != "$FORK" ]]; then
+            echo "new_release=true" >> "$GITHUB_OUTPUT"
+            echo "New release detected (or forced)"
+          else
+            echo "new_release=false" >> "$GITHUB_OUTPUT"
+            echo "No new release — fork is up to date"
+          fi
+
+          echo "upstream_tag=$UPSTREAM" >> "$GITHUB_OUTPUT"
+          echo "upstream_release_body_b64=${{ steps.upstream.outputs.body_b64 }}" >> "$GITHUB_OUTPUT"
+
+  # ---------------------------------------------------------------------------
+  # Job 2: Merge upstream tag into the fork's main branch
+  # ---------------------------------------------------------------------------
+  sync-fork:
+    name: Sync fork with upstream
+    needs: check-upstream
+    if: needs.check-upstream.outputs.new_release == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - name: Checkout fork (full history for merge)
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Merge upstream tag
+        env:
+          UPSTREAM_TAG: ${{ needs.check-upstream.outputs.upstream_tag }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git remote add upstream https://github.com/mistralai/mistral-vibe.git
+          git fetch upstream --tags
+
+          echo "Merging upstream tag: $UPSTREAM_TAG"
+          if ! git merge "$UPSTREAM_TAG" --no-edit; then
+            echo "::error::Merge conflict detected. Conflicting files:"
+            git diff --name-only --diff-filter=U
+            echo ""
+            echo "Manual resolution required:"
+            echo "  git remote add upstream https://github.com/mistralai/mistral-vibe.git"
+            echo "  git fetch upstream --tags"
+            echo "  git merge $UPSTREAM_TAG"
+            echo "  # resolve conflicts"
+            echo "  git push origin main"
+            exit 1
+          fi
+
+          echo "Merge successful — pushing to fork"
+          git push origin main
+          git push origin "$UPSTREAM_TAG" --force
+
+      - name: Extract version from pyproject.toml
+        id: version
+        run: |
+          VERSION="$(grep -m1 '^version' pyproject.toml | sed 's/.*= *"\(.*\)"/\1/')"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "Version: $VERSION"
+
+  # ---------------------------------------------------------------------------
+  # Job 3: Build riscv64 binary on self-hosted runner
+  # ---------------------------------------------------------------------------
+  build-riscv64:
+    name: Build linux-riscv64
+    needs: sync-fork
+    runs-on: [self-hosted, linux, riscv64]
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout repository (post-merge)
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+        with:
+          ref: main
+
+      - name: Build vibe-acp
+        run: bash scripts/build-riscv64.sh
+
+      - name: Get package version
+        id: version
+        run: |
+          source .venv-riscv64/bin/activate
+          VERSION="$(python -c 'from vibe import __version__; print(__version__)')"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          deactivate
+
+      - name: Upload binary artifact
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: vibe-acp-linux-riscv64-${{ steps.version.outputs.version }}
+          path: dist/vibe-acp
+
+  # ---------------------------------------------------------------------------
+  # Job 4: Create fork release with riscv64 binary
+  # ---------------------------------------------------------------------------
+  create-release:
+    name: Create fork release
+    needs: [check-upstream, sync-fork, build-riscv64]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download artifact
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
+        with:
+          path: artifacts
+
+      - name: Zip artifact
+        run: |
+          mkdir -p release-assets
+          for dir in artifacts/*; do
+            name="$(basename "$dir")"
+            if [[ -f "$dir/vibe-acp" ]]; then
+              chmod +x "$dir/vibe-acp"
+              zip -j "release-assets/${name}.zip" "$dir/vibe-acp"
+            fi
+          done
+
+      - name: Decode upstream release notes
+        id: notes
+        env:
+          BODY_B64: ${{ needs.check-upstream.outputs.upstream_release_body_b64 }}
+        run: |
+          if [[ -n "$BODY_B64" ]]; then
+            DECODED="$(echo "$BODY_B64" | base64 -d)"
+          else
+            DECODED=""
+          fi
+          # Write to file for multi-line safety
+          echo "$DECODED" > /tmp/upstream-notes.md
+
+      - name: Generate release notes
+        env:
+          VERSION: ${{ needs.sync-fork.outputs.version }}
+          UPSTREAM_TAG: ${{ needs.check-upstream.outputs.upstream_tag }}
+        run: |
+          ARTIFACT="$(ls release-assets/*.zip 2>/dev/null | head -1)"
+          ARTIFACT_NAME="$(basename "$ARTIFACT")"
+
+          # Use unindented heredoc to avoid leading whitespace in output
+          cat > /tmp/release-body.md <<BODY_EOF
+          RISC-V 64 build of Mistral Vibe — the open-source CLI coding assistant by Mistral AI.
+
+          ## Download
+
+          | Platform | Architecture | File |
+          |----------|-------------|------|
+          | Linux | riscv64 | \`${ARTIFACT_NAME}\` |
+
+          ## Installation
+
+          \`\`\`bash
+          unzip ${ARTIFACT_NAME}
+          chmod +x vibe-acp
+          sudo mv vibe-acp /usr/local/bin/
+          vibe-acp --version
+          \`\`\`
+
+          ## Upstream Release
+
+          This build is based on [${UPSTREAM_TAG}](https://github.com/mistralai/mistral-vibe/releases/tag/${UPSTREAM_TAG}) from [mistralai/mistral-vibe](https://github.com/mistralai/mistral-vibe).
+
+          For other platforms (x86_64, aarch64, macOS, Windows), see the [upstream release](https://github.com/mistralai/mistral-vibe/releases/tag/${UPSTREAM_TAG}).
+          BODY_EOF
+
+          # Append upstream release notes if non-empty
+          if [[ -s /tmp/upstream-notes.md ]]; then
+            {
+              echo ""
+              echo "---"
+              echo ""
+              echo "<details>"
+              echo "<summary>Upstream release notes</summary>"
+              echo ""
+              cat /tmp/upstream-notes.md
+              echo ""
+              echo "</details>"
+            } >> /tmp/release-body.md
+          fi
+
+      - name: Create release
+        uses: softprops/action-gh-release@a06a81a03ee405af7f2048a818ed3f03bbf83c7b # v2
+        with:
+          tag_name: ${{ needs.check-upstream.outputs.upstream_tag }}
+          name: "${{ needs.check-upstream.outputs.upstream_tag }} (RISC-V 64)"
+          body_path: /tmp/release-body.md
+          files: release-assets/*.zip
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
