@@ -1,0 +1,73 @@
+name: Build RISC-V 64
+
+on:
+  release:
+    types: [published]
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  build-riscv64:
+    name: linux-riscv64
+    runs-on: [self-hosted, linux, riscv64]
+    timeout-minutes: 45
+    if: >-
+      github.repository != 'mistralai/mistral-vibe' &&
+      (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@08eba0b27e820071cde6df949e0beb9ba4906955 # v4
+
+      - name: Build vibe-acp
+        run: bash scripts/build-riscv64.sh
+
+      - name: Get package version
+        id: version
+        run: |
+          source .venv-riscv64/bin/activate
+          VERSION="$(python -c 'from vibe import __version__; print(__version__)')"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          deactivate
+
+      - name: Upload binary artifact
+        uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5
+        with:
+          name: vibe-acp-linux-riscv64-${{ steps.version.outputs.version }}
+          path: dist/vibe-acp
+
+  attach-to-release:
+    needs: build-riscv64
+    runs-on: ubuntu-latest
+    if: github.event_name == 'release'
+    permissions:
+      contents: write
+
+    steps:
+      - name: Download artifact
+        uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5
+        with:
+          path: artifacts
+
+      - name: Zip artifact
+        run: |
+          mkdir -p release-assets
+          for dir in artifacts/*; do
+            name=$(basename "$dir")
+            if [ -f "$dir/vibe-acp" ]; then
+              chmod +x "$dir/vibe-acp"
+              zip -j "release-assets/${name}.zip" "$dir/vibe-acp"
+            fi
+          done
+
+      - name: Attach binary to release
+        uses: softprops/action-gh-release@a06a81a03ee405af7f2048a818ed3f03bbf83c7b # v2
+        with:
+          files: release-assets/*.zip
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
