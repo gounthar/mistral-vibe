@@ -187,14 +187,23 @@ jobs:
 
       - name: Zip artifact
         run: |
+          echo "=== Artifact tree ==="
+          find artifacts/ -type f
+          echo "==="
+
           mkdir -p release-assets
-          for dir in artifacts/*; do
-            name="$(basename "$dir")"
-            if [[ -f "$dir/vibe-acp" ]]; then
-              chmod +x "$dir/vibe-acp"
-              zip -j "release-assets/${name}.zip" "$dir/vibe-acp"
-            fi
-          done
+          BINARY="$(find artifacts/ -name 'vibe-acp' -type f | head -1)"
+          if [[ -z "$BINARY" ]]; then
+            echo "::error::No vibe-acp binary found in artifacts/"
+            exit 1
+          fi
+
+          # Derive artifact name from parent directory
+          ARTIFACT_DIR="$(dirname "$BINARY")"
+          ARTIFACT_NAME="$(basename "$ARTIFACT_DIR")"
+          chmod +x "$BINARY"
+          zip -j "release-assets/${ARTIFACT_NAME}.zip" "$BINARY"
+          echo "Created: release-assets/${ARTIFACT_NAME}.zip"
 
       - name: Decode upstream release notes
         id: notes
