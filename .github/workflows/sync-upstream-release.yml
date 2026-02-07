@@ -111,7 +111,7 @@ jobs:
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
           git remote add upstream https://github.com/mistralai/mistral-vibe.git
-          git fetch upstream --tags
+          git fetch upstream --tags --force
 
           echo "Merging upstream tag: $UPSTREAM_TAG"
           if ! git merge "$UPSTREAM_TAG" --no-edit; then
