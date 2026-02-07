@@ -13,6 +13,9 @@ jobs:
   build-riscv64:
     name: linux-riscv64
     runs-on: [self-hosted, linux, riscv64]
+    if: >-
+      github.repository != 'mistralai/mistral-vibe' &&
+      (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)
     permissions:
       contents: read
 
@@ -39,7 +42,7 @@ jobs:
 
   attach-to-release:
     needs: build-riscv64
-    runs-on: [self-hosted, linux, riscv64]
+    runs-on: ubuntu-latest
     if: github.event_name == 'release'
     permissions:
       contents: write
@@ -62,9 +65,8 @@ jobs:
           done
 
       - name: Attach binary to release
+        uses: softprops/action-gh-release@a06a81a03ee405af7f2048a818ed3f03bbf83c7b # v2
+        with:
+          files: release-assets/*.zip
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          for asset in release-assets/*.zip; do
-            gh release upload "${{ github.event.release.tag_name }}" "$asset" --clobber
-          done
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

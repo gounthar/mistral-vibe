@@ -93,7 +93,7 @@ Run interactively for testing:
 Or install as a systemd service for persistence:
 
 ```bash
-cat <<'EOF' | sudo tee /etc/systemd/system/github-runner.service
+cat <<EOF | sudo tee /etc/systemd/system/github-runner.service
 [Unit]
 Description=GitHub Actions Runner
 After=network.target

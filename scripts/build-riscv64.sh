@@ -13,7 +13,7 @@
 #   1. Checks system dependencies (Python, compilers, Cargo, etc.)
 #   2. Creates a clean virtual environment
 #   3. Installs runtime + build dependencies via pip
-#   4. Builds PyInstaller's bootloader from source (no riscv64 pre-built)
+#   4. Verifies PyInstaller's riscv64 bootloader (auto-built during pip install)
 #   5. Builds the vibe-acp one-file binary with PyInstaller
 #   6. Smoke-tests the binary
 #   7. Tests pip-installable CLI in a separate venv
@@ -74,7 +74,7 @@ check_python() {
         local major minor
         major="$(echo "$ver" | cut -d. -f1)"
         minor="$(echo "$ver" | cut -d. -f2)"
-        if [[ "$major" -ge 3 && "$minor" -ge 12 ]]; then
+        if (( major > 3 || (major == 3 && minor >= 12) )); then
             success "python3 $ver found (>= 3.12)"
         else
             error "python3 $ver found but >= 3.12 is required"
@@ -92,10 +92,11 @@ check_cmd g++       g++
 check_cmd make      make
 check_cmd cargo     cargo
 check_cmd git       git
-check_cmd ldd       binutils
+check_cmd ldd       libc-bin
 check_cmd objdump   binutils
 check_cmd objcopy   binutils
 check_cmd rg        ripgrep
+check_cmd zip       zip
 
 # Check dev libraries via dpkg (Debian/Ubuntu)
 check_dev_lib() {
@@ -144,13 +145,13 @@ success "Build venv created and activated: $BUILD_VENV"
 step "Installing dependencies (this may take 15-30 min on first build)"
 
 info "Upgrading pip, setuptools, wheel, maturin..."
-pip install --upgrade pip setuptools wheel maturin 2>&1 | tail -1
+pip install --upgrade pip setuptools wheel maturin 2>&1 | tail -5
 
 info "Installing project runtime dependencies..."
-pip install . 2>&1 | tail -1
+pip install . 2>&1 | tail -5
 
 info "Installing PyInstaller build dependency..."
-pip install "pyinstaller>=6.17.0" 2>&1 | tail -1
+pip install "pyinstaller>=6.17.0" 2>&1 | tail -5
 
 success "All Python dependencies installed"
 
@@ -219,8 +220,8 @@ fi
 source "$TEST_VENV/bin/activate"
 
 info "Installing project via pip..."
-pip install --upgrade pip setuptools wheel maturin 2>&1 | tail -1
-pip install . 2>&1 | tail -1
+pip install --upgrade pip setuptools wheel maturin 2>&1 | tail -5
+pip install . 2>&1 | tail -5
 
 info "Testing vibe --help..."
 vibe --help >/dev/null 2>&1

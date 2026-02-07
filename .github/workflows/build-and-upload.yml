@@ -103,7 +103,9 @@ jobs:
   build-riscv64:
     name: linux-riscv64
     runs-on: [self-hosted, linux, riscv64]
-    if: github.repository == 'mistralai/mistral-vibe'
+    if: >-
+      github.repository == 'mistralai/mistral-vibe' &&
+      (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)
     permissions:
       contents: read
 
