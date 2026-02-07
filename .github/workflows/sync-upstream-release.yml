@@ -49,7 +49,7 @@ jobs:
           fi
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
           # Base64-encode body for multiline-safe output passing
-          echo "body_b64=$(echo "$BODY" | base64 -w 0)" >> "$GITHUB_OUTPUT"
+          echo "body_b64=$(printf '%s' "$BODY" | base64 -w 0)" >> "$GITHUB_OUTPUT"
           echo "Upstream latest: $TAG"
 
       - name: Get fork latest release
@@ -203,12 +203,12 @@ jobs:
           BODY_B64: ${{ needs.check-upstream.outputs.upstream_release_body_b64 }}
         run: |
           if [[ -n "$BODY_B64" ]]; then
-            DECODED="$(echo "$BODY_B64" | base64 -d)"
+            DECODED="$(printf '%s' "$BODY_B64" | base64 -d)"
           else
             DECODED=""
           fi
           # Write to file for multi-line safety
-          echo "$DECODED" > /tmp/upstream-notes.md
+          printf '%s' "$DECODED" > /tmp/upstream-notes.md
 
       - name: Generate release notes
         env:
