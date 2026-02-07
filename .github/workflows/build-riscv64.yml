@@ -1,6 +1,8 @@
 name: Build RISC-V 64
 
 on:
+  release:
+    types: [published]
   push:
     branches: [main]
   pull_request:
@@ -34,3 +36,35 @@ jobs:
         with:
           name: vibe-acp-linux-riscv64-${{ steps.version.outputs.version }}
           path: dist/vibe-acp
+
+  attach-to-release:
+    needs: build-riscv64
+    runs-on: [self-hosted, linux, riscv64]
+    if: github.event_name == 'release'
+    permissions:
+      contents: write
+
+    steps:
+      - name: Download artifact
+        uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5
+        with:
+          path: artifacts
+
+      - name: Zip artifact
+        run: |
+          mkdir -p release-assets
+          for dir in artifacts/*; do
+            name=$(basename "$dir")
+            if [ -f "$dir/vibe-acp" ]; then
+              chmod +x "$dir/vibe-acp"
+              zip -j "release-assets/${name}.zip" "$dir/vibe-acp"
+            fi
+          done
+
+      - name: Attach binary to release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          for asset in release-assets/*.zip; do
+            gh release upload "${{ github.event.release.tag_name }}" "$asset" --clobber
+          done
