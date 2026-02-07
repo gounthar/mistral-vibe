@@ -38,9 +38,10 @@ jobs:
         id: upstream
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          UPSTREAM_TAG_INPUT: ${{ inputs.upstream_tag }}
         run: |
-          if [[ -n "${{ inputs.upstream_tag }}" ]]; then
-            TAG="${{ inputs.upstream_tag }}"
+          if [[ -n "$UPSTREAM_TAG_INPUT" ]]; then
+            TAG="$UPSTREAM_TAG_INPUT"
             BODY="$(gh release view "$TAG" --repo mistralai/mistral-vibe --json body --jq '.body' 2>/dev/null || echo '')"
           else
             TAG="$(gh release view --repo mistralai/mistral-vibe --json tagName --jq '.tagName')"
@@ -62,11 +63,12 @@ jobs:
 
       - name: Compare versions
         id: compare
+        env:
+          UPSTREAM: ${{ steps.upstream.outputs.tag }}
+          FORK: ${{ steps.fork.outputs.tag }}
+          FORCE: ${{ inputs.force }}
+          UPSTREAM_BODY_B64: ${{ steps.upstream.outputs.body_b64 }}
         run: |
-          UPSTREAM="${{ steps.upstream.outputs.tag }}"
-          FORK="${{ steps.fork.outputs.tag }}"
-          FORCE="${{ inputs.force }}"
-
           echo "Upstream tag: $UPSTREAM"
           echo "Fork tag:     ${FORK:-<none>}"
           echo "Force:        ${FORCE:-false}"
@@ -80,7 +82,7 @@ jobs:
           fi
 
           echo "upstream_tag=$UPSTREAM" >> "$GITHUB_OUTPUT"
-          echo "upstream_release_body_b64=${{ steps.upstream.outputs.body_b64 }}" >> "$GITHUB_OUTPUT"
+          echo "upstream_release_body_b64=$UPSTREAM_BODY_B64" >> "$GITHUB_OUTPUT"
 
   # ---------------------------------------------------------------------------
   # Job 2: Merge upstream tag into the fork's main branch
