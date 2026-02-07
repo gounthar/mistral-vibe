@@ -155,33 +155,24 @@ pip install "pyinstaller>=6.17.0" 2>&1 | tail -1
 success "All Python dependencies installed"
 
 # ---------------------------------------------------------------------------
-# Step 4: Build PyInstaller bootloader from source
+# Step 4: Verify PyInstaller bootloader for riscv64
 # ---------------------------------------------------------------------------
-step "Building PyInstaller bootloader for riscv64"
+step "Verifying PyInstaller bootloader for riscv64"
 
+# PyInstaller 6.x auto-builds the bootloader for the current arch during
+# pip install. We just need to confirm it exists.
 PYINSTALLER_DIR="$("$PYTHON" -c "import PyInstaller; print(PyInstaller.__path__[0])")"
-BOOTLOADER_DIR="$PYINSTALLER_DIR/bootloader"
+EXISTING_BOOT="$(find "$PYINSTALLER_DIR" -path "*/bootloader/Linux-64bit-riscv*" -name "run" 2>/dev/null || true)"
 
-if [[ -f "$PYINSTALLER_DIR/_bootloader_info.py" ]]; then
-    # Check if a riscv64 bootloader already exists
-    EXISTING_BOOT="$(find "$PYINSTALLER_DIR" -path "*/bootloader/Linux-64bit-riscv*" -name "run" 2>/dev/null || true)"
-    if [[ -n "$EXISTING_BOOT" ]]; then
-        success "riscv64 bootloader already present: $EXISTING_BOOT"
-    else
-        info "No riscv64 bootloader found, building from source..."
-        (
-            cd "$BOOTLOADER_DIR"
-            "$PYTHON" ./waf all 2>&1 | tail -5
-        )
-        success "PyInstaller bootloader built"
-    fi
+if [[ -n "$EXISTING_BOOT" ]]; then
+    success "riscv64 bootloader present: $EXISTING_BOOT"
 else
-    info "Building PyInstaller bootloader..."
-    (
-        cd "$BOOTLOADER_DIR"
-        "$PYTHON" ./waf all 2>&1 | tail -5
-    )
-    success "PyInstaller bootloader built"
+    error "riscv64 bootloader not found after PyInstaller install."
+    error "Expected at: $PYINSTALLER_DIR/bootloader/Linux-64bit-riscv/run"
+    error "PyInstaller may have failed to auto-build the bootloader."
+    error "Ensure gcc, make, and zlib1g-dev are installed and try:"
+    echo -e "  ${YELLOW}pip install --force-reinstall --no-binary :all: pyinstaller${NC}"
+    exit 1
 fi
 
 # ---------------------------------------------------------------------------
