@@ -12,7 +12,7 @@ We use [ChristopherHX/github-act-runner](https://github.com/ChristopherHX/github
 
 Register the runner with these labels:
 
-```
+```text
 self-hosted, linux, riscv64
 ```
 

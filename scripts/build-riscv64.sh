@@ -101,7 +101,7 @@ check_cmd zip       zip
 # Check dev libraries via dpkg (Debian/Ubuntu)
 check_dev_lib() {
     local pkg="$1"
-    if dpkg -s "$pkg" &>/dev/null 2>&1; then
+    if dpkg -s "$pkg" &>/dev/null; then
         success "$pkg installed"
     else
         error "$pkg not found (install: sudo apt install $pkg)"
@@ -145,13 +145,13 @@ success "Build venv created and activated: $BUILD_VENV"
 step "Installing dependencies (this may take 15-30 min on first build)"
 
 info "Upgrading pip, setuptools, wheel, maturin..."
-pip install --upgrade pip setuptools wheel maturin 2>&1 | tail -5
+pip install --upgrade pip setuptools wheel maturin --log "$PROJECT_DIR/pip-bootstrap.log" 2>&1 | tail -5
 
 info "Installing project runtime dependencies..."
-pip install . 2>&1 | tail -5
+pip install . --log "$PROJECT_DIR/pip-install.log" 2>&1 | tail -5
 
 info "Installing PyInstaller build dependency..."
-pip install "pyinstaller>=6.17.0" 2>&1 | tail -5
+pip install "pyinstaller>=6.17.0" --log "$PROJECT_DIR/pip-pyinstaller.log" 2>&1 | tail -5
 
 success "All Python dependencies installed"
 
