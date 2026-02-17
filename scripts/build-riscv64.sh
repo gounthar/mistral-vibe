@@ -45,6 +45,7 @@ PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 BUILD_VENV="$PROJECT_DIR/.venv-riscv64"
 TEST_VENV="$PROJECT_DIR/.venv-riscv64-test"
 PYTHON="${PYTHON:-python3}"
+LOG_TAIL_LINES=15
 
 # ---------------------------------------------------------------------------
 # Step 1: Dependency check
@@ -147,19 +148,21 @@ success "Build venv created and activated: $BUILD_VENV"
 step "Installing dependencies (this may take 15-30 min on first build)"
 
 info "Upgrading pip, setuptools, wheel, maturin..."
-pip install --upgrade pip setuptools wheel maturin --log "$PROJECT_DIR/pip-bootstrap.log" 2>&1 | tail -15
+pip install --upgrade pip setuptools wheel maturin --log "$PROJECT_DIR/pip-bootstrap.log" 2>&1 | tail -"$LOG_TAIL_LINES"
 
 # Relax cryptography upper bound for riscv64: pinned versions (e.g. <=46.0.3)
 # may lack riscv64 wheels, forcing a source build that fails without a full
 # Rust/maturin build environment. Newer patch releases ship prebuilt wheels.
 info "Relaxing cryptography upper bound for riscv64 wheel availability..."
-sed -i 's/"cryptography>=\([0-9.]*\),<=[0-9.]*"/"cryptography>=\1"/' "$PROJECT_DIR/pyproject.toml"
+cp "$PROJECT_DIR/pyproject.toml" "$PROJECT_DIR/pyproject.toml.bak"
+trap 'mv -f "$PROJECT_DIR/pyproject.toml.bak" "$PROJECT_DIR/pyproject.toml" 2>/dev/null || true' EXIT
+sed -i 's/"cryptography>=\([0-9.]*\),<=\?[0-9.]*"/"cryptography>=\1"/' "$PROJECT_DIR/pyproject.toml"
 
 info "Installing project runtime dependencies..."
-pip install . --log "$PROJECT_DIR/pip-install.log" 2>&1 | tail -15
+pip install . --log "$PROJECT_DIR/pip-install.log" 2>&1 | tail -"$LOG_TAIL_LINES"
 
 info "Installing PyInstaller build dependency..."
-pip install "pyinstaller>=6.17.0" --log "$PROJECT_DIR/pip-pyinstaller.log" 2>&1 | tail -15
+pip install "pyinstaller>=6.17.0" --log "$PROJECT_DIR/pip-pyinstaller.log" 2>&1 | tail -"$LOG_TAIL_LINES"
 
 success "All Python dependencies installed"
 
@@ -190,7 +193,7 @@ fi
 step "Building vibe-acp with PyInstaller"
 
 cd "$PROJECT_DIR"
-pyinstaller vibe-acp.spec 2>&1 | tail -15
+pyinstaller vibe-acp.spec 2>&1 | tail -"$LOG_TAIL_LINES"
 
 if [[ ! -f "$PROJECT_DIR/dist/vibe-acp" ]]; then
     error "Build failed: dist/vibe-acp not found"
@@ -228,8 +231,8 @@ fi
 source "$TEST_VENV/bin/activate"
 
 info "Installing project via pip..."
-pip install --upgrade pip setuptools wheel maturin 2>&1 | tail -15
-pip install . 2>&1 | tail -15
+pip install --upgrade pip setuptools wheel maturin 2>&1 | tail -"$LOG_TAIL_LINES"
+pip install . 2>&1 | tail -"$LOG_TAIL_LINES"
 
 info "Testing vibe --help..."
 vibe --help >/dev/null 2>&1
