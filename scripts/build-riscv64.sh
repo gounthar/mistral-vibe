@@ -231,8 +231,8 @@ fi
 source "$TEST_VENV/bin/activate"
 
 info "Installing project via pip..."
-pip install --upgrade pip setuptools wheel maturin 2>&1 | tail -"$LOG_TAIL_LINES"
-pip install . 2>&1 | tail -"$LOG_TAIL_LINES"
+pip install --upgrade pip setuptools wheel maturin --log "$PROJECT_DIR/pip-test-bootstrap.log" 2>&1 | tail -"$LOG_TAIL_LINES"
+pip install . --log "$PROJECT_DIR/pip-test-install.log" 2>&1 | tail -"$LOG_TAIL_LINES"
 
 info "Testing vibe --help..."
 vibe --help >/dev/null 2>&1
