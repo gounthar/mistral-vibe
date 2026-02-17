@@ -28,7 +28,7 @@ sudo apt install -y \
   python3 python3-venv python3-dev python3-pip \
   gcc g++ make \
   git binutils \
-  zlib1g-dev libffi-dev \
+  zlib1g-dev libffi-dev libssl-dev pkg-config \
   ripgrep \
   zip
 ```
@@ -144,3 +144,4 @@ First builds are slow (~15-30 minutes) because Rust extensions compile from sour
 | PyInstaller bootloader fails | Ensure `gcc`, `make`, `zlib1g-dev` are installed |
 | Runner shows "offline" | Check systemd service: `sudo systemctl status github-runner` |
 | `rg: not found` at runtime | Install ripgrep: `sudo apt install ripgrep` |
+| `cryptography` metadata error | Install `libssl-dev` and `pkg-config`: `sudo apt install libssl-dev pkg-config` |
