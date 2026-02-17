@@ -164,7 +164,7 @@ if grep -qE 'cryptography>=.*,<' "$PROJECT_DIR/pyproject.toml"; then
     exit 1
 fi
 
-info "cryptography constraint after relaxation: $(grep 'cryptography>=' "$PROJECT_DIR/pyproject.toml" || echo 'not found')"
+info "cryptography constraint after relaxation: $(grep 'cryptography>=' "$PROJECT_DIR/pyproject.toml" || echo '(no cryptography constraint found)')"
 
 info "Installing project runtime dependencies..."
 pip install . --log "$PROJECT_DIR/pip-install.log" 2>&1 | tail -"$LOG_TAIL_LINES"
