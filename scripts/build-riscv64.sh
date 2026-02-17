@@ -159,7 +159,7 @@ trap 'mv -f "$PROJECT_DIR/pyproject.toml.bak" "$PROJECT_DIR/pyproject.toml" 2>/d
 sed -i 's/"cryptography>=\([0-9.]*\),<=\?[0-9.]*"/"cryptography>=\1"/' "$PROJECT_DIR/pyproject.toml"
 
 # Verify that the cryptography upper bound was actually relaxed.
-if grep -q 'cryptography>=.*,<=' "$PROJECT_DIR/pyproject.toml"; then
+if grep -q 'cryptography>=.*,<=\?' "$PROJECT_DIR/pyproject.toml"; then
     error "Failed to relax cryptography upper bound in pyproject.toml"
     exit 1
 fi
