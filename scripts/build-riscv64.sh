@@ -158,6 +158,14 @@ cp "$PROJECT_DIR/pyproject.toml" "$PROJECT_DIR/pyproject.toml.bak"
 trap 'mv -f "$PROJECT_DIR/pyproject.toml.bak" "$PROJECT_DIR/pyproject.toml" 2>/dev/null || true' EXIT
 sed -i 's/"cryptography>=\([0-9.]*\),<=\?[0-9.]*"/"cryptography>=\1"/' "$PROJECT_DIR/pyproject.toml"
 
+# Verify that the cryptography upper bound was actually relaxed.
+if grep -q 'cryptography>=.*,<=' "$PROJECT_DIR/pyproject.toml"; then
+    error "Failed to relax cryptography upper bound in pyproject.toml"
+    exit 1
+fi
+
+info "cryptography constraint after relaxation: $(grep 'cryptography>=' "$PROJECT_DIR/pyproject.toml" || echo 'not found')"
+
 info "Installing project runtime dependencies..."
 pip install . --log "$PROJECT_DIR/pip-install.log" 2>&1 | tail -"$LOG_TAIL_LINES"
 
