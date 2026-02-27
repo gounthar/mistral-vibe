@@ -107,6 +107,10 @@ jobs:
           TAG: ${{ steps.check.outputs.tag }}
         run: |
           ARTIFACT="$(ls release-assets/*.zip 2>/dev/null | head -1)"
+          if [[ -z "$ARTIFACT" ]]; then
+            echo "::error::No zip artifact found in release-assets/"
+            exit 1
+          fi
           ARTIFACT_NAME="$(basename "$ARTIFACT")"
 
           {
