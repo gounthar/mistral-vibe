@@ -14,7 +14,7 @@
 #   2. Creates a clean virtual environment
 #   3. Installs runtime + build dependencies via pip
 #   4. Verifies PyInstaller's riscv64 bootloader (auto-built during pip install)
-#   5. Builds the vibe-acp one-file binary with PyInstaller
+#   5. Builds the vibe-acp onedir binary with PyInstaller
 #   6. Smoke-tests the binary
 #   7. Tests pip-installable CLI in a separate venv
 #   8. Packages the artifact as a zip
@@ -195,12 +195,12 @@ step "Building vibe-acp with PyInstaller"
 cd "$PROJECT_DIR"
 pyinstaller vibe-acp.spec 2>&1 | tail -n "$LOG_TAIL_LINES"
 
-if [[ ! -f "$PROJECT_DIR/dist/vibe-acp" ]]; then
-    error "Build failed: dist/vibe-acp not found"
+if [[ ! -f "$PROJECT_DIR/dist/vibe-acp-dir/vibe-acp" ]]; then
+    error "Build failed: dist/vibe-acp-dir/vibe-acp not found"
     exit 1
 fi
 
-success "Binary built: dist/vibe-acp ($(du -h "$PROJECT_DIR/dist/vibe-acp" | cut -f1))"
+success "Binary built: dist/vibe-acp-dir/vibe-acp ($(du -sh "$PROJECT_DIR/dist/vibe-acp-dir" | cut -f1) total)"
 
 # ---------------------------------------------------------------------------
 # Step 6: Smoke test the binary
@@ -208,11 +208,11 @@ success "Binary built: dist/vibe-acp ($(du -h "$PROJECT_DIR/dist/vibe-acp" | cut
 step "Smoke-testing the binary"
 
 info "Testing --version..."
-"$PROJECT_DIR/dist/vibe-acp" --version
+"$PROJECT_DIR/dist/vibe-acp-dir/vibe-acp" --version
 success "--version OK"
 
 info "Testing --help..."
-"$PROJECT_DIR/dist/vibe-acp" --help >/dev/null 2>&1
+"$PROJECT_DIR/dist/vibe-acp-dir/vibe-acp" --help >/dev/null 2>&1
 success "--help OK"
 
 # ---------------------------------------------------------------------------
@@ -256,8 +256,8 @@ source "$BUILD_VENV/bin/activate"
 VERSION="$("$PYTHON" -c "from vibe import __version__; print(__version__)")"
 ARTIFACT="vibe-acp-linux-riscv64-${VERSION}.zip"
 
-cd "$PROJECT_DIR"
-zip -j "$ARTIFACT" dist/vibe-acp
+cd "$PROJECT_DIR/dist"
+zip -r "$PROJECT_DIR/$ARTIFACT" vibe-acp-dir/
 
 deactivate 2>/dev/null || true
 
@@ -269,7 +269,7 @@ success "Artifact created: $ARTIFACT"
 echo
 echo -e "${GREEN}${BOLD}Build complete!${NC}"
 echo
-echo "  Binary:   dist/vibe-acp"
+echo "  Binary:   dist/vibe-acp-dir/vibe-acp"
 echo "  Artifact: $ARTIFACT"
 echo "  Version:  $VERSION"
 echo "  Arch:     $(uname -m)"

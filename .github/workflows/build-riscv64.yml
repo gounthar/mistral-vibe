@@ -39,7 +39,7 @@ jobs:
         uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5
         with:
           name: vibe-acp-linux-riscv64-${{ steps.version.outputs.version }}
-          path: dist/vibe-acp
+          path: dist/vibe-acp-dir/
 
   create-release:
     name: Create fork release
@@ -80,15 +80,16 @@ jobs:
           VERSION: ${{ needs.build-riscv64.outputs.version }}
         run: |
           mkdir -p release-assets
-          BINARY="$(find artifacts/ -name 'vibe-acp' -type f | head -1)"
-          if [[ -z "$BINARY" ]]; then
-            echo "::error::No vibe-acp binary found in artifacts/"
+          # Find the onedir output (vibe-acp-dir/ containing vibe-acp + _internal/)
+          ARTIFACT_DIR="$(find artifacts/ -name 'vibe-acp-dir' -type d | head -1)"
+          if [[ -z "$ARTIFACT_DIR" ]]; then
+            echo "::error::No vibe-acp-dir directory found in artifacts/"
             exit 1
           fi
 
           ZIP_NAME="vibe-acp-linux-riscv64-${VERSION}.zip"
-          chmod +x "$BINARY"
-          zip -j "release-assets/${ZIP_NAME}" "$BINARY"
+          chmod +x "$ARTIFACT_DIR/vibe-acp"
+          (cd "$ARTIFACT_DIR/.." && zip -r "$OLDPWD/release-assets/${ZIP_NAME}" vibe-acp-dir/)
           echo "Created: release-assets/${ZIP_NAME}"
 
       - name: Fetch upstream release notes
