@@ -93,7 +93,7 @@ jobs:
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
         with:
           fetch-depth: 0
-          token: ${{ secrets.GITHUB_TOKEN }}
+          token: ${{ secrets.PAT_TOKEN }}
 
       - name: Merge upstream tag
         env:
@@ -127,7 +127,7 @@ jobs:
       # allowed to trigger new runs even with GITHUB_TOKEN).
       - name: Trigger riscv64 build workflow
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ secrets.PAT_TOKEN }}
         run: |
           echo "Dispatching build-riscv64 workflow..."
           gh workflow run build-riscv64.yml --repo "$GITHUB_REPOSITORY" --ref main
