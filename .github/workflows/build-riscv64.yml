@@ -10,11 +10,11 @@ on:
 jobs:
   build-riscv64:
     name: linux-riscv64
-    runs-on: [self-hosted, linux, riscv64]
-    timeout-minutes: 45
+    runs-on: ubuntu-24.04-riscv
+    timeout-minutes: 60
     if: >-
-      github.repository != 'mistralai/mistral-vibe' &&
-      (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)
+      github.event_name != 'pull_request' ||
+      github.event.pull_request.head.repo.full_name == github.repository
     permissions:
       contents: read
     outputs:
@@ -24,8 +24,48 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@08eba0b27e820071cde6df949e0beb9ba4906955 # v4
 
-      - name: Build vibe-acp
-        run: bash scripts/build-riscv64.sh
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            gcc g++ make pkg-config \
+            python3-dev libffi-dev libssl-dev zlib1g-dev \
+            ripgrep zip
+
+      - name: Install uv
+        run: curl -LsSf https://astral.sh/uv/install.sh | sh
+
+      - name: Sync dependencies
+        run: uv sync --locked --no-dev --group build
+
+      - name: Build with PyInstaller
+        run: |
+          # Ensure PyInstaller finds and bundles libpython from /opt/python-3.12
+          export LD_LIBRARY_PATH="/opt/python-3.12/lib:${LD_LIBRARY_PATH:-}"
+          uv run --no-dev --group build pyinstaller vibe-acp.spec
+
+      - name: Debug build output
+        run: |
+          echo "=== PyInstaller version ==="
+          uv run --no-dev --group build python -c "import PyInstaller; print(PyInstaller.__version__)"
+          echo "=== Bootloader used ==="
+          uv run --no-dev --group build python -c "
+          from PyInstaller import __path__ as pi_path
+          import os, glob
+          bl = os.path.join(pi_path[0], 'bootloader')
+          for d in sorted(os.listdir(bl)):
+              files = glob.glob(os.path.join(bl, d, '*'))
+              print(f'  {d}/: {[os.path.basename(f) for f in files]}')"
+          echo "=== dist/ structure ==="
+          find dist/ -maxdepth 3 -name '*.so*' -o -name 'vibe-acp' | sort
+          echo "=== _internal/ libpython ==="
+          ls -la dist/vibe-acp-dir/_internal/libpython* 2>/dev/null || echo "not found"
+
+      - name: Smoke test bundled binary
+        run: |
+          # Set LD_LIBRARY_PATH to _internal/ in case bootloader doesn't find it
+          export LD_LIBRARY_PATH="$(pwd)/dist/vibe-acp-dir/_internal:${LD_LIBRARY_PATH:-}"
+          ./dist/vibe-acp-dir/vibe-acp --version
 
       - name: Get package version
         id: version
