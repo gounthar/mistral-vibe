@@ -161,8 +161,8 @@ sed -i 's/"cryptography>=\([0-9.]*\),<=\?[0-9.]*"/"cryptography>=\1"/' "$PROJECT
 info "Installing project runtime dependencies..."
 pip install . --log "$PROJECT_DIR/pip-install.log" 2>&1 | tail -n "$LOG_TAIL_LINES"
 
-info "Installing PyInstaller build dependency..."
-pip install "pyinstaller>=6.17.0" --log "$PROJECT_DIR/pip-pyinstaller.log" 2>&1 | tail -n "$LOG_TAIL_LINES"
+info "Installing PyInstaller and build dependencies..."
+pip install "pyinstaller>=6.17.0" "truststore>=0.10.4" --log "$PROJECT_DIR/pip-pyinstaller.log" 2>&1 | tail -n "$LOG_TAIL_LINES"
 
 success "All Python dependencies installed"
 
