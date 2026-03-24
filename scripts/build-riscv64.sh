@@ -123,6 +123,8 @@ cp pyproject.toml pyproject.toml.bak
 trap 'mv -f pyproject.toml.bak pyproject.toml 2>/dev/null || true' EXIT
 sed -i 's/"cryptography>=\([0-9.]*\),<=\?[0-9.]*"/"cryptography>=\1"/' pyproject.toml
 
+# Limit concurrent Rust builds to avoid overwhelming riscv64 boards
+export UV_CONCURRENT_BUILDS=1
 uv sync --no-dev --group build
 success "All dependencies synced"
 
