@@ -39,7 +39,17 @@ jobs:
         run: uv sync --locked --no-dev --group build
 
       - name: Build with PyInstaller
-        run: uv run --no-dev --group build pyinstaller vibe-acp.spec
+        run: |
+          # Ensure PyInstaller finds and bundles libpython from /opt/python-3.12
+          export LD_LIBRARY_PATH="/opt/python-3.12/lib:${LD_LIBRARY_PATH:-}"
+          uv run --no-dev --group build pyinstaller vibe-acp.spec
+
+      - name: Verify libpython is bundled
+        run: |
+          echo "=== Contents of dist/vibe-acp-dir/_internal/ ==="
+          ls dist/vibe-acp-dir/_internal/libpython* 2>/dev/null || echo "WARNING: no libpython in _internal/"
+          echo "=== Checking with ldd ==="
+          ldd dist/vibe-acp-dir/vibe-acp 2>&1 | grep -i python || true
 
       - name: Smoke test bundled binary
         run: ./dist/vibe-acp-dir/vibe-acp --version
