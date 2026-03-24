@@ -71,8 +71,8 @@ from vibe.acp.tools.session_update import (
     tool_result_session_update,
 )
 from vibe.acp.utils import (
-    TOOL_OPTIONS,
     ToolOption,
+    build_permission_options,
     create_assistant_message_replay,
     create_compact_end_session_update,
     create_compact_start_session_update,
@@ -101,8 +101,9 @@ from vibe.core.proxy_setup import (
     unset_proxy_var,
 )
 from vibe.core.session.session_loader import SessionLoader
-from vibe.core.tools.base import BaseToolConfig, ToolPermission
+from vibe.core.tools.permissions import RequiredPermission
 from vibe.core.types import (
+    AgentProfileChangedEvent,
     ApprovalCallback,
     ApprovalResponse,
     AssistantEvent,
@@ -228,9 +229,7 @@ class VibeAcpAgentLoop(AcpAgent):
 
     def _load_config(self) -> VibeConfig:
         try:
-            config = VibeConfig.load(
-                disabled_tools=["ask_user_question", "exit_plan_mode"]
-            )
+            config = VibeConfig.load(disabled_tools=["ask_user_question"])
             config.tool_paths.extend(self._get_acp_tool_overrides())
             return config
         except MissingAPIKeyError as e:
@@ -263,18 +262,22 @@ class VibeAcpAgentLoop(AcpAgent):
 
         config = self._load_config()
 
-        agent_loop = AgentLoop(
-            config=config,
-            agent_name=BuiltinAgentName.DEFAULT,
-            enable_streaming=True,
-            entrypoint_metadata=self._build_entrypoint_metadata(),
-        )
-        agent_loop.agent_manager.register_agent(CHAT_AGENT)
-        # NOTE: For now, we pin session.id to agent_loop.session_id right after init time.
-        # We should just use agent_loop.session_id everywhere, but it can still change during
-        # session lifetime (e.g. agent_loop.compact is called).
-        # We should refactor agent_loop.session_id to make it immutable in ACP context.
-        session = await self._create_acp_session(agent_loop.session_id, agent_loop)
+        try:
+            agent_loop = AgentLoop(
+                config=config,
+                agent_name=BuiltinAgentName.DEFAULT,
+                enable_streaming=True,
+                entrypoint_metadata=self._build_entrypoint_metadata(),
+            )
+            agent_loop.agent_manager.register_agent(CHAT_AGENT)
+            # NOTE: For now, we pin session.id to agent_loop.session_id right after init time.
+            # We should just use agent_loop.session_id everywhere, but it can still change during
+            # session lifetime (e.g. agent_loop.compact is called).
+            # We should refactor agent_loop.session_id to make it immutable in ACP context.
+            session = await self._create_acp_session(agent_loop.session_id, agent_loop)
+        except Exception as e:
+            raise ConfigurationError(str(e)) from e
+
         agent_loop.emit_new_session_telemetry()
 
         modes_state, modes_config = make_mode_response(
@@ -314,17 +317,15 @@ class VibeAcpAgentLoop(AcpAgent):
         session = self._get_session(session_id)
 
         def _handle_permission_selection(
-            option_id: str, tool_name: str
+            option_id: str,
+            tool_name: str,
+            required_permissions: list[RequiredPermission] | None,
         ) -> tuple[ApprovalResponse, str | None]:
             match option_id:
                 case ToolOption.ALLOW_ONCE:
                     return (ApprovalResponse.YES, None)
                 case ToolOption.ALLOW_ALWAYS:
-                    if tool_name not in session.agent_loop.config.tools:
-                        session.agent_loop.config.tools[tool_name] = BaseToolConfig()
-                    session.agent_loop.config.tools[
-                        tool_name
-                    ].permission = ToolPermission.ALWAYS
+                    session.agent_loop.approve_always(tool_name, required_permissions)
                     return (ApprovalResponse.YES, None)
                 case ToolOption.REJECT_ONCE:
                     return (
@@ -335,19 +336,33 @@ class VibeAcpAgentLoop(AcpAgent):
                     return (ApprovalResponse.NO, f"Unknown option: {option_id}")
 
         async def approval_callback(
-            tool_name: str, args: BaseModel, tool_call_id: str
+            tool_name: str,
+            args: BaseModel,
+            tool_call_id: str,
+            required_permissions: list | None = None,
         ) -> tuple[ApprovalResponse, str | None]:
-            # Create the tool call update
-            tool_call = ToolCallUpdate(tool_call_id=tool_call_id)
-
-            response = await self.client.request_permission(
-                session_id=session_id, tool_call=tool_call, options=TOOL_OPTIONS
+            typed_permissions: list[RequiredPermission] | None = (
+                [
+                    rp
+                    for rp in required_permissions
+                    if isinstance(rp, RequiredPermission)
+                ]
+                if required_permissions
+                else None
             )
 
-            # Parse the response using isinstance for proper type narrowing
+            tool_call = ToolCallUpdate(tool_call_id=tool_call_id)
+            options = build_permission_options(typed_permissions)
+
+            response = await self.client.request_permission(
+                session_id=session_id, tool_call=tool_call, options=options
+            )
+
             if response.outcome.outcome == "selected":
                 outcome = cast(AllowedOutcome, response.outcome)
-                return _handle_permission_selection(outcome.option_id, tool_name)
+                return _handle_permission_selection(
+                    outcome.option_id, tool_name, typed_permissions
+                )
             else:
                 return (
                     ApprovalResponse.NO,
@@ -463,7 +478,7 @@ class VibeAcpAgentLoop(AcpAgent):
             VibeConfig.save_updates({"installed_agents": [*current, "lean"]})
             new_config = VibeConfig.load(
                 tool_paths=session.agent_loop.config.tool_paths,
-                disabled_tools=["ask_user_question", "exit_plan_mode"],
+                disabled_tools=["ask_user_question"],
             )
             await session.agent_loop.reload_with_initial_messages(
                 base_config=new_config
@@ -492,7 +507,7 @@ class VibeAcpAgentLoop(AcpAgent):
             })
             new_config = VibeConfig.load(
                 tool_paths=session.agent_loop.config.tool_paths,
-                disabled_tools=["ask_user_question", "exit_plan_mode"],
+                disabled_tools=["ask_user_question"],
             )
             await session.agent_loop.reload_with_initial_messages(
                 base_config=new_config
@@ -589,7 +604,7 @@ class VibeAcpAgentLoop(AcpAgent):
 
         new_config = VibeConfig.load(
             tool_paths=session.agent_loop.config.tool_paths,
-            disabled_tools=["ask_user_question", "exit_plan_mode"],
+            disabled_tools=["ask_user_question"],
         )
 
         await session.agent_loop.reload_with_initial_messages(base_config=new_config)
@@ -840,6 +855,9 @@ class VibeAcpAgentLoop(AcpAgent):
 
             elif isinstance(event, CompactEndEvent):
                 yield create_compact_end_session_update(event)
+
+            elif isinstance(event, AgentProfileChangedEvent):
+                pass
 
     @override
     async def cancel(self, session_id: str, **kwargs: Any) -> None:
