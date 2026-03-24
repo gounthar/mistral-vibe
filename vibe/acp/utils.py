@@ -23,6 +23,7 @@ from acp.schema import (
 
 from vibe.core.agents.models import AgentProfile, AgentType
 from vibe.core.proxy_setup import SUPPORTED_PROXY_VARS, get_current_proxy_settings
+from vibe.core.tools.permissions import RequiredPermission
 from vibe.core.types import CompactEndEvent, CompactStartEvent, LLMMessage
 from vibe.core.utils import compact_reduction_display
 
@@ -45,7 +46,7 @@ TOOL_OPTIONS = [
     ),
     PermissionOption(
         option_id=ToolOption.ALLOW_ALWAYS,
-        name="Allow always",
+        name="Allow for this session",
         kind=cast(Literal["allow_always"], ToolOption.ALLOW_ALWAYS),
     ),
     PermissionOption(
@@ -54,6 +55,44 @@ TOOL_OPTIONS = [
         kind=cast(Literal["reject_once"], ToolOption.REJECT_ONCE),
     ),
 ]
+
+
+def build_permission_options(
+    required_permissions: list[RequiredPermission] | None,
+) -> list[PermissionOption]:
+    """Build ACP permission options, including granular labels when available."""
+    if not required_permissions:
+        return TOOL_OPTIONS
+
+    labels = ", ".join(rp.label for rp in required_permissions)
+    permissions_meta = [
+        {
+            "scope": rp.scope,
+            "invocation_pattern": rp.invocation_pattern,
+            "session_pattern": rp.session_pattern,
+            "label": rp.label,
+        }
+        for rp in required_permissions
+    ]
+
+    return [
+        PermissionOption(
+            option_id=ToolOption.ALLOW_ONCE,
+            name="Allow once",
+            kind=cast(Literal["allow_once"], ToolOption.ALLOW_ONCE),
+        ),
+        PermissionOption(
+            option_id=ToolOption.ALLOW_ALWAYS,
+            name=f"Allow for this session: {labels}",
+            kind=cast(Literal["allow_always"], ToolOption.ALLOW_ALWAYS),
+            field_meta={"required_permissions": permissions_meta},
+        ),
+        PermissionOption(
+            option_id=ToolOption.REJECT_ONCE,
+            name="Reject once",
+            kind=cast(Literal["reject_once"], ToolOption.REJECT_ONCE),
+        ),
+    ]
 
 
 def is_valid_acp_mode(profiles: list[AgentProfile], mode_name: str) -> bool:

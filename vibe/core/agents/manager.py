@@ -10,9 +10,8 @@ from vibe.core.agents.models import (
     AgentType,
     BuiltinAgentName,
 )
+from vibe.core.config.harness_files import get_harness_files_manager
 from vibe.core.logger import logger
-from vibe.core.paths.config_paths import discover_local_agents_dirs
-from vibe.core.paths.global_paths import GLOBAL_AGENTS_DIR
 from vibe.core.utils import name_matches
 
 if TYPE_CHECKING:
@@ -51,19 +50,25 @@ class AgentManager:
 
     @property
     def available_agents(self) -> dict[str, AgentProfile]:
+        installed = self._config.installed_agents
+        base = {
+            name: profile
+            for name, profile in self._available.items()
+            if not profile.install_required or name in installed
+        }
         if self._config.enabled_agents:
             return {
                 name: profile
-                for name, profile in self._available.items()
+                for name, profile in base.items()
                 if name_matches(name, self._config.enabled_agents)
             }
         if self._config.disabled_agents:
             return {
                 name: profile
-                for name, profile in self._available.items()
+                for name, profile in base.items()
                 if not name_matches(name, self._config.disabled_agents)
             }
-        return dict(self._available)
+        return base
 
     @property
     def config(self) -> VibeConfig:
@@ -88,9 +93,9 @@ class AgentManager:
         for path in config.agent_paths:
             if path.is_dir():
                 paths.append(path)
-        paths.extend(discover_local_agents_dirs(Path.cwd()))
-        if GLOBAL_AGENTS_DIR.path.is_dir():
-            paths.append(GLOBAL_AGENTS_DIR.path)
+        mgr = get_harness_files_manager()
+        paths.extend(mgr.project_agents_dirs)
+        paths.extend(mgr.user_agents_dirs)
         unique: list[Path] = []
         for p in paths:
             rp = p.resolve()

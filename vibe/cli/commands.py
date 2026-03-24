@@ -22,9 +22,14 @@ class CommandRegistry:
                 handler="_show_help",
             ),
             "config": Command(
-                aliases=frozenset(["/config", "/model"]),
+                aliases=frozenset(["/config"]),
                 description="Edit config settings",
                 handler="_show_config",
+            ),
+            "model": Command(
+                aliases=frozenset(["/model"]),
+                description="Select active model",
+                handler="_show_model",
             ),
             "reload": Command(
                 aliases=frozenset(["/reload"]),
@@ -76,6 +81,21 @@ class CommandRegistry:
                 aliases=frozenset(["/resume", "/continue"]),
                 description="Browse and resume past sessions",
                 handler="_show_session_picker",
+            ),
+            "voice": Command(
+                aliases=frozenset(["/voice"]),
+                description="Configure voice settings",
+                handler="_show_voice_settings",
+            ),
+            "leanstall": Command(
+                aliases=frozenset(["/leanstall"]),
+                description="Install the Lean 4 agent (leanstral)",
+                handler="_install_lean",
+            ),
+            "unleanstall": Command(
+                aliases=frozenset(["/unleanstall"]),
+                description="Uninstall the Lean 4 agent",
+                handler="_uninstall_lean",
             ),
         }
 

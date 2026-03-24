@@ -4,7 +4,14 @@ from collections.abc import AsyncGenerator
 import os
 from typing import TYPE_CHECKING, ClassVar, final
 
-import mistralai
+from mistralai.client import Mistral
+from mistralai.client.errors import SDKError
+from mistralai.client.models import (
+    ConversationResponse,
+    MessageOutputEntry,
+    TextChunk,
+    ToolReferenceChunk,
+)
 from pydantic import BaseModel, Field
 
 from vibe.core.tools.base import (
@@ -16,7 +23,8 @@ from vibe.core.tools.base import (
     ToolPermission,
 )
 from vibe.core.tools.ui import ToolCallDisplay, ToolResultDisplay, ToolUIData
-from vibe.core.types import ToolStreamEvent
+from vibe.core.types import Backend, ToolStreamEvent
+from vibe.core.utils import get_server_url_from_api_base
 
 if TYPE_CHECKING:
     from vibe.core.types import ToolCallEvent, ToolResultEvent
@@ -65,8 +73,10 @@ class WebSearch(
         if not api_key:
             raise ToolError("MISTRAL_API_KEY environment variable not set.")
 
-        client = mistralai.Mistral(
-            api_key=api_key, timeout_ms=self.config.timeout * 1000
+        client = Mistral(
+            api_key=api_key,
+            server_url=self._resolve_server_url(ctx),
+            timeout_ms=self.config.timeout * 1000,
         )
 
         try:
@@ -81,22 +91,28 @@ class WebSearch(
 
                 yield self._parse_response(response)
 
-        except mistralai.SDKError as exc:
+        except SDKError as exc:
             raise ToolError(f"Mistral API error: {exc}") from exc
 
-    def _parse_response(
-        self, response: mistralai.ConversationResponse
-    ) -> WebSearchResult:
+    def _resolve_server_url(self, ctx: InvokeContext | None) -> str | None:
+        if not ctx or not ctx.agent_manager:
+            return None
+        for provider in ctx.agent_manager.config.providers:
+            if provider.backend == Backend.MISTRAL:
+                return get_server_url_from_api_base(provider.api_base)
+        return None
+
+    def _parse_response(self, response: ConversationResponse) -> WebSearchResult:
         text_parts: list[str] = []
         sources: dict[str, WebSearchSource] = {}
 
         for entry in response.outputs:
-            if not isinstance(entry, mistralai.MessageOutputEntry):
+            if not isinstance(entry, MessageOutputEntry):
                 continue
             for chunk in entry.content:
-                if isinstance(chunk, mistralai.TextChunk):
+                if isinstance(chunk, TextChunk):
                     text_parts.append(chunk.text)
-                elif isinstance(chunk, mistralai.ToolReferenceChunk) and chunk.url:
+                elif isinstance(chunk, ToolReferenceChunk) and chunk.url:
                     if chunk.url not in sources:
                         sources[chunk.url] = WebSearchSource(
                             title=chunk.title, url=chunk.url

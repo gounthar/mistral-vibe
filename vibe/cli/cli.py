@@ -5,9 +5,10 @@ from pathlib import Path
 import sys
 
 from rich import print as rprint
+import tomli_w
 
 from vibe import __version__
-from vibe.cli.textual_ui.app import run_textual_ui
+from vibe.cli.textual_ui.app import StartupOptions, run_textual_ui
 from vibe.core.agent_loop import AgentLoop
 from vibe.core.agents.models import BuiltinAgentName
 from vibe.core.config import (
@@ -16,10 +17,12 @@ from vibe.core.config import (
     VibeConfig,
     load_dotenv_values,
 )
+from vibe.core.config.harness_files import get_harness_files_manager
 from vibe.core.logger import logger
-from vibe.core.paths.config_paths import CONFIG_FILE, HISTORY_FILE
+from vibe.core.paths import HISTORY_FILE
 from vibe.core.programmatic import run_programmatic
 from vibe.core.session.session_loader import SessionLoader
+from vibe.core.tracing import setup_tracing
 from vibe.core.types import EntrypointMetadata, LLMMessage, OutputFormat, Role
 from vibe.core.utils import ConversationLimitException
 from vibe.setup.onboarding import run_onboarding
@@ -61,16 +64,21 @@ def load_config_or_exit() -> VibeConfig:
 
 
 def bootstrap_config_files() -> None:
-    if not CONFIG_FILE.path.exists():
+    mgr = get_harness_files_manager()
+    config_file = mgr.user_config_file
+    if not config_file.exists():
         try:
-            VibeConfig.save_updates(VibeConfig.create_default())
+            config_file.parent.mkdir(parents=True, exist_ok=True)
+            with config_file.open("wb") as f:
+                tomli_w.dump(VibeConfig.create_default(), f)
         except Exception as e:
             rprint(f"[yellow]Could not create default config file: {e}[/]")
 
-    if not HISTORY_FILE.path.exists():
+    history_file = HISTORY_FILE.path
+    if not history_file.exists():
         try:
-            HISTORY_FILE.path.parent.mkdir(parents=True, exist_ok=True)
-            HISTORY_FILE.path.write_text("Hello Vibe!\n", "utf-8")
+            history_file.parent.mkdir(parents=True, exist_ok=True)
+            history_file.write_text("Hello Vibe!\n", "utf-8")
         except Exception as e:
             rprint(f"[yellow]Could not create history file: {e}[/]")
 
@@ -97,6 +105,8 @@ def load_session(
                 f"{config.session_logging.save_dir}[/]"
             )
             sys.exit(1)
+    elif args.resume is True:
+        return None
     else:
         session_to_load = SessionLoader.find_session_by_id(
             args.resume, config.session_logging
@@ -143,6 +153,7 @@ def run_cli(args: argparse.Namespace) -> None:
     try:
         initial_agent_name = get_initial_agent_name(args)
         config = load_config_or_exit()
+        setup_tracing(config)
 
         if args.enabled_tools:
             config.enabled_tools = args.enabled_tools
@@ -151,6 +162,7 @@ def run_cli(args: argparse.Namespace) -> None:
 
         stdin_prompt = get_prompt_from_stdin()
         if args.prompt is not None:
+            config.disabled_tools = [*config.disabled_tools, "ask_user_question"]
             programmatic_prompt = args.prompt or stdin_prompt
             if not programmatic_prompt:
                 print(
@@ -198,8 +210,11 @@ def run_cli(args: argparse.Namespace) -> None:
 
             run_textual_ui(
                 agent_loop=agent_loop,
-                initial_prompt=args.initial_prompt or stdin_prompt,
-                teleport_on_start=args.teleport,
+                startup=StartupOptions(
+                    initial_prompt=args.initial_prompt or stdin_prompt,
+                    teleport_on_start=args.teleport,
+                    show_resume_picker=args.resume is True,
+                ),
             )
 
     except (KeyboardInterrupt, EOFError):
