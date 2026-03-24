@@ -44,15 +44,31 @@ jobs:
           export LD_LIBRARY_PATH="/opt/python-3.12/lib:${LD_LIBRARY_PATH:-}"
           uv run --no-dev --group build pyinstaller vibe-acp.spec
 
-      - name: Verify libpython is bundled
+      - name: Debug PyInstaller output
         run: |
-          echo "=== Contents of dist/vibe-acp-dir/_internal/ ==="
-          ls dist/vibe-acp-dir/_internal/libpython* 2>/dev/null || echo "WARNING: no libpython in _internal/"
-          echo "=== Checking with ldd ==="
-          ldd dist/vibe-acp-dir/vibe-acp 2>&1 | grep -i python || true
+          echo "=== dist/vibe-acp-dir/ ==="
+          ls -la dist/vibe-acp-dir/
+          echo "=== _internal/ (first 20 entries) ==="
+          ls dist/vibe-acp-dir/_internal/ | head -20
+          echo "=== libpython ==="
+          ls -la dist/vibe-acp-dir/_internal/libpython* 2>/dev/null || echo "no libpython in _internal/"
+          echo "=== file type ==="
+          file dist/vibe-acp-dir/vibe-acp
+          echo "=== bootloader check: does it have embedded archive? ==="
+          python3 -c "
+          import struct
+          with open('dist/vibe-acp-dir/vibe-acp', 'rb') as f:
+              f.seek(-24, 2)
+              magic = f.read(8)
+              print(f'Tail magic: {magic!r}')
+              print(f'Is onefile (MEI magic): {magic == b\"MEI\\014\\013\\012\\013\\016\"}')" || true
+          echo "=== LD_LIBRARY_PATH ==="
+          echo "${LD_LIBRARY_PATH:-<unset>}"
 
       - name: Smoke test bundled binary
-        run: ./dist/vibe-acp-dir/vibe-acp --version
+        run: |
+          cd dist/vibe-acp-dir
+          ./vibe-acp --version
 
       - name: Get package version
         id: version
