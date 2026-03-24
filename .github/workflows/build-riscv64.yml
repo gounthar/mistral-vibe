@@ -44,31 +44,28 @@ jobs:
           export LD_LIBRARY_PATH="/opt/python-3.12/lib:${LD_LIBRARY_PATH:-}"
           uv run --no-dev --group build pyinstaller vibe-acp.spec
 
-      - name: Debug PyInstaller output
+      - name: Debug PyInstaller bootloader
         run: |
-          echo "=== dist/vibe-acp-dir/ ==="
-          ls -la dist/vibe-acp-dir/
-          echo "=== _internal/ (first 20 entries) ==="
-          ls dist/vibe-acp-dir/_internal/ | head -20
-          echo "=== libpython ==="
-          ls -la dist/vibe-acp-dir/_internal/libpython* 2>/dev/null || echo "no libpython in _internal/"
-          echo "=== file type ==="
+          echo "=== PyInstaller version ==="
+          uv run python -c "import PyInstaller; print(PyInstaller.__version__)"
+          echo "=== Python used by uv ==="
+          uv run python --version
+          uv run python -c "import sys; print(sys.executable); print(sys.prefix)"
+          echo "=== Bootloader path ==="
+          uv run python -c "
+          from PyInstaller import __path__ as pi_path
+          import os, glob
+          bl = os.path.join(pi_path[0], 'bootloader')
+          for d in sorted(os.listdir(bl)):
+              print(f'  {d}/')
+              for f in sorted(glob.glob(os.path.join(bl, d, '*'))):
+                  print(f'    {os.path.basename(f)}')" || true
+          echo "=== Binary file info ==="
           file dist/vibe-acp-dir/vibe-acp
-          echo "=== bootloader check: does it have embedded archive? ==="
-          python3 -c "
-          import struct
-          with open('dist/vibe-acp-dir/vibe-acp', 'rb') as f:
-              f.seek(-24, 2)
-              magic = f.read(8)
-              print(f'Tail magic: {magic!r}')
-              print(f'Is onefile (MEI magic): {magic == b\"MEI\\014\\013\\012\\013\\016\"}')" || true
-          echo "=== LD_LIBRARY_PATH ==="
-          echo "${LD_LIBRARY_PATH:-<unset>}"
+          ls -la dist/vibe-acp-dir/_internal/libpython* 2>/dev/null
 
       - name: Smoke test bundled binary
-        run: |
-          cd dist/vibe-acp-dir
-          ./vibe-acp --version
+        run: ./dist/vibe-acp-dir/vibe-acp --version
 
       - name: Get package version
         id: version
