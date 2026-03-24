@@ -101,8 +101,8 @@ jobs:
 
   build-riscv64:
     name: linux-riscv64
-    runs-on: [self-hosted, linux, riscv64]
-    timeout-minutes: 45
+    runs-on: ubuntu-24.04-riscv
+    timeout-minutes: 60
     if: >-
       github.repository == 'mistralai/mistral-vibe' &&
       (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)
@@ -113,22 +113,29 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@08eba0b27e820071cde6df949e0beb9ba4906955 # v4
 
-      - name: Build vibe-acp for riscv64
-        run: bash scripts/build-riscv64.sh
+      - name: Install uv
+        run: curl -LsSf https://astral.sh/uv/install.sh | sh
+
+      - name: Sync dependencies
+        run: uv sync --no-dev --group build
+
+      - name: Build with PyInstaller
+        run: uv run --no-dev --group build pyinstaller vibe-acp.spec
+
+      - name: Smoke test bundled binary
+        run: ./dist/vibe-acp-dir/vibe-acp --version
 
       - name: Get package version
         id: get_version
         run: |
-          source .venv-riscv64/bin/activate
-          VERSION="$(python -c 'from vibe import __version__; print(__version__)')"
+          VERSION="$(uv run python -c 'from vibe import __version__; print(__version__)')"
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
-          deactivate
 
       - name: Upload binary artifact
         uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5
         with:
           name: vibe-acp-linux-riscv64-${{ steps.get_version.outputs.version }}
-          path: dist/vibe-acp
+          path: dist/vibe-acp-dir/
 
   attach-to-release:
     needs: [build-and-upload, build-riscv64]
