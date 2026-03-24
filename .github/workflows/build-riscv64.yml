@@ -24,6 +24,14 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@08eba0b27e820071cde6df949e0beb9ba4906955 # v4
 
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            gcc g++ make pkg-config \
+            python3-dev libffi-dev libssl-dev zlib1g-dev \
+            ripgrep zip
+
       - name: Install uv
         run: curl -LsSf https://astral.sh/uv/install.sh | sh
 
