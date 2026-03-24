@@ -30,10 +30,8 @@ jobs:
       - name: Get package version
         id: version
         run: |
-          source .venv-riscv64/bin/activate
-          VERSION="$(python -c 'from vibe import __version__; print(__version__)')"
+          VERSION="$(uv run python -c 'from vibe import __version__; print(__version__)')"
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
-          deactivate
 
       - name: Upload binary artifact
         uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5
@@ -127,8 +125,9 @@ jobs:
             echo ""
             echo '```bash'
             echo "unzip ${ARTIFACT_NAME}"
-            echo "chmod +x vibe-acp"
-            echo "sudo mv vibe-acp /usr/local/bin/"
+            echo "chmod +x vibe-acp-dir/vibe-acp"
+            echo "sudo mv vibe-acp-dir /opt/vibe-acp"
+            echo "sudo ln -sf /opt/vibe-acp/vibe-acp /usr/local/bin/vibe-acp"
             echo "vibe-acp --version"
             echo '```'
             echo ""
