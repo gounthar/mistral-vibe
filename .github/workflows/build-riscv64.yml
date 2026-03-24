@@ -44,28 +44,28 @@ jobs:
           export LD_LIBRARY_PATH="/opt/python-3.12/lib:${LD_LIBRARY_PATH:-}"
           uv run --no-dev --group build pyinstaller vibe-acp.spec
 
-      - name: Debug PyInstaller bootloader
+      - name: Debug build output
         run: |
           echo "=== PyInstaller version ==="
-          uv run python -c "import PyInstaller; print(PyInstaller.__version__)"
-          echo "=== Python used by uv ==="
-          uv run python --version
-          uv run python -c "import sys; print(sys.executable); print(sys.prefix)"
-          echo "=== Bootloader path ==="
-          uv run python -c "
+          uv run --no-dev --group build python -c "import PyInstaller; print(PyInstaller.__version__)"
+          echo "=== Bootloader used ==="
+          uv run --no-dev --group build python -c "
           from PyInstaller import __path__ as pi_path
           import os, glob
           bl = os.path.join(pi_path[0], 'bootloader')
           for d in sorted(os.listdir(bl)):
-              print(f'  {d}/')
-              for f in sorted(glob.glob(os.path.join(bl, d, '*'))):
-                  print(f'    {os.path.basename(f)}')" || true
-          echo "=== Binary file info ==="
-          file dist/vibe-acp-dir/vibe-acp
-          ls -la dist/vibe-acp-dir/_internal/libpython* 2>/dev/null
+              files = glob.glob(os.path.join(bl, d, '*'))
+              print(f'  {d}/: {[os.path.basename(f) for f in files]}')"
+          echo "=== dist/ structure ==="
+          find dist/ -maxdepth 3 -name '*.so*' -o -name 'vibe-acp' | sort
+          echo "=== _internal/ libpython ==="
+          ls -la dist/vibe-acp-dir/_internal/libpython* 2>/dev/null || echo "not found"
 
       - name: Smoke test bundled binary
-        run: ./dist/vibe-acp-dir/vibe-acp --version
+        run: |
+          # Set LD_LIBRARY_PATH to _internal/ in case bootloader doesn't find it
+          export LD_LIBRARY_PATH="$(pwd)/dist/vibe-acp-dir/_internal:${LD_LIBRARY_PATH:-}"
+          ./dist/vibe-acp-dir/vibe-acp --version
 
       - name: Get package version
         id: version
