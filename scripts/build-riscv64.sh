@@ -125,7 +125,7 @@ sed -i 's/"cryptography>=\([0-9.]*\),<=\?[0-9.]*"/"cryptography>=\1"/' pyproject
 
 # Limit concurrent Rust builds to avoid overwhelming riscv64 boards
 export UV_CONCURRENT_BUILDS=1
-uv sync --no-dev --group build
+uv sync --only-group build
 success "All dependencies synced"
 
 # ---------------------------------------------------------------------------
@@ -133,7 +133,7 @@ success "All dependencies synced"
 # ---------------------------------------------------------------------------
 step "Building vibe-acp with PyInstaller"
 
-uv run --no-dev --group build pyinstaller vibe-acp.spec 2>&1 | tail -n 15
+uv run --only-group build pyinstaller vibe-acp.spec 2>&1 | tail -n 15
 
 if [[ ! -f "$PROJECT_DIR/dist/vibe-acp-dir/vibe-acp" ]]; then
     error "Build failed: dist/vibe-acp-dir/vibe-acp not found"
