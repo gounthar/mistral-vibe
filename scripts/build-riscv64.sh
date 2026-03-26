@@ -118,14 +118,17 @@ cd "$PROJECT_DIR"
 
 # Relax cryptography upper bound for riscv64: pinned versions may lack
 # riscv64 wheels, forcing source builds. Newer patch releases ship wheels.
-info "Relaxing cryptography upper bound for riscv64 wheel availability..."
+info "Patching pyproject.toml for riscv64 compatibility..."
 cp pyproject.toml pyproject.toml.bak
 trap 'mv -f pyproject.toml.bak pyproject.toml 2>/dev/null || true' EXIT
+# Relax cryptography upper bound: pinned versions may lack riscv64 wheels
 sed -i 's/"cryptography>=\([0-9.]*\),<=\?[0-9.]*"/"cryptography>=\1"/' pyproject.toml
+# Remove typos from dev deps: its PyPI sdist has a broken pyproject.toml
+# that uv cannot parse, and uv resolves dev deps even with --no-dev
+sed -i '/"typos>=/d' pyproject.toml
 
 # Limit concurrent Rust builds to avoid overwhelming riscv64 boards
 export UV_CONCURRENT_BUILDS=1
-# Remove lockfile to avoid resolving broken dev deps (typos sdist)
 rm -f uv.lock
 uv sync --no-dev --group build
 success "All dependencies synced"
