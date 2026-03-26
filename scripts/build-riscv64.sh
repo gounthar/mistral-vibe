@@ -41,7 +41,7 @@ step()    { echo -e "\n${BOLD}==> $1${NC}"; }
 # ---------------------------------------------------------------------------
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
-UV_VERSION="${UV_VERSION:-0.10.0}"
+UV_VERSION="${UV_VERSION:-0.11.1}"
 
 # ---------------------------------------------------------------------------
 # Step 1: Dependency check
