@@ -30,7 +30,7 @@ jobs:
       - name: Get package version
         id: version
         run: |
-          VERSION="$(uv run python -c 'from vibe import __version__; print(__version__)')"
+          VERSION="$(grep -oP '(?<=^version = ")[^"]+' pyproject.toml.bak 2>/dev/null || grep -oP '(?<=^version = ")[^"]+' pyproject.toml)"
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
 
       - name: Upload binary artifact
