@@ -37,7 +37,7 @@ jobs:
         uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5
         with:
           name: vibe-acp-linux-riscv64-${{ steps.version.outputs.version }}
-          path: dist/vibe-acp-dir/
+          path: dist/
 
   create-release:
     name: Create fork release
