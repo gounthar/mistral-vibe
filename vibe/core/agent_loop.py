@@ -161,18 +161,19 @@ class AgentLoop:
         entrypoint_metadata: EntrypointMetadata | None = None,
     ) -> None:
         self._base_config = config
+        self.mcp_registry = MCPRegistry()
+        self.agent_manager = AgentManager(
+            lambda: self._base_config, initial_agent=agent_name
+        )
+        self.tool_manager = ToolManager(
+            lambda: self.config, mcp_registry=self.mcp_registry
+        )
+        self.skill_manager = SkillManager(lambda: self.config)
+        self.message_observer = message_observer
         self._max_turns = max_turns
         self._max_price = max_price
         self._plan_session = PlanSession()
 
-        self.agent_manager = AgentManager(
-            lambda: self._base_config, initial_agent=agent_name
-        )
-        self._mcp_registry = MCPRegistry()
-        self.tool_manager = ToolManager(
-            lambda: self.config, mcp_registry=self._mcp_registry
-        )
-        self.skill_manager = SkillManager(lambda: self.config)
         self.format_handler = APIToolFormatHandler()
 
         self.backend_factory = lambda: backend or self._select_backend()
@@ -181,7 +182,6 @@ class AgentLoop:
             backend_getter=lambda: self.backend, config_getter=lambda: self.config
         )
 
-        self.message_observer = message_observer
         self.enable_streaming = enable_streaming
         self.middleware_pipeline = MiddlewarePipeline()
         self._setup_middleware()
@@ -193,6 +193,11 @@ class AgentLoop:
         self.messages = MessageList(initial=[system_message], observer=message_observer)
 
         self.stats = AgentStats()
+        self.approval_callback: ApprovalCallback | None = None
+        self.user_input_callback: UserInputCallback | None = None
+        self.entrypoint_metadata = entrypoint_metadata
+        self.session_id = str(uuid4())
+
         try:
             active_model = config.get_active_model()
             self.stats.input_price_per_million = active_model.input_price
@@ -200,11 +205,6 @@ class AgentLoop:
         except ValueError:
             pass
 
-        self.approval_callback: ApprovalCallback | None = None
-        self.user_input_callback: UserInputCallback | None = None
-
-        self.entrypoint_metadata = entrypoint_metadata
-        self.session_id = str(uuid4())
         self._current_user_message_id: str | None = None
         self._is_user_prompt_call: bool = False
 
@@ -244,6 +244,16 @@ class AgentLoop:
     @property
     def auto_approve(self) -> bool:
         return self.config.auto_approve
+
+    def refresh_config(self) -> None:
+        self._base_config = VibeConfig.load()
+        self.agent_manager.invalidate_config()
+
+    def set_approval_callback(self, callback: ApprovalCallback) -> None:
+        self.approval_callback = callback
+
+    def set_user_input_callback(self, callback: UserInputCallback) -> None:
+        self.user_input_callback = callback
 
     def set_tool_permission(
         self, tool_name: str, permission: ToolPermission, save_permanently: bool = False
@@ -290,10 +300,6 @@ class AgentLoop:
             self.set_tool_permission(
                 tool_name, ToolPermission.ALWAYS, save_permanently=save_permanently
             )
-
-    def refresh_config(self) -> None:
-        self._base_config = VibeConfig.load()
-        self.agent_manager.invalidate_config()
 
     def emit_new_session_telemetry(self) -> None:
         entrypoint = (
@@ -344,7 +350,9 @@ class AgentLoop:
             self.agent_profile,
         )
 
-    async def act(self, msg: str) -> AsyncGenerator[BaseEvent]:
+    async def act(
+        self, msg: str, client_message_id: str | None = None
+    ) -> AsyncGenerator[BaseEvent, None]:
         self._clean_message_history()
         self.rewind_manager.create_checkpoint()
         try:
@@ -352,7 +360,9 @@ class AgentLoop:
         except ValueError:
             model_name = None
         async with agent_span(model=model_name, session_id=self.session_id):
-            async for event in self._conversation_loop(msg):
+            async for event in self._conversation_loop(
+                msg, client_message_id=client_message_id
+            ):
                 yield event
 
     @property
@@ -372,6 +382,7 @@ class AgentLoop:
                 nuage_workflow_id=self.config.nuage_workflow_id,
                 nuage_api_key=self.config.nuage_api_key,
                 nuage_task_queue=self.config.nuage_task_queue,
+                vibe_config=self._base_config,
             )
         return self._teleport_service
 
@@ -511,8 +522,12 @@ class AgentLoop:
         }
         return headers
 
-    async def _conversation_loop(self, user_msg: str) -> AsyncGenerator[BaseEvent]:
-        user_message = LLMMessage(role=Role.user, content=user_msg)
+    async def _conversation_loop(
+        self, user_msg: str, client_message_id: str | None = None
+    ) -> AsyncGenerator[BaseEvent]:
+        user_message = LLMMessage(
+            role=Role.user, content=user_msg, message_id=client_message_id
+        )
         self.messages.append(user_message)
         self.stats.steps += 1
         self._current_user_message_id = user_message.message_id
@@ -604,11 +619,14 @@ class AgentLoop:
         self,
     ) -> AsyncGenerator[AssistantEvent | ReasoningEvent | ToolCallEvent]:
         message_id: str | None = None
+        reasoning_message_id: str | None = None
         emitted_tool_call_ids = set[str]()
 
         async for chunk in self._chat_streaming():
             if message_id is None:
                 message_id = chunk.message.message_id
+            if reasoning_message_id is None:
+                reasoning_message_id = chunk.message.reasoning_message_id
 
             for event in self._build_tool_call_events(
                 chunk.message.tool_calls, emitted_tool_call_ids
@@ -618,7 +636,8 @@ class AgentLoop:
 
             if chunk.message.reasoning_content:
                 yield ReasoningEvent(
-                    content=chunk.message.reasoning_content, message_id=message_id
+                    content=chunk.message.reasoning_content,
+                    message_id=reasoning_message_id,
                 )
 
             if chunk.message.content:
@@ -1017,7 +1036,8 @@ class AgentLoop:
                 return ToolDecision(
                     verdict=ToolExecutionResponse.SKIP,
                     approval_type=ToolPermission.NEVER,
-                    feedback=f"Tool '{tool_name}' is permanently disabled",
+                    feedback=ctx.reason
+                    or f"Tool '{tool_name}' is permanently disabled",
                 )
             case _:
                 uncovered = [
@@ -1066,7 +1086,6 @@ class AgentLoop:
         if len(self.messages) < ACCEPTABLE_HISTORY_SIZE:
             return
         self._fill_missing_tool_responses()
-        self._ensure_assistant_after_tools()
 
     def _fill_missing_tool_responses(self) -> None:
         i = 1
@@ -1114,25 +1133,9 @@ class AgentLoop:
 
             i += 1
 
-    def _ensure_assistant_after_tools(self) -> None:
-        MIN_MESSAGE_SIZE = 2
-        if len(self.messages) < MIN_MESSAGE_SIZE:
-            return
-
-        last_msg = self.messages[-1]
-        if last_msg.role is Role.tool:
-            empty_assistant_msg = LLMMessage(role=Role.assistant, content="Understood.")
-            self.messages.append(empty_assistant_msg)
-
     def _reset_session(self) -> None:
         self.session_id = str(uuid4())
         self.session_logger.reset_session(self.session_id)
-
-    def set_approval_callback(self, callback: ApprovalCallback) -> None:
-        self.approval_callback = callback
-
-    def set_user_input_callback(self, callback: UserInputCallback) -> None:
-        self.user_input_callback = callback
 
     async def clear_history(self) -> None:
         await self.session_logger.save_interaction(
@@ -1266,7 +1269,7 @@ class AgentLoop:
             self._max_price = max_price
 
         self.tool_manager = ToolManager(
-            lambda: self.config, mcp_registry=self._mcp_registry
+            lambda: self.config, mcp_registry=self.mcp_registry
         )
         self.skill_manager = SkillManager(lambda: self.config)
 

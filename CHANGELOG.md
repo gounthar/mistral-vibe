@@ -5,6 +5,52 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.7.3] - 2026-04-03
+
+### Added
+
+- `/data-retention` slash command to view Mistral AI's data retention notice and privacy settings
+
+
+## [2.7.2] - 2026-04-01
+
+### Added
+
+- Alt+Left / Alt+Right keyboard shortcuts for word-wise cursor movement in chat input
+
+### Changed
+
+- Refactored narrator into a dedicated narrator manager
+
+### Fixed
+
+- Broken build on Linux
+- Errored MCP servers are now excluded from the banner count
+- Improved bash denylist matching and error messages
+- Command messages are now skipped during rewind navigation
+
+
+## [2.7.1] - 2026-03-31
+
+### Added
+
+- ACP message-id support for reliable message boundary identification
+- Reasoning effort parameter for supported models
+
+### Changed
+
+- Updated MistralAI SDK
+- Updated ACP SDK dependency
+- Refined system prompt wording and structure
+- Reduced scroll sensitivity to 1 line per tick for smoother scrolling
+
+### Fixed
+
+- Non-standard HTTP 529 status codes now handled gracefully in error formatting and retried
+- Text selection errors when copying from unmounting components
+- Excluded "injected" field from user messages in generic backend
+
+
 ## [2.7.0] - 2026-03-24
 
 ### Added
