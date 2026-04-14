@@ -185,7 +185,9 @@ class TestTeleportServiceCheckSupported:
         self, service: TeleportService
     ) -> None:
         service._git.get_info = AsyncMock(
-            side_effect=ServiceTeleportNotSupportedError("Not a git repository")
+            side_effect=ServiceTeleportNotSupportedError(
+                "Teleport requires a git repository. cd into a project with a .git directory and try again."
+            )
         )
         with pytest.raises(ServiceTeleportNotSupportedError):
             await service.check_supported()
@@ -381,6 +383,31 @@ class TestTeleportServiceExecute:
         assert events[3].oauth_url == "https://github.com/login/oauth"
         assert isinstance(events[4], TeleportAuthCompleteEvent)
         assert isinstance(events[-1], TeleportCompleteEvent)
+
+    @pytest.mark.asyncio
+    async def test_execute_raises_when_chat_url_is_none(
+        self,
+        service: TeleportService,
+        git_info: GitRepoInfo,
+        mock_github_connected: MagicMock,
+    ) -> None:
+        service._git.get_info = AsyncMock(return_value=git_info)
+        service._git.is_commit_pushed = AsyncMock(return_value=True)
+
+        mock_nuage = MagicMock()
+        mock_nuage.start_workflow = AsyncMock(return_value="exec-123")
+        mock_nuage.get_github_integration = AsyncMock(
+            return_value=mock_github_connected
+        )
+        mock_nuage.get_chat_assistant_url = AsyncMock(return_value=None)
+        service._nuage = mock_nuage
+
+        session = TeleportSession()
+        gen = service.execute("test prompt", session)
+
+        with pytest.raises(ServiceTeleportError, match="not available"):
+            async for _ in gen:
+                pass
 
     @pytest.mark.asyncio
     async def test_execute_uses_default_prompt_when_none(

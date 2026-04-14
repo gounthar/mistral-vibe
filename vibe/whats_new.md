@@ -1,3 +1,4 @@
-# What's new in v2.7.3
+# What's new in v2.7.5
 
-- **Data retention command**: Added a `/data-retention` slash command to view Mistral AI's data retention notice and privacy settings
+- **Trust dialog**: Display detected files and LLM risks in the trust folder dialog
+- **Faster startup**: Deferred MCP and git I/O to a background thread for faster CLI startup
