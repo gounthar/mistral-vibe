@@ -89,11 +89,42 @@ jobs:
       contents: write
       actions: write
     steps:
+      # Validate the sync token before checkout. Without this, an expired token
+      # surfaces as a cryptic "could not read Username for https://github.com"
+      # git error three retries deep. Fail fast with an actionable message and
+      # warn while the expiry is still a week out.
+      - name: Verify sync token
+        env:
+          GH_TOKEN: ${{ secrets.DISPATCH_TOKEN }}
+        run: |
+          if [ -z "$GH_TOKEN" ]; then
+            echo "::error::DISPATCH_TOKEN secret is empty. Set it to a PAT with Contents (write) and Actions (write) access: gh secret set DISPATCH_TOKEN --repo $GITHUB_REPOSITORY"
+            exit 1
+          fi
+          if ! resp="$(gh api -i user 2>&1)"; then
+            echo "::error::DISPATCH_TOKEN is invalid or expired. Regenerate a fine-grained PAT (Contents: RW, Actions: RW) and run: gh secret set DISPATCH_TOKEN --repo $GITHUB_REPOSITORY"
+            exit 1
+          fi
+          exp="$(printf '%s\n' "$resp" | grep -i '^github-authentication-token-expiration:' | cut -d' ' -f2- | tr -d '\r')"
+          if [ -n "$exp" ]; then
+            echo "Token valid. Expires: $exp"
+            exp_epoch="$(date -d "$exp" +%s 2>/dev/null || echo 0)"
+            if [ "$exp_epoch" -gt 0 ]; then
+              days_left=$(( (exp_epoch - $(date +%s)) / 86400 ))
+              echo "Days until expiry: $days_left"
+              if [ "$days_left" -lt 7 ]; then
+                echo "::warning::DISPATCH_TOKEN expires in $days_left day(s). Rotate it: gh secret set DISPATCH_TOKEN --repo $GITHUB_REPOSITORY"
+              fi
+            fi
+          else
+            echo "Token valid (no expiry set)."
+          fi
+
       - name: Checkout fork (full history for merge)
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
         with:
           fetch-depth: 0
-          token: ${{ secrets.PAT_TOKEN }}
+          token: ${{ secrets.DISPATCH_TOKEN }}
 
       - name: Merge upstream tag
         env:
@@ -127,7 +158,7 @@ jobs:
       # allowed to trigger new runs even with GITHUB_TOKEN).
       - name: Trigger riscv64 build workflow
         env:
-          GH_TOKEN: ${{ secrets.PAT_TOKEN }}
+          GH_TOKEN: ${{ secrets.DISPATCH_TOKEN }}
         run: |
           echo "Dispatching build-riscv64 workflow..."
           gh workflow run build-riscv64.yml --repo "$GITHUB_REPOSITORY" --ref main
