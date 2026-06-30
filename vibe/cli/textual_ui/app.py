@@ -28,6 +28,7 @@ from textual.theme import BUILTIN_THEMES
 from textual.timer import Timer
 from textual.widget import Widget
 from textual.widgets import Static
+from textual.worker import Worker, WorkerFailed, WorkerState
 
 from vibe import __version__ as CORE_VERSION
 from vibe.cli.clipboard import copy_selection_to_clipboard, copy_text_to_clipboard
@@ -51,6 +52,12 @@ from vibe.cli.textual_ui.handlers.event_handler import EventHandler
 from vibe.cli.textual_ui.lazy_audio_managers import (
     create_default_narrator_manager,
     create_default_voice_manager,
+)
+from vibe.cli.textual_ui.mcp_commands import (
+    MCP_ADD_HELP,
+    is_mcp_add_help_request,
+    parse_mcp_add_args,
+    parse_mcp_subcommand,
 )
 from vibe.cli.textual_ui.message_queue import MessageQueue, QueueController, QueuePorts
 from vibe.cli.textual_ui.notifications import (
@@ -171,6 +178,7 @@ from vibe.core.log_reader import LogReader
 from vibe.core.logger import logger
 from vibe.core.paths import HISTORY_FILE
 from vibe.core.rewind import RewindError
+from vibe.core.sentry import capture_sentry_exception
 from vibe.core.session.image_snapshot import ImageSnapshotError, snapshot_image
 from vibe.core.session.resume_sessions import (
     ResumeSessionInfo,
@@ -202,7 +210,11 @@ from vibe.core.tools.builtins.ask_user_question import (
     Question,
 )
 from vibe.core.tools.connectors.counts import compute_connector_counts
-from vibe.core.tools.mcp_settings import persist_mcp_toggle
+from vibe.core.tools.mcp_settings import (
+    MCPServerAddError,
+    persist_mcp_toggle,
+    persist_oauth_mcp_server,
+)
 from vibe.core.tools.permissions import RequiredPermission
 from vibe.core.types import (
     MAX_IMAGE_BYTES,
@@ -1811,11 +1823,13 @@ class VibeApp(App):  # noqa: PLR0904
                 self._pending_question = None
                 await self._switch_to_input_app()
 
-    async def _handle_turn_error(self) -> None:
+    async def _handle_turn_error(self, *, cancelled: bool = False) -> None:
         if self._loading_widget and self._loading_widget.parent:
             await self._loading_widget.remove()
         if self.event_handler:
-            self.event_handler.stop_current_tool_call(success=False)
+            self.event_handler.stop_current_tool_call(
+                success=False, cancelled=cancelled
+            )
 
     async def _handle_agent_loop_init(self) -> None:
         show_init_spinner = not self.agent_loop.is_initialized
@@ -1890,7 +1904,7 @@ class VibeApp(App):  # noqa: PLR0904
             ) as events:
                 await self._handle_agent_loop_events(events)
         except asyncio.CancelledError:
-            await self._handle_turn_error()
+            await self._handle_turn_error(cancelled=True)
             self._narrator_manager.on_turn_cancel()
             raise
         except Exception as e:
@@ -1917,6 +1931,7 @@ class VibeApp(App):  # noqa: PLR0904
             self._loading_widget = None
             if self.event_handler:
                 await self.event_handler.finalize_streaming()
+                self.event_handler.escalate_unresolved_errors()
             self._queue.notify_busy_changed()
             self._queue.start_drain_if_needed()
             await self._refresh_windowing_from_history()
@@ -2109,7 +2124,7 @@ class VibeApp(App):  # noqa: PLR0904
                 pass
 
         if self.event_handler:
-            self.event_handler.stop_current_tool_call(success=False)
+            self.event_handler.stop_current_tool_call(cancelled=True)
             self.event_handler.stop_current_compact()
             await self.event_handler.finalize_streaming()
 
@@ -2154,24 +2169,24 @@ class VibeApp(App):  # noqa: PLR0904
         return "Refreshed."
 
     async def _maybe_handle_mcp_subcommand(self, cmd_args: str) -> bool:
-        parts = cmd_args.strip().split(None, 1)
-        if not parts or parts[0] not in {"login", "logout", "status"}:
+        parsed = parse_mcp_subcommand(cmd_args)
+        if parsed is None:
             return False
 
-        subcommand = parts[0]
-        arg = parts[1].strip() if len(parts) > 1 else ""
-        match subcommand:
+        match parsed.name:
+            case "add":
+                await self._mcp_add(parsed.args)
             case "status":
-                if arg:
+                if parsed.args:
                     await self._mount_and_scroll(
                         ErrorMessage("Usage: /mcp status", collapsed=True)
                     )
                     return True
                 await self._show_mcp_status()
             case "login":
-                await self._mcp_login(arg)
+                await self._mcp_login(parsed.args)
             case "logout":
-                await self._mcp_logout(arg)
+                await self._mcp_logout(parsed.args)
         return True
 
     async def _show_mcp_status(self) -> None:
@@ -2252,6 +2267,49 @@ class VibeApp(App):  # noqa: PLR0904
         await self._mount_and_scroll(
             UserCommandMessage(f"MCP server `{alias}` logged out.")
         )
+
+    async def _mcp_add(self, raw_args: str) -> None:
+        if is_mcp_add_help_request(raw_args):
+            await self._mount_and_scroll(UserCommandMessage(MCP_ADD_HELP))
+            return
+
+        try:
+            args = parse_mcp_add_args(raw_args)
+        except ValueError as exc:
+            await self._mount_and_scroll(ErrorMessage(str(exc), collapsed=True))
+            return
+
+        try:
+            result = persist_oauth_mcp_server(
+                self.agent_loop.config,
+                url=args.url,
+                name=args.name,
+                scopes=args.scopes,
+                transport=args.transport,
+            )
+        except MCPServerAddError as exc:
+            await self._mount_and_scroll(ErrorMessage(str(exc), collapsed=True))
+            return
+
+        self.agent_loop.refresh_config()
+        await self._refresh_mcp_browser()
+        head = (
+            f"Added OAuth MCP server `{result.name}`."
+            if result.created
+            else f"OAuth MCP server `{result.name}` is already configured."
+        )
+        tail = (
+            "Starting OAuth login..."
+            if args.login
+            else (
+                f"Run `/mcp login {result.name}` to authenticate, "
+                "or `/mcp status` to inspect it."
+            )
+        )
+        await self._mount_and_scroll(UserCommandMessage(f"{head}\n{tail}"))
+
+        if args.login:
+            await self._mcp_login(result.name)
 
     async def _show_mcp(self, cmd_args: str = "", **kwargs: Any) -> None:
         if await self._maybe_handle_mcp_subcommand(cmd_args):
@@ -3723,14 +3781,50 @@ class VibeApp(App):  # noqa: PLR0904
             telemetry_client=self.agent_loop.telemetry_client,
         )
 
+    def _handle_exception(self, error: Exception) -> None:
+        if not isinstance(error, WorkerFailed):
+            capture_sentry_exception(
+                error, fatal=True, tags={"vibe_boundary": "textual_app"}
+            )
+        return super()._handle_exception(error)
+
+    def on_worker_state_changed(self, event: Worker.StateChanged) -> None:
+        error = event.worker.error
+        if event.state == WorkerState.ERROR and error:
+            capture_sentry_exception(
+                error,
+                fatal=False,
+                tags={
+                    "vibe_boundary": "textual_worker",
+                    "worker_name": event.worker.name or "",
+                },
+            )
+
 
 async def _run_app_with_cleanup(app: VibeApp) -> str | None:
     from vibe.cli.stderr_guard import stderr_guard
+
+    loop = asyncio.get_running_loop()
+    if not WINDOWS:
+        try:
+
+            def _sigterm_handler() -> None:
+                loop.remove_signal_handler(signal.SIGTERM)
+                app._force_quit()
+
+            loop.add_signal_handler(signal.SIGTERM, _sigterm_handler)
+        except (NotImplementedError, OSError):
+            pass
 
     try:
         with stderr_guard():
             return await app.run_async()
     finally:
+        if not WINDOWS:
+            try:
+                loop.remove_signal_handler(signal.SIGTERM)
+            except (NotImplementedError, OSError):
+                pass
         sys.stderr.write("Closing\u2026\r")
         sys.stderr.flush()
         try:
