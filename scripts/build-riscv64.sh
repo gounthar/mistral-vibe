@@ -126,6 +126,12 @@ sed -i 's/"cryptography>=\([0-9.]*\),<=\?[0-9.]*"/"cryptography>=\1"/' pyproject
 # Remove typos from dev deps: its PyPI sdist has a broken pyproject.toml
 # that uv cannot parse, and uv resolves dev deps even with --no-dev
 sed -i '/"typos>=/d' pyproject.toml
+# Drop the Unified Harness runtime: PyPI ships wheels only (no sdist) for
+# x86_64, aarch64, macOS and Windows, so riscv64 has nothing to resolve.
+# Every reference to it under vibe/ is a lazy import guarded by
+# experimental_harness_available(), so the binary runs fine without it --
+# only the --experimental-harness backend is unavailable.
+sed -i '/"mistralai-vibe-local-harness==/d' pyproject.toml
 
 # Limit concurrent Rust builds to avoid overwhelming riscv64 boards
 export UV_CONCURRENT_BUILDS=1
