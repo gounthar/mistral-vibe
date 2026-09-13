@@ -48,6 +48,32 @@
         untokenize = prev.untokenize.overrideAttrs (old: {
           buildInputs = (old.buildInputs or []) ++ final.resolveBuildSystem {setuptools = [];};
         });
+
+        # cryptography 50.0.0 has no macOS x86_64 wheel. Source builds need
+        # the Python backend and vendored Rust crates inside the Nix sandbox.
+        cryptography = prev.cryptography.overrideAttrs (old:
+          lib.optionalAttrs (old.passthru.format == "pyproject") {
+            cargoDeps = pkgs.rustPlatform.fetchCargoVendor {
+              inherit (old) pname version src;
+              # Matches cryptography 50.0.0 in nixpkgs (a7e1a760ab81).
+              hash = "sha256-heJGLh0MgDPpksWyPLaIkZ5gVEWx8UnaJKv4GvclpmI=";
+            };
+            buildInputs = (old.buildInputs or [])
+              ++ [pkgs.openssl]
+              ++ lib.optionals pkgs.stdenv.isDarwin [pkgs.libiconv];
+            nativeBuildInputs = (old.nativeBuildInputs or [])
+              ++ final.resolveBuildSystem {
+                maturin = [];
+                cffi = [];
+                setuptools = [];
+              }
+              ++ [
+                pkgs.rustPlatform.cargoSetupHook
+                pkgs.cargo
+                pkgs.rustc
+                pkgs.pkg-config
+              ];
+          });
       };
 
       pkgs = import nixpkgs {
