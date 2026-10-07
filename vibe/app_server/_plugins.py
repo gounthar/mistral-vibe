@@ -72,6 +72,8 @@ from vibe.core.plugins import (
 from vibe.core.skills.models import SkillInfo, SkillScope
 
 if TYPE_CHECKING:
+    from pydantic import JsonValue
+
     from mistralai_vibe_local_harness.protocol import (
         RustAgentTypeDefinition,
         RustKnowledgeFolderDefinition,
@@ -88,8 +90,6 @@ if TYPE_CHECKING:
         RestoredPlugins,
         SessionPluginProjection,
     )
-    from pydantic import JsonValue
-
     from vibe.app_server._plugin_mcp import PluginMCPCatalog
     from vibe.core.config.models import MCPServer
     from vibe.core.tools.connectors.connector_registry import ConnectorRegistry
@@ -97,7 +97,7 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
-def _builtin_plugin_roots() -> list[Path]:
+def packaged_builtin_plugin_roots() -> list[Path]:
     """Discover built-in plugin directories shipped inside the package."""
     try:
         import vibe.plugins.builtins as _pkg
@@ -158,7 +158,7 @@ async def resolve_session_plugins(
     exact plugin sets).
     """
     if builtin_plugin_roots is None:
-        builtin_plugin_roots = _builtin_plugin_roots()
+        builtin_plugin_roots = packaged_builtin_plugin_roots()
     resolution = await asyncio.to_thread(
         _resolve_installed, harness_files, config_orchestrator, builtin_plugin_roots
     )
