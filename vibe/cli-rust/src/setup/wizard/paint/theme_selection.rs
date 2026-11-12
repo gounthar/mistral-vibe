@@ -1,7 +1,8 @@
-//! The onboarding theme-selection screen (Python `ThemeSelectionScreen`).
+//! The onboarding theme-selection screen.
 
 use ratatui::layout::{Alignment, Constraint, Layout, Rect};
 use ratatui::style::{Modifier, Style};
+use ratatui::text::Line;
 use ratatui::widgets::{Block, BorderType, Borders, Paragraph};
 use ratatui::Frame;
 
@@ -85,7 +86,7 @@ pub(super) fn draw(app: &mut App, wizard: &mut OnboardingState, f: &mut Frame, a
         Block::default()
             .borders(Borders::ALL)
             .border_type(BorderType::Rounded)
-            .border_style(Style::default().fg(theme::popup_border())),
+            .border_style(theme::border_style()),
         Rect::new(list_x, selected_y, list_w, 3),
     );
     let centered = format!(
@@ -93,7 +94,7 @@ pub(super) fn draw(app: &mut App, wizard: &mut OnboardingState, f: &mut Frame, a
         opts[selected],
         width = (list_w as usize).saturating_sub(2)
     );
-    // Python's theme screen has no hover affordance; the selection renders
+    // The theme screen has no hover affordance; the selection renders
     // identically whether or not the pointer sits on it.
     let selected_style = Style::default()
         .fg(text_color())
@@ -181,10 +182,10 @@ fn fade_style(distance: usize) -> Style {
 }
 
 /// The pane's geometry and content: the rendered Markdown, the pane height
-/// (content height, clipped by the Python `max-height`), and the content width
-/// (the container scrollbar, when the pane clips, narrows the widget by two
-/// columns).
-type Preview = (u16, u16, Vec<ratatui::text::Line<'static>>);
+/// (content height, clipped by the pane's maximum height), and the content
+/// width (the container scrollbar, when the pane clips, narrows the widget
+/// by two columns).
+type Preview = (u16, u16, Vec<Line<'static>>);
 
 fn preview_pane(area_width: u16, max_height: u16) -> Preview {
     let width = 70u16.min(area_width);
@@ -202,9 +203,9 @@ fn preview_pane(area_width: u16, max_height: u16) -> Preview {
     )
 }
 
-/// The preview pane (Python `#preview`): a bordered, scrollable container
-/// holding a plain `Markdown` widget, so it renders with Textual's own
-/// defaults. The scrollbar is the shared, draggable one.
+/// The preview pane: a bordered, scrollable container holding a plain
+/// Markdown render with default styling. The scrollbar is the shared,
+/// draggable one.
 fn draw_preview(
     app: &mut App,
     wizard: &mut OnboardingState,
@@ -222,8 +223,11 @@ fn draw_preview(
         Block::default()
             .borders(Borders::ALL)
             .border_type(BorderType::Rounded)
-            .border_style(Style::default().fg(theme::popup_border()))
-            .title(" Preview ")
+            .border_style(theme::border_style())
+            .title(Line::styled(
+                " Preview ",
+                theme::text(theme::popup_border()),
+            ))
             .title_alignment(Alignment::Center),
         Rect::new(x, area.y, width, pane_h),
     );

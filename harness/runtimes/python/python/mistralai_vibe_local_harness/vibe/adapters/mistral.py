@@ -1,16 +1,18 @@
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
+from collections.abc import AsyncGenerator, Mapping, Sequence
+from contextlib import aclosing
 from html import escape
 import json
 import re
-from typing import Any, Literal, cast
+from typing import Any, cast
 
-import httpx
+import httpx2
 from mistralai.client import Mistral
 from mistralai.client.models.chatcompletionstreamrequest import (
     ChatCompletionStreamRequestMessageTypedDict,
 )
+from mistralai.client.models.completionevent import CompletionEvent
 from mistralai.client.utils.retries import BackoffStrategy, RetryConfig
 
 from mistralai_vibe_local_harness.protocol import (
@@ -38,6 +40,10 @@ from mistralai_vibe_local_harness.protocol import (
     tool_call_wire_arguments,
 )
 from mistralai_vibe_local_harness.vibe._credentials import ProviderCredentialSnapshot
+from mistralai_vibe_local_harness.vibe._http_transport import (
+    env_proxy_transport,
+    keepalive_socket_options,
+)
 from mistralai_vibe_local_harness.vibe._runtime_config import (
     LocalModelRoute,
     LocalRuntimeAdapterConfig,
@@ -49,13 +55,32 @@ from mistralai_vibe_local_harness.vibe._ssl import build_ssl_context
 from mistralai_vibe_local_harness.vibe.adapters._correlation import correlation_hook
 from mistralai_vibe_local_harness.vibe.adapters._provider_failure import (
     IncompleteProviderStream,
+    is_read_timeout,
     until_connection_lost,
 )
+from mistralai_vibe_local_harness.vibe.adapters._reply_usage import (
+    has_reply_usage,
+    reply_token_usage,
+)
+from mistralai_vibe_local_harness.vibe.adapters._request_log import (
+    log_completion_request,
+)
 from mistralai_vibe_local_harness.vibe.adapters._retry import (
+    ProviderAttempt,
     RetryNotices,
     call_with_retries,
 )
-from mistralai_vibe_local_harness.vibe.adapters._stream_idle import StreamIdleGuard
+from mistralai_vibe_local_harness.vibe.adapters._tool_call_finish import (
+    CompletionSource,
+    MalformedToolCalls,
+    align_finish_reason,
+)
+from mistralai_vibe_local_harness.vibe.completion_profile import (
+    WireFormat,
+    finish_reason as map_finish_reason,
+    reasoning_wire_value,
+    takes_reasoning_input,
+)
 
 # Mistral's in-band signal that it aborted a generation part way.
 _ABORTED_FINISH_REASON = "error"
@@ -64,16 +89,6 @@ _ABORTED_FINISH_REASON = "error"
 _NO_SDK_RETRIES = RetryConfig(
     strategy="none", backoff=BackoffStrategy(0, 0, 0, 0), retry_connection_errors=False
 )
-
-
-type ReasoningEffort = Literal["none", "high"]
-
-_THINKING_TO_REASONING_EFFORT: dict[str, ReasoningEffort] = {
-    "low": "none",
-    "medium": "high",
-    "high": "high",
-    "max": "high",
-}
 
 
 async def execute_mistral_completion(
@@ -87,12 +102,27 @@ async def execute_mistral_completion(
     metadata: Mapping[str, str] | None = None,
     on_retry: ProviderRetryObserver | None = None,
     on_delta: ProviderDeltaObserver | None = None,
+    malformed: MalformedToolCalls | None = None,
 ) -> RustCompletionResult:
+    """Run one completion against the Mistral API.
+
+    The route's reasoning setting, or the request's own, goes out as
+    ``reasoning_effort``; off goes out only to a model known to reason, since a
+    model without adjustable reasoning may reject it. Earlier reasoning goes back
+    only to a model that takes it, so a switch from a reasoning model works.
+    """
     notices = RetryNotices(on_retry)
-    async with httpx.AsyncClient(
-        timeout=config.timeout_s,
-        verify=build_ssl_context(),
-        follow_redirects=True,
+    read_timeout_s = config.stream_guard().read_timeout_seconds
+    async with httpx2.AsyncClient(
+        timeout=httpx2.Timeout(config.timeout_s, read=read_timeout_s),
+        transport=env_proxy_transport(
+            verify=build_ssl_context(
+                use_system_trust_store=config.enable_system_trust_store
+            ),
+            socket_options=keepalive_socket_options(),
+        ),
+        follow_redirects=credential.follow_redirects,
+        headers=dict(credential.headers),
         # Capture the provider correlation id at the transport level so both the
         # streaming and non-streaming paths report it; the parsed complete_async
         # response drops headers.
@@ -103,15 +133,24 @@ async def execute_mistral_completion(
             server_url=_server_url_from_api_base(config.base_url),
             async_client=http_client,
             retry_config=_NO_SDK_RETRIES,
-            timeout_ms=int(config.timeout_s * 1000),
+            # The SDK applies this one timeout to every phase of a request.
+            timeout_ms=int(read_timeout_s * 1000),
+        )
+        replay_reasoning = takes_reasoning_input(
+            WireFormat.MISTRAL, route.thinking, route.reasoning, route.request_thinking
         )
         kwargs: dict[str, Any] = {
             "model": route.model,
-            "messages": [_message_payload(message) for message in messages],
+            "messages": [
+                _message_payload(message, replay_reasoning=replay_reasoning)
+                for message in messages
+            ],
             "temperature": route.temperature,
         }
-        if reasoning_effort := _THINKING_TO_REASONING_EFFORT.get(route.thinking):
-            kwargs["reasoning_effort"] = reasoning_effort
+        if (thinking := route.reasoning_setting(WireFormat.MISTRAL)) is not None:
+            kwargs["reasoning_effort"] = reasoning_wire_value(
+                WireFormat.MISTRAL, thinking
+            )
         if route.top_p is not None:
             kwargs["top_p"] = route.top_p
         if (max_tokens := config.output_token_cap(route)) is not None:
@@ -123,33 +162,86 @@ async def execute_mistral_completion(
         if tools:
             kwargs["tools"] = [_tool_payload(tool) for tool in tools]
             kwargs["parallel_tool_calls"] = True
+        log_completion_request(
+            config.provider,
+            route.model,
+            WireFormat.MISTRAL,
+            route.reasoning_setting(WireFormat.MISTRAL),
+        )
+        source = CompletionSource(provider=config.provider, model=route.model)
         if stream:
 
-            async def stream_once() -> RustCompletionResult:
-                async with await client.chat.stream_async(**kwargs) as events:
-                    idle_guard = StreamIdleGuard(
-                        config.stream_idle_timeout_s, read_timeout_s=config.timeout_s
-                    )
+            async def stream_once(
+                provider_attempt: ProviderAttempt,
+            ) -> RustCompletionResult:
+                opened = False
+
+                # The guard watches the request from the start, so silence before
+                # the response headers ends at the first-output wait, like silence
+                # after them. A read timeout before the headers stays an ordinary
+                # failure: only one after them is a stall.
+                async def open_events() -> AsyncGenerator[CompletionEvent]:
+                    nonlocal opened
+                    async with await client.chat.stream_async(**kwargs) as events:
+                        opened = True
+                        provider_attempt.accept()
+                        async for event in events:
+                            yield event
+
+                async with aclosing(open_events()) as events:
                     return await _read_stream(
-                        idle_guard.watch(events, starts_output=_carries_model_output),
+                        config.stream_guard().watch(
+                            events,
+                            starts_output=_carries_model_output,
+                            is_read_timeout=lambda error: (
+                                opened and is_read_timeout(error)
+                            ),
+                        ),
                         on_delta,
                         emits_finish_reason=config.emits_finish_reason,
+                        source=source,
+                        record=malformed,
+                        provider_attempt=provider_attempt,
                     )
 
             return await call_with_retries(
                 stream_once,
                 max_elapsed_time_s=config.retry_max_elapsed_time_s,
                 notices=notices,
+                completion_budget=config.completion_budget,
+                pricing=route.pricing,
             )
-        response = await call_with_retries(
-            lambda: client.chat.complete_async(**kwargs),
+
+        # Reading the response is part of the attempt, so a response with only
+        # unusable tool calls is retried like a failed request.
+        async def complete_once(
+            provider_attempt: ProviderAttempt,
+        ) -> RustCompletionResult:
+            response = await client.chat.complete_async(**kwargs)
+            provider_attempt.accept()
+            return _read_completion(
+                response,
+                source=source,
+                record=malformed,
+                provider_attempt=provider_attempt,
+            )
+
+        return await call_with_retries(
+            complete_once,
             max_elapsed_time_s=config.retry_max_elapsed_time_s,
             notices=notices,
+            completion_budget=config.completion_budget,
+            pricing=route.pricing,
         )
-        return _read_completion(response)
 
 
-def _read_completion(response: Any) -> RustCompletionResult:
+def _read_completion(
+    response: Any,
+    *,
+    source: CompletionSource,
+    record: MalformedToolCalls | None = None,
+    provider_attempt: ProviderAttempt | None = None,
+) -> RustCompletionResult:
     choice = _first_choice(response)
     if choice is None:
         raise ValueError("Completion response has no choices")
@@ -168,24 +260,24 @@ def _read_completion(response: Any) -> RustCompletionResult:
         text = _delta_text(content)
         if text:
             parts.append(RustTextContentBlock(text=text))
-    tool_call_parts = _message_tool_call_parts(_read_field(message, "tool_calls"))
+    tool_calls = _read_field(message, "tool_calls")
+    tool_call_parts = _message_tool_call_parts(tool_calls)
     parts.extend(tool_call_parts)
+    usage = _report_provider_usage(_read_field(response, "usage"), provider_attempt)
+    reason = _read_field(choice, "finish_reason")
+    finish_reason = align_finish_reason(
+        map_finish_reason(WireFormat.MISTRAL, reason)
+        if isinstance(reason, str)
+        else None,
+        kept_tool_calls=len(tool_call_parts),
+        dropped_tool_calls=(len(tool_calls) if isinstance(tool_calls, list) else 0)
+        - len(tool_call_parts),
+        source=source,
+        record=record,
+    )
     if not parts:
         raise ValueError("Completion response has no content")
-    reason = _read_field(choice, "finish_reason")
-    finish_reason = _finish_reason(reason) if isinstance(reason, str) else "stop"
-    # Core rejects tool_call finish without tool call parts and rejects any
-    # other finish that carries tool call parts, so align finish_reason with
-    # what we actually parsed — mirroring the streaming path.
-    if tool_call_parts:
-        finish_reason = "tool_call"
-    elif finish_reason == "tool_call":
-        finish_reason = "stop"
-    return RustCompletionResult(
-        parts=parts,
-        finish_reason=finish_reason,
-        usage=_usage(_read_field(response, "usage")),
-    )
+    return RustCompletionResult(parts=parts, finish_reason=finish_reason, usage=usage)
 
 
 def _carries_model_output(event: Any) -> bool:
@@ -210,21 +302,32 @@ async def _read_stream(
     on_delta: ProviderDeltaObserver | None = None,
     *,
     emits_finish_reason: bool,
+    source: CompletionSource,
+    record: MalformedToolCalls | None = None,
+    provider_attempt: ProviderAttempt | None = None,
 ) -> RustCompletionResult:
     text_parts: list[str] = []
     reasoning_parts: list[str] = []
     reasoning_meta: JsonObject = {}
     tool_calls: dict[int, dict[str, str]] = {}
-    usage: RustTokenUsage | None = None
+    # The usage the stream reports last; Mistral sends it on the final chunk.
+    raw_usage: object = None
     finish_reason: RustCompletionFinishReason | None = None
     async for event in until_connection_lost(
-        # Read when the stream fails, so it must see the latest finish reason.
+        # Read when the stream fails, so it must see the latest chunk.
         stream,
-        complete=lambda: finish_reason is not None,  # noqa: B023
+        complete=lambda: (
+            finish_reason is not None  # noqa: B023
+            and has_reply_usage(WireFormat.MISTRAL, raw_usage)  # noqa: B023
+        ),
     ):
         chunk = _event_data(event)
-        if parsed_usage := _usage(_read_field(chunk, "usage")):
-            usage = parsed_usage
+        if (reported := _read_field(chunk, "usage")) is not None:
+            raw_usage = reported
+            if provider_attempt is not None and has_reply_usage(
+                WireFormat.MISTRAL, raw_usage
+            ):
+                _report_provider_usage(raw_usage, provider_attempt)
         choice = _first_choice(chunk)
         if choice is None:
             continue
@@ -238,42 +341,76 @@ async def _read_stream(
             reasoning_parts.append(delta_reasoning)
         if delta_meta:
             reasoning_meta.update(delta_meta)
-        _collect_tool_call_deltas(tool_calls, _read_field(delta, "tool_calls"))
+        delta_tool_call = _collect_tool_call_deltas(
+            tool_calls, _read_field(delta, "tool_calls")
+        )
         if isinstance(reason := _read_field(choice, "finish_reason"), str):
             if reason == _ABORTED_FINISH_REASON:
                 raise IncompleteProviderStream(
                     "Model stream ended with the error finish reason."
                 )
-            finish_reason = _finish_reason(reason)
-        if on_delta is not None and (delta_text or delta_reasoning):
+            finish_reason = map_finish_reason(WireFormat.MISTRAL, reason)
+        if on_delta is not None and (delta_text or delta_reasoning or delta_tool_call):
             await on_delta(
-                ProviderStreamDelta(text=delta_text, reasoning=delta_reasoning)
+                ProviderStreamDelta(
+                    text=delta_text,
+                    reasoning=delta_reasoning,
+                    tool_call=delta_tool_call,
+                )
             )
-    if finish_reason is None:
+    if finish_reason is None and emits_finish_reason:
         # The last chunk of a complete stream carries a finish reason, and the
         # SDK also ends iteration when the body closes early.
-        if emits_finish_reason:
-            raise IncompleteProviderStream(
-                "Model stream ended without a finish reason."
-            )
-        finish_reason = "stop"
+        raise IncompleteProviderStream("Model stream ended without a finish reason.")
+    tool_call_parts = _tool_call_parts(tool_calls)
+    return RustCompletionResult(
+        parts=_streamed_parts(
+            reasoning="".join(reasoning_parts),
+            reasoning_meta=reasoning_meta,
+            text="".join(text_parts),
+            tool_call_parts=tool_call_parts,
+        ),
+        finish_reason=align_finish_reason(
+            finish_reason,
+            kept_tool_calls=len(tool_call_parts),
+            dropped_tool_calls=len(tool_calls) - len(tool_call_parts),
+            source=source,
+            record=record,
+        ),
+        usage=_report_provider_usage(raw_usage, provider_attempt),
+    )
+
+
+def _report_provider_usage(
+    raw_usage: object, provider_attempt: ProviderAttempt | None
+) -> RustTokenUsage:
+    usage = reply_token_usage(WireFormat.MISTRAL, raw_usage)
+    if provider_attempt is not None:
+        provider_attempt.report_usage(usage)
+    return usage
+
+
+def _streamed_parts(
+    *,
+    reasoning: str,
+    reasoning_meta: JsonObject,
+    text: str,
+    tool_call_parts: list[RustCompletionResultToolCallPart],
+) -> list[RustCompletionResultPart]:
     parts: list[RustCompletionResultPart] = []
-    if reasoning_parts:
+    if reasoning:
         parts.append(
             RustReasoningPart(
-                content=[RustReasoningTextContent(text="".join(reasoning_parts))],
+                content=[RustReasoningTextContent(text=reasoning)],
                 _meta=reasoning_meta or None,
             )
         )
-    text = "".join(text_parts)
     if text:
         parts.append(RustTextContentBlock(text=text))
-    parts.extend(_tool_call_parts(tool_calls))
+    parts.extend(tool_call_parts)
     if not parts:
         parts.append(RustTextContentBlock(text=" "))
-    if tool_calls:
-        finish_reason = "tool_call"
-    return RustCompletionResult(parts=parts, finish_reason=finish_reason, usage=usage)
+    return parts
 
 
 def _delta_text(content: object) -> str:
@@ -371,7 +508,7 @@ def _server_url_from_api_base(api_base: str) -> str | None:
 
 
 def _message_payload(
-    message: RustMessage,
+    message: RustMessage, *, replay_reasoning: bool = True
 ) -> ChatCompletionStreamRequestMessageTypedDict:
     if isinstance(message, RustSystemMessage | RustUserMessage):
         return cast(
@@ -384,7 +521,7 @@ def _message_payload(
         # backend's ``ThinkChunk`` replay.
         reasoning_chunks: list[dict[str, Any]] = []
         for block in message.content:
-            if isinstance(block, RustReasoningPart):
+            if replay_reasoning and isinstance(block, RustReasoningPart):
                 thinking_items = [
                     {"type": "text", "text": item.text}
                     for item in block.content
@@ -461,6 +598,9 @@ def _block_text(block: Any) -> str | None:
         block.resource, RustTextResourceContents
     ):
         return _resource_text(block.resource)
+    if isinstance(block, RustEmbeddedResourceContentBlock):
+        # Embedded file data has no text form; the model gets its link.
+        return f"[resource: {block.resource.uri}]"
     if isinstance(block, RustResourceLinkContentBlock):
         return f"[resource: {block.uri}]"
     return None
@@ -498,9 +638,10 @@ def _tool_payload(tool: RustToolDefinition) -> dict[str, Any]:
 
 def _collect_tool_call_deltas(
     tool_calls: dict[int, dict[str, str]], deltas: object
-) -> None:
+) -> bool:
+    """Merge a chunk's tool call fragments; whether the chunk carried any."""
     if not isinstance(deltas, list):
-        return
+        return False
     for delta in deltas:
         raw_index = _read_field(delta, "index")
         index = raw_index if isinstance(raw_index, int) else len(tool_calls)
@@ -515,6 +656,7 @@ def _collect_tool_call_deltas(
             current["name"] += name
         if isinstance(arguments := _read_field(function, "arguments"), str):
             current["arguments"] += arguments
+    return bool(deltas)
 
 
 def _merge_streamed_value(current: str, fragment: str) -> str:
@@ -598,41 +740,6 @@ def _first_choice(chunk: object) -> object | None:
     if not isinstance(choices, list):
         raise ValueError("provider chunk has no first choice")
     return choices[0]
-
-
-def _usage(value: object) -> RustTokenUsage | None:
-    if value is None:
-        return None
-    input_tokens = (
-        _read_field(value, "prompt_tokens") or _read_field(value, "input_tokens") or 0
-    )
-    output_tokens = (
-        _read_field(value, "completion_tokens")
-        or _read_field(value, "output_tokens")
-        or 0
-    )
-    prompt_tokens_details = _read_field(value, "prompt_tokens_details")
-    cached_input_tokens = _read_field(prompt_tokens_details, "cached_tokens") or 0
-    if (
-        not isinstance(input_tokens, int)
-        or not isinstance(output_tokens, int)
-        or not isinstance(cached_input_tokens, int)
-    ):
-        return None
-    return RustTokenUsage(
-        input_tokens=input_tokens,
-        output_tokens=output_tokens,
-        total_tokens=input_tokens + output_tokens,
-        cached_input_tokens=cached_input_tokens,
-    )
-
-
-def _finish_reason(value: str) -> RustCompletionFinishReason:
-    if value == "tool_calls":
-        return "tool_call"
-    if value in {"stop", "tool_call", "length", "content_filter", "other"}:
-        return cast(RustCompletionFinishReason, value)
-    return "other"
 
 
 __all__ = ["execute_mistral_completion"]

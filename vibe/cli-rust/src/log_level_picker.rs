@@ -1,11 +1,11 @@
-//! `/log-level` picker state. Mirrors Python's `LogLevelPickerApp`: one row per
+//! `/log-level` picker state: one row per
 //! level with two toggleable badges, `session` and `config`.
 
 use std::sync::Arc;
 
 use serde_json::json;
 
-use crate::app::App;
+use crate::app::{App, Severity};
 use crate::observability::level::{self, LogLevelChain, DEFAULT_LOG_LEVEL, LOG_LEVELS};
 use crate::server::Client;
 
@@ -26,7 +26,7 @@ pub fn open(app: &mut App) {
         .session
         .clone()
         .unwrap_or_else(|| chain.effective.clone());
-    app.log_level_picker.selected = index_of(&highlighted);
+    app.log_level_picker.list.highlight(index_of(&highlighted));
     app.log_level_picker.session = chain.session.clone();
     app.log_level_picker.config = chain.config.clone();
     app.log_level_picker.chain = chain;
@@ -36,12 +36,27 @@ pub fn open(app: &mut App) {
 
 /// Move the highlight up/down by one, wrapping at the ends.
 pub fn navigate(app: &mut App, down: bool) {
-    let picker = &mut app.log_level_picker;
-    picker.selected = crate::list_nav::wrap(picker.selected, options().len(), down);
+    app.log_level_picker
+        .list
+        .step(down, options().len(), true, |_| true);
 }
 
 pub fn focus_badge(app: &mut App, badge: &'static str) {
     app.log_level_picker.focused_badge = badge;
+}
+
+/// A click on a painted badge focuses and toggles it; elsewhere it only highlights the row.
+pub fn click(app: &mut App, at: (u16, u16)) {
+    let Some(&(_, badge)) = app
+        .log_level_picker
+        .badges
+        .iter()
+        .find(|(area, _)| area.contains(at.into()))
+    else {
+        return;
+    };
+    focus_badge(app, badge);
+    toggle_badge(app);
 }
 
 /// Enter: set the focused badge to the highlighted level, or clear it if already there.
@@ -61,11 +76,15 @@ pub fn toggle_badge(app: &mut App) {
 }
 
 pub fn selected_level(app: &App) -> &'static str {
-    options()[app.log_level_picker.selected.min(options().len() - 1)]
+    options()[app
+        .log_level_picker
+        .list
+        .selected()
+        .min(options().len() - 1)]
 }
 
 /// The chain recomputed against the draft badges, so the `›` marker and the
-/// subtitle both move live while toggling (Python `_effective_level`).
+/// subtitle both move live while toggling.
 pub fn draft_chain(app: &App) -> LogLevelChain {
     let picker = &app.log_level_picker;
     let env = picker.chain.env.clone();
@@ -98,9 +117,9 @@ pub fn apply_event(app: &mut App, event: Event) {
         // Nothing else reconciles this tier -- `config/read` only runs at
         // startup -- so an unpersisted level must not stay in the chain.
         level::set_config_log_level(restore.as_deref());
-        crate::ui::notice::show(app, &format!("Failed to persist log level: {error}"), 4);
+        let message = format!("Failed to persist log level: {error}");
+        crate::notices::inline(app, Severity::Error, &message);
     }
-    app.commit_finished();
 }
 
 /// Esc applies: the session tier lands in-process, the config tier is persisted.
@@ -126,10 +145,15 @@ pub fn apply(app: &mut App, client: &Arc<Client>) {
         );
     }
     let chain = level::get_log_level_chain();
-    crate::ui::notice::show(app, &feedback(&previous, &chain, config_cleared), 4);
+    crate::ui::notice::show(
+        app,
+        Severity::Information,
+        &feedback(&previous, &chain, config_cleared),
+        4,
+    );
 }
 
-/// Python `on_log_level_picker_app_applied`: only report what actually moved.
+/// Only report what actually moved.
 fn feedback(previous: &LogLevelChain, chain: &LogLevelChain, config_cleared: bool) -> String {
     let mut parts: Vec<String> = Vec::new();
     match &chain.session {
@@ -160,23 +184,17 @@ fn write_config(
     let Some(session_id) = app.session.session_id.clone() else {
         return;
     };
-    let tx = app.log_level_picker.tx.clone();
     let client = client.clone();
-    let pending = app.commit_started();
-    tokio::spawn(async move {
+    crate::ui_event::spawn(app, async move {
         let op = if cleared {
             json!({"op": "remove", "path": LOG_LEVEL_PATH, "targetLayer": null})
         } else {
             json!({"op": "set", "path": LOG_LEVEL_PATH, "value": level, "targetLayer": null})
         };
-        let event =
-            match crate::config_write::write(&client, &session_id, vec![op], "log level picker")
-                .await
-            {
-                Ok(_) => Event::Applied,
-                Err(error) => Event::Failed { error, restore },
-            };
-        crate::input::deliver(tx, event, &pending).await;
+        match crate::config_write::write(&client, &session_id, vec![op], "log level picker").await {
+            Ok(_) => Event::Applied,
+            Err(error) => Event::Failed { error, restore },
+        }
     });
 }
 

@@ -5,8 +5,7 @@ from __future__ import annotations
 from e2e.app_server.events import todo, todo_item, turn_started, user_msg
 from e2e.app_server.scenario import Timeline
 
-env = {"VIBE_REPLAY_SETTLE_BUSY": "1", "VIBE_TYPING_GRACE_PERIOD_MS": "0"}
-capture_startup = False
+env = {"VIBE_TYPING_GRACE_PERIOD_MS": "0"}
 
 _PROMPT = "plan the migration"
 # Terminals without a distinct Cmd key deliver the cmd+\\ remap as ESC \.
@@ -28,5 +27,5 @@ timeline: Timeline = [
 ]
 
 # The first Esc only undocks the panel: the turn keeps running.
-screen_contains = {"rust": ("Esc/Ctrl+C to interrupt",)}
-screen_excludes = {"rust": ("Todos · 1/3 done", "Interrupted")}
+screen_contains = ("Esc/Ctrl+C to interrupt",)
+screen_excludes = ("Todos · 1/3 done", "Interrupted")

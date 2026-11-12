@@ -3,28 +3,26 @@
 use std::sync::Arc;
 
 use crate::server::{notification, server_method};
-use crate::server::{Client, Notification};
+use crate::server::{Client, EntryHead, EntryParams, Notification, PublicTurn};
+use serde::Deserialize;
 use serde_json::Value;
 use tokio::sync::mpsc;
 
-use crate::app::{App, Status, ToastSeverity};
+use crate::app::{App, Status};
 use crate::cli::StartupResume;
 use crate::commands::compact;
 use crate::commands::retry;
-use crate::commands::retry_continuation;
 use crate::commands::submission;
 use crate::commands::submission::new_message_id;
 use crate::startup::StartupEvent;
 use crate::transcript::local;
 use crate::utils::startup_cache;
+use crate::utils::text::bounded_message;
 use crate::{
-    agents, approval, completion_manager, config, config_issues, feedback, mcp, message_queue,
-    model_picker, observability, post_ready, question_app, resume_picker, session_exit, startup,
-    subagents, todo_tracker, turn_summary, ui,
+    agents, approval, artifacts, completion_manager, config, feedback, mcp, message_queue,
+    model_picker, notices, observability, post_ready, question_app, resume_picker, session_exit,
+    startup, subagents, todo_tracker, turn_summary, ui,
 };
-
-/// Seconds a server warning/error toast stays up (Python `App.notify` default).
-const SERVER_TOAST_SECS: u64 = 5;
 
 /// Returns true if a deferred `/exit` was replayed during the Ready event.
 pub fn apply_startup_event(
@@ -42,7 +40,7 @@ pub fn apply_startup_event(
         StartupEvent::Attached(session_id) => {
             app.set_session_id(session_id.clone());
             if app.config_screen.open {
-                config::load(session_id, client, config_tx);
+                config::load(session_id, client, config_tx, true);
             }
             false
         }
@@ -56,7 +54,7 @@ pub fn apply_startup_event(
         }
         StartupEvent::Ready(ready) => apply_ready(app, client, config_tx, *ready),
         StartupEvent::MissingApiKey { .. } => {
-            // The wizard is a pre-session surface (Python `run_onboarding`):
+            // The wizard is a pre-session surface:
             // the loop exits on this verdict and the entrypoint reruns the
             // wizard, so the reducer only logs.
             tracing::warn!(vibe_boundary = "startup", "missing API key; setup required");
@@ -64,44 +62,41 @@ pub fn apply_startup_event(
         }
         StartupEvent::ConfigError(message) => {
             let message = format!("Invalid configuration: {message}");
-            tracing::error!(
-                vibe_boundary = "startup",
-                fatal = true,
-                "config error: {message}"
-            );
+            // The user's config is wrong, not Vibe: not fatal, so not reported.
+            tracing::error!(vibe_boundary = "startup", "config error: {message}");
             app.session.startup_error = Some(message);
+            app.view.transcript.remove(RESUME_STATUS_ID);
             app.set_status(Status::Failed);
             false
         }
         StartupEvent::Failed(error) => {
-            tracing::error!(
-                vibe_boundary = "startup",
-                fatal = true,
-                "startup failed: {error}"
-            );
+            // The handshake already logged it, fatal only for a client bug.
             app.session.startup_error = Some(error);
+            app.view.transcript.remove(RESUME_STATUS_ID);
             app.set_status(Status::Failed);
             false
         }
     }
 }
 
-/// Python `_auto_resume_on_startup`'s opening line: `--continue`/`--resume <id>`
-/// say so on the first frame, while the handshake attaches that session.
+/// The auto-resume status row, settled in place once the attach lands.
+const RESUME_STATUS_ID: &str = "rs-startup-resume";
+
+/// `--continue`/`--resume <id>` show a resume status while the handshake attaches.
 pub fn announce_resume(app: &mut App) {
     if matches!(
         app.session.startup_resume,
         StartupResume::ById(_) | StartupResume::Continue
     ) {
-        local::add_command_result(
+        local::add_progress_status(
             &mut app.view.transcript,
-            &submission::new_message_id(),
+            RESUME_STATUS_ID,
             "Resuming session\u{2026}",
         );
     }
 }
 
-/// Python `_show_dangerous_directory_warning`: the borderless warning mounted
+/// The borderless warning mounted
 /// at startup when the cwd is a risky folder.
 pub fn show_dangerous_directory_warning(app: &mut App) {
     if let Some(reason) = crate::utils::paths::dangerous_directory_reason() {
@@ -115,15 +110,14 @@ pub fn show_dangerous_directory_warning(app: &mut App) {
     }
 }
 
-/// Python `_schedule_update_notification`/`_check_update`: one detached,
-/// non-forced check after startup, its outcome only written to the update
+/// One detached, non-forced update check after startup, its outcome only written to the update
 /// cache. Failures are logged, never surfaced. Replay runs have no PyPI, so
 /// the check stays offline there like the other replay-gated subsystems.
 fn spawn_background_update_check(enabled: bool) {
     if !enabled || crate::utils::is_replaying() {
         return;
     }
-    tokio::spawn(async move {
+    crate::work::spawn_daemon(async move {
         let repository = crate::update_notifier::cache::FileSystemUpdateCacheRepository;
         let gateway =
             crate::update_notifier::gateway::UpdateCheckGateway::for_project("mistral-vibe").await;
@@ -137,30 +131,31 @@ fn spawn_background_update_check(enabled: bool) {
         )
         .await
         {
-            // Python warns for `UpdateError`; a failed cache write never
-            // reaches here — it is logged inside, like Python's swallowed
-            // `OSError`.
+            // A failed cache write never reaches here: it is logged inside.
             tracing::warn!("Update check failed: {}", error.message)
         }
     });
 }
 
-/// Python `_auto_resume_on_startup`'s closing line: what the attach did.
+/// Settle the auto-resume status with what the attach did; a failure becomes an error row.
 fn attach_notice(app: &mut App, attach: startup::Attach) {
-    let id = submission::new_message_id();
     let transcript = &mut app.view.transcript;
-    match attach {
-        startup::Attach::Started => {}
-        startup::Attach::Resumed(session) => local::add_command_result(
-            transcript,
-            &id,
-            &format!("Resumed session `{}`", resume_picker::short_id(&session)),
-        ),
-        startup::Attach::NoPrevious => {
-            local::add_command_result(transcript, &id, "No previous sessions found.")
+    let text = match attach {
+        startup::Attach::Started => return transcript.remove(RESUME_STATUS_ID),
+        startup::Attach::Resumed(session) => {
+            format!("Resumed session {}.", resume_picker::short_id(&session))
         }
-        startup::Attach::Failed(message) => local::add_command_error(transcript, &id, &message),
+        startup::Attach::NoPrevious => "No previous sessions found.".to_owned(),
+        startup::Attach::Failed(message) => {
+            transcript.remove(RESUME_STATUS_ID);
+            let id = submission::new_message_id();
+            return local::add_command_error(transcript, &id, &message);
+        }
+    };
+    if !transcript.contains(RESUME_STATUS_ID) {
+        local::add_progress_status(transcript, RESUME_STATUS_ID, &text);
     }
+    local::settle_status(transcript, RESUME_STATUS_ID, &text);
 }
 
 fn apply_ready(
@@ -196,24 +191,35 @@ fn apply_ready(
     };
     crate::terminal_notifier::configure(app, &runtime);
     if !app.session.resumed {
-        let title = runtime
-            .pointer("/sessionLog/title")
-            .and_then(Value::as_str)
-            .or(state.session.title.as_deref())
-            .unwrap_or("");
+        let title = runtime["sessionLog"]["title"].as_str();
+        let title = title.or(state.session.title.as_deref()).unwrap_or("");
         app.terminal_notifier.set_default_title(title);
     }
     app.subagents.status_list_enabled = startup::read_show_subagent_status_list(&runtime);
+    app.artifacts_modal.enabled = startup::read_pr_monitoring(&runtime);
+    app.view.sticky_prompt_enabled = startup::read_enable_sticky_prompt(&runtime);
     app.quit.ask_confirmation_on_exit = startup::read_ask_confirmation_on_exit(&runtime);
+    // Later picker resumes resend this config, so it must keep naming the
+    // settled worktree, not the checkout the run started in. Parking must land
+    // before the config apply queues a deferred index start, so that start
+    // builds at the settled worktree, not the checkout it left.
+    if let Some(cwd) = settled {
+        app.session.agent_config.cwd = Some(cwd.clone());
+        if !app.completion.files.running() {
+            app.completion.files.park(std::path::PathBuf::from(cwd));
+        }
+    }
+    crate::vim::apply_runtime(app, &runtime);
     apply_final_startup_config(app, startup_cache);
     app.view
         .transcript
         .set_show_reasoning(startup::read_show_thinking_nodes(&runtime));
-    message_queue::reconcile_snapshot(app, client, &state);
     // The picker can resume before the handshake finishes, and that session
     // wins: the one started here is only what Esc would fall back to.
     if !app.session.resumed {
+        message_queue::reconcile_snapshot(app, client, &state);
         app.set_session_id(state.session.id.clone());
+        crate::background_work::adopt_state(app, &state);
         app.subagents.seed_snapshot(state.child_sessions.clone());
         subagents::refresh(app);
         match app.resume_picker.open {
@@ -221,20 +227,17 @@ fn apply_ready(
             false => {
                 app.todo_tracker.seed_from_history(state.history.as_ref());
                 resume_picker::load_history(app, &state);
+                // The ready read below reads the live branch.
                 crate::worktree::track_state(app, &state);
             }
         }
     }
     app.session.tokens = startup::read_tokens(&runtime);
     app.subagents.main_tokens = app.session.tokens;
-    apply_stats(
-        app,
-        runtime.pointer("/runtime/stats").unwrap_or(&Value::Null),
-    );
+    app.session.stats = crate::utils::json::read(&runtime["runtime"]["stats"]);
     // This run's `--worktree` verdict (the announce), pinned apart from the
     // session's own tracking: a resumed session's restored effect carries the
-    // original run's `created`, and reuse must stay non-cleaning (Python's
-    // `worktree_session.created`).
+    // original run's `created`, and reuse must stay non-cleaning.
     app.session.prepared_worktree = prepared;
     // The notifications the settle wait absorbed, applied once the state they
     // follow exists, so the footer lands on the worktree before first paint.
@@ -243,14 +246,8 @@ fn apply_ready(
             tracing::debug!("absorbed notification deferred; no approval is pending pre-TUI");
         }
     }
-    // Python chdirs before SessionOptions, and later picker resumes resend
-    // this config, so it must keep naming the settled worktree, not the
-    // checkout the run started in.
-    if let Some(cwd) = settled {
-        app.session.agent_config.cwd = Some(cwd);
-    }
-    // Python snapshots the usage baseline once the session attaches; a picker
-    // resume that already adopted keeps the baseline it set.
+    // Snapshot the usage baseline once the session attaches; a picker resume
+    // that already adopted keeps the baseline it set.
     if !app.session.resumed {
         app.session.usage_baseline = Some(session_exit::current_usage(app));
     }
@@ -263,53 +260,61 @@ fn apply_ready(
     agents::apply_runtime(app, &runtime);
     agents::flush_pending(app, client);
     mcp::show_post_init_notices(app, &runtime);
-    config_issues::show_config_issues(app, &runtime);
+    crate::skills_browser::notify_updates(app, client, &runtime);
+    notices::show_config_issues(app, &runtime);
     startup::banners::mount(app, &runtime, client);
-    // Python reads the what's-new gate inside mount, then schedules the
-    // update check; keeping the spawn after mount preserves that ordering.
+    // Read the what's-new gate inside mount before scheduling the update
+    // check; keeping the spawn after mount preserves that ordering.
     // ADR 0015: apply the live trust policy before the check's gateway
     // builds its client.
     crate::update_notifier::gateway::configure_tls_trust(config.enable_system_trust_store);
     spawn_background_update_check(config.enable_update_checks);
     post_ready::fetch(app, client, config.show_greeting);
+    artifacts::fetch(app, client);
+    resume_picker::subscribe(app, client);
     completion_manager::refresh(app);
-    app.set_status(Status::Ready);
+    // A picker resume that landed first already adopted its own turn: leave
+    // the status it set rather than drop that turn to `Ready`.
+    if !app.session.resumed {
+        match app.resume_picker.open {
+            true => app.set_status(Status::Ready),
+            false => adopt_active_turn(app, &state),
+        }
+    }
     approval::show_pending(app);
-    record_startup(app, &attach, is_cold_start, config.harness_selection_source);
+    record_startup(app, &attach, is_cold_start);
     attach_notice(app, attach);
     crate::commands::shell::flush_pending(app, client);
     message_queue::flush_pending(app, client);
     // The resume picker owns the startup: the prompt waits for the session the
-    // user picks, or is dropped when they cancel (Python returns before
-    // `_process_startup_prompt` when the picker is up).
+    // user picks, or is dropped when they cancel.
     if !app.resume_picker.open {
         process_initial_prompt(app, client);
     }
     // Prompts flush before deferred slash commands; a prompt-then-command typed
     // during Starting thus dispatches in that order regardless of submission
-    // order. Python preserves true order via one gated dispatch.
+    // order.
     submission::flush_pending(app, client, config_tx)
 }
 
-/// Python `_send_startup_telemetry_once`. Fields this client has no surface for
-/// (teleport) are honestly `false`; `session_init_duration_ms` stays null since
-/// the server does not report it to this client.
-fn record_startup(
-    app: &mut App,
-    attach: &startup::Attach,
-    is_cold_start: bool,
-    harness_selection_source: Option<String>,
-) {
+/// Startup telemetry, sent once. `teleport_on_start` stays in the event schema
+/// after the feature's removal and is always `false`; `session_init_duration_ms`
+/// stays null since the server does not report it to this client.
+fn record_startup(app: &mut App, attach: &startup::Attach, is_cold_start: bool) {
+    let install_source = crate::update_notifier::cache::cached_source();
+    crate::telemetry::install::record_version_update(app);
     let properties = crate::telemetry::bmap(serde_json::json!({
+        "install_source": install_source,
         "agent_ready_duration_ms": startup::agent_ready_duration_ms(),
         "session_init_duration_ms": Value::Null,
         "has_initial_prompt": app.session.initial_prompt.as_deref().is_some_and(|p| !p.is_empty()),
         "teleport_on_start": false,
-        "show_resume_picker": matches!(app.session.startup_resume, StartupResume::Picker),
+        "show_resume_picker": app.session.resume_picker_shown,
         "is_resuming_session": matches!(attach, startup::Attach::Resumed(_)),
         "prompt_for_workspace_trust": app.session.trust_prompted,
         "is_cold_start": is_cold_start,
-        "harness_selection_source": harness_selection_source,
+        "mouse_capture": app.session.startup_config.enable_mouse_capture,
+        "vim_keybindings": app.vim.enabled,
     }));
     app.session.startup_telemetry = Some(properties);
     flush_startup_telemetry(app);
@@ -328,21 +333,15 @@ pub fn flush_startup_telemetry(app: &mut App) {
     crate::telemetry::record(app, crate::telemetry::event::STARTUP, properties);
 }
 
-/// Python `_process_initial_prompt`: send the positional `vibe <prompt>` argument
-/// into the session, once as a plain prompt like `_handle_user_message` does, or
-/// teleport it under `--teleport`.
+/// Send the positional `vibe <prompt>` argument into the session once, as a plain prompt.
 pub fn process_initial_prompt(app: &mut App, client: &Arc<Client>) {
-    // Python's `args.initial_prompt or stdin_prompt` drops an empty string.
-    let prompt = app
+    // An empty prompt is dropped.
+    if let Some(prompt) = app
         .session
         .initial_prompt
         .take()
-        .filter(|prompt| !prompt.is_empty());
-    if std::mem::take(&mut app.session.teleport_on_start)
-        && crate::commands::has_command("/teleport")
+        .filter(|prompt| !prompt.is_empty())
     {
-        crate::teleport::submit(app, client, prompt.unwrap_or_default());
-    } else if let Some(prompt) = prompt {
         message_queue::enqueue_prompt(app, client, prompt);
     }
 }
@@ -353,7 +352,13 @@ pub fn process_initial_prompt(app: &mut App, client: &Arc<Client>) {
 pub fn apply_runtime_value(app: &mut App, runtime: &Value) {
     crate::terminal_notifier::configure(app, runtime);
     app.subagents.status_list_enabled = startup::read_show_subagent_status_list(runtime);
+    app.artifacts_modal.enabled = startup::read_pr_monitoring(runtime);
+    app.view.sticky_prompt_enabled = startup::read_enable_sticky_prompt(runtime);
     app.quit.ask_confirmation_on_exit = startup::read_ask_confirmation_on_exit(runtime);
+    crate::vim::apply_runtime(app, runtime);
+    let show_thinking = startup::read_show_thinking_nodes(runtime);
+    app.view.transcript.set_show_reasoning(show_thinking);
+    app.subagents.transcripts.set_show_reasoning(show_thinking);
     subagents::refresh(app);
     let narrator_enabled = app.session.startup_config.narrator_enabled;
     let version = app.session.startup_config.server_version.clone();
@@ -369,72 +374,18 @@ pub fn apply_runtime_value(app: &mut App, runtime: &Value) {
     model_picker::apply_runtime(app, runtime);
     crate::thinking_picker::apply_runtime(app, runtime);
     agents::apply_runtime(app, runtime);
-    // Python never re-checks the custom-tools deprecation on a plain runtime
-    // refresh, only after the initial history and a transcript rebuild.
     app.session.runtime = runtime.clone();
-    apply_stats(
-        app,
-        runtime.pointer("/runtime/stats").unwrap_or(&Value::Null),
-    );
+    app.session.stats = crate::utils::json::read(&runtime["runtime"]["stats"]);
     completion_manager::refresh(app);
     mcp::apply_runtime(app, runtime);
 }
 
-/// Apply a mutation response's `runtime` when it carries one (Python
-/// `if response.runtime is not None: state.apply_runtime(response.runtime)`).
+/// Apply a mutation response's `runtime` when it carries one.
 pub fn apply_response_runtime(app: &mut App, response: &Value) {
     if response.get("runtime").is_some_and(Value::is_object) {
         apply_runtime_value(app, response);
+        notices::show_updated_config_warnings(app, response);
     }
-}
-
-fn apply_stats(app: &mut App, stats: &Value) {
-    app.session.stats.steps = stats.get("steps").and_then(Value::as_u64).unwrap_or(0);
-    app.session.stats.session_prompt_tokens = stats
-        .get("sessionPromptTokens")
-        .and_then(Value::as_u64)
-        .unwrap_or(0);
-    app.session.stats.session_completion_tokens = stats
-        .get("sessionCompletionTokens")
-        .and_then(Value::as_u64)
-        .unwrap_or(0);
-    app.session.stats.session_cached_tokens = stats
-        .get("sessionCachedTokens")
-        .and_then(Value::as_u64)
-        .unwrap_or(0);
-    app.session.stats.last_turn_total_tokens = stats
-        .get("lastTurnPromptTokens")
-        .and_then(Value::as_u64)
-        .unwrap_or(0)
-        + stats
-            .get("lastTurnCompletionTokens")
-            .and_then(Value::as_u64)
-            .unwrap_or(0);
-    app.session.stats.last_turn_cached_tokens = stats
-        .get("lastTurnCachedTokens")
-        .and_then(Value::as_u64)
-        .unwrap_or(0);
-    let input_price = stats
-        .get("inputPricePerMillion")
-        .and_then(Value::as_f64)
-        .unwrap_or(0.0);
-    let output_price = stats
-        .get("outputPricePerMillion")
-        .and_then(Value::as_f64)
-        .unwrap_or(0.0);
-    let cached_price = stats
-        .get("cachedInputPricePerMillion")
-        .and_then(Value::as_f64)
-        .unwrap_or(input_price);
-    app.session.stats.session_cost =
-        (app.session
-            .stats
-            .session_prompt_tokens
-            .saturating_sub(app.session.stats.session_cached_tokens) as f64
-            * input_price
-            + app.session.stats.session_cached_tokens as f64 * cached_price
-            + app.session.stats.session_completion_tokens as f64 * output_price)
-            / 1_000_000.0;
 }
 
 fn apply_final_startup_config(app: &mut App, config: startup_cache::StartupConfig) {
@@ -445,32 +396,44 @@ fn apply_final_startup_config(app: &mut App, config: startup_cache::StartupConfi
 }
 
 fn show_startup_config(app: &mut App, config: startup_cache::StartupConfig) {
-    ui::theme::set_active(&config.theme);
-    app.session.tokens.1 = config.context_window;
-    app.completion.skills.clone_from(&config.skills);
-    agents::show_startup_agents(app, &config);
-    app.view.banner.sync_model_variant(&config);
     app.session.startup_config = config;
+    ui::theme::set_active(&app.session.startup_config.theme);
+    app.session.tokens.1 = app.session.startup_config.context_window;
+    app.completion
+        .skills
+        .clone_from(&app.session.startup_config.skills);
+    agents::show_startup_agents(app, &app.session.startup_config.clone());
+    app.view
+        .banner
+        .sync_model_variant(&app.session.startup_config);
+    crate::utils::file_index::reconcile(
+        &mut app.completion.files,
+        &app.session.startup_config,
+        app.session.cwd.as_deref(),
+    );
     completion_manager::refresh(app);
 }
 
-/// Python mounts a live reasoning row with the bulk fold state
-/// (`ReasoningMessage(collapsed=get_tools_collapsed())`); other live widgets
-/// keep their constructor's collapsed default.
-fn expand_live_reasoning(app: &mut App, params: &Value) {
+/// A live reasoning row or loop prompt starts with the bulk fold state.
+fn expand_live_foldable(app: &mut App, entry: &EntryHead) {
     if app.view.tools_collapsed {
         return;
     }
-    let Some(id) = params.pointer("/entry/id").and_then(Value::as_str) else {
+    let Some(id) = entry.id.as_deref() else {
         return;
     };
-    if app.view.transcript.is_reasoning(id) {
-        app.view.expanded.insert(id.to_owned());
+    let transcript = &app.view.transcript;
+    let unfolded = match transcript.is_reasoning(id) {
+        true => Some(id),
+        false => transcript.loop_prompt_of(id),
+    };
+    if let Some(unfolded) = unfolded.map(str::to_owned) {
+        app.view.expanded.insert(unfolded);
         app.view.transcript_cache.invalidate_layouts();
     }
 }
 
-/// Python `_record_todos`: a settled todo effect replaces the pinned list.
+/// A settled todo effect replaces the pinned list.
 fn record_todos(app: &mut App, raw: Option<&Value>) {
     let Some(todos) = raw.and_then(todo_tracker::todos_from_entry) else {
         return;
@@ -479,32 +442,27 @@ fn record_todos(app: &mut App, raw: Option<&Value>) {
 }
 
 /// The stored entry an update points at, cloned out before `record_todos` takes `&mut app`.
-fn updated_entry_raw(app: &App, params: &Value) -> Option<Value> {
-    params
-        .get("entryId")
-        .and_then(Value::as_str)
-        .and_then(|id| app.view.transcript.entry_raw(id))
-        .cloned()
+fn updated_entry_raw(app: &App, params: &EntryParams) -> Option<Value> {
+    let id = params.entry_id.as_deref()?;
+    app.view.transcript.entry_raw(id).cloned()
 }
 
-fn sync_loading_label(app: &mut App, params: &Value) {
+fn sync_loading_label(app: &mut App, params: &EntryParams) {
     if !matches!(app.session.status, Status::Generating { .. }) {
         return;
     }
-    match params.pointer("/entry/type").and_then(Value::as_str) {
+    let entry = &params.entry;
+    match entry.entry_type() {
         Some("reasoning") => {
             app.view
                 .loading
                 .set_label(ui::loading::THINKING_LOADING_STATUS);
         }
-        // Python's hook notices steer the loading status; other detail kinds
+        // Hook notices steer the loading status; other detail kinds
         // leave it untouched, so nothing else resets it here.
-        Some("notice") => match params.pointer("/entry/detail/kind").and_then(Value::as_str) {
+        Some("notice") => match entry.detail_kind() {
             Some("hook_started") => {
-                let name = params
-                    .pointer("/entry/detail/hookName")
-                    .and_then(Value::as_str)
-                    .unwrap_or("");
+                let name = entry.detail.hook_name.as_deref().unwrap_or_default();
                 app.view
                     .loading
                     .set_label(format!("Running hook {name}").trim_end());
@@ -516,25 +474,14 @@ fn sync_loading_label(app: &mut App, params: &Value) {
             }
             _ => {}
         },
-        // Python starts a call by showing its `statusText`, and resets to the
-        // default once a settled result lands — but only when no other call is
-        // live (`LoadingWidget.set_status`, `_handle_effect_completed`).
+        // A starting call shows its `statusText`; the status resets to the
+        // default once a settled result lands, but only when no other call is
+        // live.
         Some("effect") => {
-            let id = params
-                .pointer("/entry/id")
-                .and_then(Value::as_str)
-                .unwrap_or("");
-            let running = params
-                .pointer("/entry/generationStatus")
-                .and_then(Value::as_str)
-                == Some("in_progress");
-            if running {
-                app.view.loading.set_label(
-                    params
-                        .pointer("/entry/detail/display/statusText")
-                        .and_then(Value::as_str)
-                        .unwrap_or(""),
-                );
+            let id = entry.id.as_deref().unwrap_or("");
+            if entry.generation_status.as_deref() == Some("in_progress") {
+                let status = entry.detail.display.status_text.as_deref();
+                app.view.loading.set_label(status.unwrap_or_default());
             } else if !app.view.transcript.has_live_tool_calls(id) {
                 app.view
                     .loading
@@ -545,7 +492,7 @@ fn sync_loading_label(app: &mut App, params: &Value) {
             // An `entryUpdated` patch carries no entry; the merged effect still
             // re-states its label, and a settling one resets it unless another
             // call is still live.
-            let id = params.get("entryId").and_then(Value::as_str).unwrap_or("");
+            let id = params.entry_id.as_deref().unwrap_or("");
             match app.view.transcript.effect_loading_status(id) {
                 Some((status, false)) => app.view.loading.set_label(&status),
                 Some((_, true)) => {
@@ -564,7 +511,34 @@ fn sync_loading_label(app: &mut App, params: &Value) {
     }
 }
 
-/// Python `LoadingWidget.set_retrying`: a snapshot with `retrying` set swaps
+/// Pick up the turn a session state reports as still running, so the loader
+/// shows and Esc interrupts it; an idle session lands `Ready`.
+pub fn adopt_active_turn(app: &mut App, state: &crate::server::PublicSessionState) {
+    let active_turn_id = state
+        .session
+        .status
+        .as_ref()
+        .and_then(|status| status.active_turn_id.clone());
+    app.session.active_turn_id.clone_from(&active_turn_id);
+    if active_turn_id.is_none() {
+        return app.set_status(Status::Ready);
+    }
+    // `set_status` keeps a running loader, but the resumed turn is not the one
+    // it timed (the picker can open over a generating session): start afresh.
+    let since = crate::clock::now();
+    app.set_status(Status::Generating { since });
+    app.restart_loading();
+    app.session.status = Status::Generating { since };
+    let label = active_turn_id
+        .as_deref()
+        .and_then(|turn| app.view.transcript.live_status_text(turn))
+        .map(str::to_owned);
+    if let Some(status) = label {
+        app.view.loading.set_label(&status);
+    }
+}
+
+/// A snapshot with `retrying` set swaps
 /// the label in; a null one restores only when the label currently says Retrying.
 fn sync_retrying_label(app: &mut App, state: &crate::server::PublicSessionState) {
     if !matches!(app.session.status, Status::Generating { .. }) {
@@ -596,10 +570,12 @@ fn is_foreign_session_notification(app: &App, event: &Notification) -> bool {
             | notification::SESSION_STATS_UPDATED
             | notification::SESSION_SNAPSHOT
             | notification::CHILD_SESSION_UPDATED
+            | notification::ARTIFACTS_CREATED
+            | notification::ARTIFACTS_UPDATED
     ) {
         return false;
     }
-    let Some(session_id) = event.params.get("sessionId").and_then(Value::as_str) else {
+    let Some(session_id) = event.params["sessionId"].as_str() else {
         return false;
     };
     app.session
@@ -610,12 +586,28 @@ fn is_foreign_session_notification(app: &App, event: &Notification) -> bool {
 
 /// Apply one notification, or return `false` when the event loop must retain it.
 pub fn apply_notification(app: &mut App, client: &Arc<Client>, event: &Notification) -> bool {
+    // Lease updates apply pre-Starting: the startup resume picker is open while
+    // the engine comes up, and its locks must not miss them.
+    if event.method == notification::SESSION_LEASE_UPDATED {
+        resume_picker::on_lease_updated(app, client, &event.params);
+        return true;
+    }
+    if event.method == notification::SESSION_LEASE_ENDED {
+        resume_picker::on_lease_ended(app);
+        return true;
+    }
+    if event.method == notification::REPLAY_DRAINED {
+        if let Some(id) = event.params["requestId"].as_u64() {
+            client.mark_replay_drained(id);
+        }
+        return true;
+    }
+    if event.method == notification::REPLAY_FENCE {
+        crate::replay_fence::note();
+        return true;
+    }
     if event.method == server_method::CALLBACK_CALL
-        && event
-            .params
-            .pointer("/callback/detail/kind")
-            .and_then(Value::as_str)
-            == Some("approval")
+        && event.params["callback"]["detail"]["kind"] == "approval"
     {
         return approval::on_callback_call(app, &event.params);
     }
@@ -631,7 +623,7 @@ pub fn apply_notification(app: &mut App, client: &Arc<Client>, event: &Notificat
         }
         return true;
     }
-    // Warnings/errors are transient toasts, never re-sent in the snapshot: surface them pre-Ready like Python's out-of-band listener.
+    // Warnings/errors are never re-sent in the snapshot: surface them pre-Ready too.
     if matches!(app.session.status, Status::Starting | Status::Failed)
         && !matches!(
             event.method.as_str(),
@@ -645,66 +637,52 @@ pub fn apply_notification(app: &mut App, client: &Arc<Client>, event: &Notificat
     }
     match event.method.as_str() {
         notification::HISTORY_ENTRY_ADDED => {
-            if event
-                .params
-                .pointer("/entry/detail/kind")
-                .and_then(Value::as_str)
-                == Some("session_title_updated")
-            {
-                if let Some(title) = event
-                    .params
-                    .pointer("/entry/detail/title")
-                    .and_then(Value::as_str)
-                {
+            let params = EntryParams::read(&event.params);
+            let entry = &params.entry;
+            if entry.detail_kind() == Some("session_title_updated") {
+                if let Some(title) = &entry.detail.title {
                     app.terminal_notifier.set_default_title(title);
                 }
             }
-            if let Some(entry_id) = event.params.pointer("/entry/id").and_then(Value::as_str) {
+            if let Some(entry_id) = &entry.id {
                 crate::commands::shell::apply_started(app, client, entry_id);
             }
-            if entry_finishes_reasoning(&event.params) {
+            if entry_finishes_reasoning(entry) {
                 app.view.transcript.settle_reasoning();
             }
             message_queue::steering_history_added(app, client, &event.params);
-            retry::on_entry_added(app, &event.params);
+            retry::on_entry_added(app, entry);
             app.view.transcript.add(&event.params);
+            crate::program_status::shell_history_updated(app);
             crate::worktree::track_entry(app, &event.params);
             record_todos(app, event.params.get("entry"));
-            retry_continuation::merge_continuation(app);
-            // Python sets `_turn_assistant_message` inside the resolve, so a
-            // continuation's hidden entry maps to the merged row it feeds.
-            retry::track_turn_assistant(app, &event.params);
-            expand_live_reasoning(app, &event.params);
-            sync_loading_label(app, &event.params);
-            turn_summary::track_narrator_added(app, &event.params);
+            expand_live_foldable(app, entry);
+            sync_loading_label(app, &params);
+            turn_summary::track_narrator_added(app, &event.params, entry);
             if let Some(entry) = event.params.get("entry") {
                 subagents::remember_parent_instruction_from_entry(app, entry);
             }
         }
         notification::HISTORY_ENTRY_UPDATED => {
+            let params = EntryParams::read(&event.params);
             app.view.transcript.update(&event.params);
+            crate::program_status::shell_history_updated(app);
             crate::worktree::track_entry(app, &event.params);
-            record_todos(app, updated_entry_raw(app, &event.params).as_ref());
-            retry_continuation::merge_continuation(app);
-            sync_loading_label(app, &event.params);
-            turn_summary::track_narrator_updated(app, &event.params);
             // The wire patch carries no entry; the stored one is post-patch.
-            if let Some(id) = event.params.get("entryId").and_then(Value::as_str) {
-                let entry = app.view.transcript.entry_raw(id).cloned();
-                if let Some(entry) = entry {
-                    subagents::remember_parent_instruction_from_entry(app, &entry);
-                }
+            let entry = updated_entry_raw(app, &params);
+            record_todos(app, entry.as_ref());
+            sync_loading_label(app, &params);
+            turn_summary::track_narrator_updated(app, &event.params);
+            if let Some(entry) = updated_entry_raw(app, &params) {
+                subagents::remember_parent_instruction_from_entry(app, &entry);
             }
         }
         notification::SESSION_SNAPSHOT => {
             if let Some(state) = event.params.get("state") {
-                if let Ok(state) =
-                    serde_json::from_value::<crate::server::PublicSessionState>(state.clone())
-                {
+                if let Ok(state) = crate::server::PublicSessionState::deserialize(state) {
                     message_queue::reconcile_snapshot(app, client, &state);
                     // ADR 0009: a live same-session snapshot retains the loaded
-                    // contiguous prefix and merges the page into it (Python's
-                    // `SessionSnapshot` arm only touches the loading label); a
+                    // contiguous prefix and merges the page into it; a
                     // handoff or resync still replaces it.
                     let same_session =
                         app.session.session_id.as_deref() == Some(state.session.id.as_str());
@@ -716,103 +694,118 @@ pub fn apply_notification(app: &mut App, client: &Arc<Client>, event: &Notificat
                             resume_picker::load_history(app, &state);
                         }
                     }
-                    crate::worktree::track_state(app, &state);
-                    retry_continuation::reconcile_snapshot(app, same_session);
+                    crate::worktree::adopt_state(app, &state);
+                    crate::background_work::adopt_state(app, &state);
                     sync_retrying_label(app, &state);
                     app.expand_rebuilt_tools();
                     app.subagents.seed_snapshot(state.child_sessions.clone());
+                    if !same_session {
+                        subagents::reset_views(app);
+                    }
                     subagents::refresh(app);
                 }
             }
         }
         notification::TURN_STARTED => {
-            app.session.active_turn_id = event
-                .params
-                .pointer("/turn/id")
-                .and_then(Value::as_str)
-                .map(str::to_owned);
-            let queue_item_id = event
-                .params
-                .pointer("/turn/queueItemId")
-                .and_then(Value::as_str);
+            notices::close_startup(app);
+            let turn = PublicTurn::read(&event.params);
+            app.session.active_turn_id = turn.id;
             let interrupt = message_queue::take_interrupt_on_start(app);
-            if let Some(queue_item_id) = queue_item_id {
-                if message_queue::turn_started(app, client, queue_item_id) {
+            if let Some(queue_item_id) = turn.queue_item_id {
+                if message_queue::turn_started(app, client, &queue_item_id) {
                     feedback::maybe_show(app, client, app.session.session_id.clone());
                 }
             }
             app.set_status(Status::Generating {
-                since: std::time::Instant::now(),
+                since: crate::clock::now(),
             });
-            // Python `_begin_unsolicited_turn`: end the previous turn's open
-            // data, drop whatever summary it still had in flight, and open a
-            // fresh one.
+            // An unsolicited turn ends the previous turn's open data, drops
+            // whatever summary it still had in flight, and opens a fresh one.
             turn_summary::on_turn_end(app, client);
             turn_summary::cancel(app);
             turn_summary::on_turn_start(app, "");
-            // The user interrupted this turn before it started (Python `_interrupt_turn`).
+            // The user interrupted this turn before it started.
             if interrupt {
                 app.set_status(Status::Ready);
                 submission::send_interrupt(app, client);
             }
         }
         // The server promotes the next queued prompt itself; the loading area goes
-        // idle until its `turn/started` arrives, as Python's does.
+        // idle until its `turn/started` arrives.
         notification::TURN_COMPLETED => {
-            // Python `_complete_unsolicited_turn`: a failed or interrupted turn
-            // finalizes the open live group (`stop_current_tool_call`); a
+            let turn = PublicTurn::read(&event.params);
+            let status = turn.status();
+            let context = if status == Some("failed") {
+                crate::terminal_notifier::NotificationContext::Failed
+            } else {
+                crate::terminal_notifier::NotificationContext::Complete
+            };
+            // A failed or interrupted turn finalizes the open live group; a
             // successful one leaves it spinning.
-            if matches!(
-                event.params.pointer("/turn/status").and_then(Value::as_str),
-                Some("failed" | "interrupted")
-            ) {
+            if matches!(status, Some("failed" | "interrupted")) {
                 app.view.transcript.finalize_tool_group();
             }
             app.view.transcript.settle_reasoning();
+            app.view.transcript.settle_compactions(None);
             app.session.active_turn_id = None;
-            // The retried turn ended; its merged row is final until a snapshot replaces it.
-            app.session.retry_continuation = None;
-            if retry::auto_continue_incomplete_stream(app, client, &event.params) {
+            if retry::auto_continue_incomplete_stream(app, client, &turn) {
                 return true;
             }
-            let retryable = is_retryable_turn_error(&event.params);
-            app.session.can_retry = retryable;
-            if let Some((message, hint)) = turn_error_message(app, &event.params, retryable) {
+            let retryable = turn
+                .failure()
+                .is_some_and(|code| RETRYABLE_ERROR_CODES.contains(&code));
+            let error_row = turn_error_message(app, &turn, retryable).map(|(message, hint)| {
+                app.terminal_notifier.set_error_message(&message);
                 let id = new_message_id();
                 local::add_command_error(
                     &mut app.view.transcript,
                     &id,
                     &format!("{message}{hint}"),
                 );
-                if retryable {
-                    retry::offer(app, Some(id));
-                }
-            } else if retryable {
-                retry::offer(app, None);
-            }
-            if !retryable {
+                id
+            });
+            // An interrupted turn can be retried too, as the marker Esc left says.
+            if retryable || status == Some("interrupted") {
+                retry::offer(app, turn.id.as_deref(), error_row.filter(|_| retryable));
+            } else {
                 retry::cancel(app);
             }
             app.set_status(Status::Ready);
-            // Python `_complete_unsolicited_turn`: a failure feeds the summary
-            // its error — unless it auto-retries (`incomplete_stream` with no
-            // queued work) — an interrupt drops the data entirely; then
-            // `_finalize_turn_ui` requests the summary.
-            match event.params.pointer("/turn/status").and_then(Value::as_str) {
-                Some("failed") if !turn_summary::retries_incomplete_stream(app, &event.params) => {
-                    turn_summary::on_turn_error(
-                        app,
-                        &turn_summary::turn_error_message(&event.params),
-                    )
+            // A failure feeds the summary its error, unless it auto-retries
+            // (`incomplete_stream` with no queued work); an interrupt drops the
+            // data entirely; then the summary is requested.
+            let interrupted = match status {
+                Some("failed") if !turn_summary::retries_incomplete_stream(app, &turn) => {
+                    turn_summary::on_turn_error(app, &turn_summary::turn_error_message(&turn));
+                    false
                 }
-                Some("interrupted") => turn_summary::on_turn_cancel(app),
-                _ => {}
-            }
+                Some("interrupted") => {
+                    turn_summary::on_turn_cancel(app);
+                    true
+                }
+                _ => false,
+            };
             turn_summary::on_turn_end(app, client);
-            app.terminal_notifier.notify(
-                crate::terminal_notifier::NotificationContext::Complete,
-                std::time::Instant::now(),
-            );
+            // The turn spent usage; a rate limit may mean the allowance ran out.
+            let rate_limited = turn.error_code() == Some("rate_limit");
+            crate::usage_gauge::refresh(app, client, rate_limited);
+            if !interrupted && !app.queue.is_empty() && !app.queue.paused {
+                app.session.deferred_completion = turn
+                    .queue_item_id
+                    .filter(|id| app.queue.promotion_pending(id))
+                    .map(|id| (id, context));
+            } else if app.approval.open || app.question_app.open {
+                app.terminal_notifier.remember_completion(if interrupted {
+                    crate::program_status::ProgramState::Idle
+                } else {
+                    context.program_state()
+                });
+            } else if interrupted {
+                app.terminal_notifier
+                    .remember_completion(crate::program_status::ProgramState::Idle);
+            } else {
+                app.terminal_notifier.notify(context, crate::clock::now());
+            }
         }
         notification::TURN_QUEUE_UPDATED => {
             if let Some(queue) = event.params.get("queue") {
@@ -820,37 +813,39 @@ pub fn apply_notification(app: &mut App, client: &Arc<Client>, event: &Notificat
             }
         }
         notification::SESSION_STATS_UPDATED => {
-            let current = event
-                .params
-                .pointer("/stats/contextTokens")
-                .and_then(Value::as_u64)
-                .unwrap_or(0);
-            let max = event
-                .params
-                .get("contextWindow")
-                .and_then(Value::as_u64)
-                .unwrap_or(0);
-            // Python `_update_context_progress` masks the session budget with
+            let stats: crate::server::SessionStats =
+                crate::utils::json::read(&event.params["stats"]);
+            let current = stats.context_tokens;
+            let max = event.params["contextWindow"].as_u64().unwrap_or(0);
+            // The context progress masks the session budget with
             // the viewed child's own context usage while a subagent is viewed.
             app.subagents.main_tokens = (current, max);
             if app.subagents.viewed_subagent_id.is_none() {
                 app.session.tokens = (current, max);
             }
-            apply_stats(app, event.params.get("stats").unwrap_or(&Value::Null));
+            app.session.stats = stats;
+            // The `/context` app, when open, re-reads so its estimates follow the new reading.
+            crate::context_app::refresh(app, client);
+        }
+        notification::ARTIFACTS_CREATED | notification::ARTIFACTS_UPDATED => {
+            if let Some(artifact) = event.params.get("artifact") {
+                if let Ok(artifact) = crate::server::PublicSessionArtifact::deserialize(artifact) {
+                    artifacts::on_notification(app, client, &event.method, artifact);
+                }
+            }
         }
         notification::SESSION_COMPACTED => {
-            // Python `replace_state`: the handoff installs the replacement session.
+            // The handoff installs the replacement session.
             match compact::compacted_handoff(&event.params) {
                 Some((id, child_sessions)) => compact::apply_compacted(app, id, child_sessions),
                 None => compact::settle_compact(app),
             }
         }
-        // Python `ChildSessionUpdated`: upsert the child, announce the ready
+        // A child session update upserts the child, announces the ready
         // transition, and coalesce the viewed child's transcript refresh.
         notification::CHILD_SESSION_UPDATED => {
-            if let Ok(params) = serde_json::from_value::<crate::server::ChildSessionUpdatedParams>(
-                event.params.clone(),
-            ) {
+            if let Ok(params) = crate::server::ChildSessionUpdatedParams::deserialize(&event.params)
+            {
                 let session = params.child_session.clone();
                 app.subagents.replace_child_session(params.child_session);
                 let announced = app
@@ -862,12 +857,14 @@ pub fn apply_notification(app: &mut App, client: &Arc<Client>, event: &Notificat
                         subagents::anchor(app);
                     }
                     subagents::refresh_context_progress(app);
+                    // The open `/context` app reads the viewed child, so it follows its updates too.
+                    crate::context_app::refresh(app, client);
                     subagents::schedule_refresh(app);
                 }
                 subagents::refresh(app);
             }
         }
-        // Python `SessionContextCleared` -> `_reset_subagent_views`; the
+        // A cleared context resets the subagent views; the
         // handoff state carries the replacement session's children. The
         // replacement is the live session from here on, or every later
         // notification reads as foreign (`apply_compacted` parity).
@@ -876,59 +873,53 @@ pub fn apply_notification(app: &mut App, client: &Arc<Client>, event: &Notificat
                 serde_json::from_value::<crate::server::PublicSessionState>(state).ok()
             }) {
                 app.set_session_id(state.session.id.clone());
-                subagents::reset_views(app);
+                crate::background_work::adopt_state(app, &state);
                 app.subagents.seed_snapshot(state.child_sessions.clone());
+                subagents::reset_views(app);
                 subagents::refresh(app);
             }
         }
-        // Server-pushed operational warning/error: surface as a toast, like
-        // Python's `ServerWarning`/`ServerError` -> `App.notify`.
+        // Server-pushed operational warning/error: the startup box, then transcript rows.
         notification::WARNING => {
             if let Some(message) = event
                 .params
                 .pointer("/warning/message")
                 .and_then(Value::as_str)
             {
-                app.show_toast(
-                    message.to_owned(),
-                    ToastSeverity::Warning,
-                    SERVER_TOAST_SECS,
-                );
+                match event
+                    .params
+                    .pointer("/warning/code")
+                    .and_then(Value::as_str)
+                {
+                    Some(notices::HOOK_MESSAGE_CODE) => notices::hook_message(app, message),
+                    _ => notices::warn(app, message),
+                }
             }
         }
         notification::ERROR => {
-            if let Some(message) = event
-                .params
-                .pointer("/error/message")
-                .and_then(Value::as_str)
-            {
-                app.show_toast(message.to_owned(), ToastSeverity::Error, SERVER_TOAST_SECS);
+            if let Some(message) = event.params["error"]["message"].as_str() {
+                notices::error(app, message);
             }
         }
         // ADR 0009: `turn/retrying` is a compatibility notification. New reducers
         // ignore it and derive the retry label from `PublicSessionState.retrying`
         // via `sync_retrying_label` on `session/snapshot`.
         notification::TURN_RETRYING => {}
-        // Python `NarratorManager.sync` cancels only on a narrator config
-        // change; a plain runtime refresh (after resume, turn/completed, ...)
-        // does not.
+        // Narration cancels only on a narrator config change; a plain runtime
+        // refresh (after resume, turn/completed, ...) does not.
         notification::RUNTIME_UPDATED => {
             apply_runtime_value(app, &event.params);
+            notices::show_updated_config_warnings(app, &event.params);
         }
         // Forwarded by the client: a callback the user must answer.
         server_method::CALLBACK_CALL => {
-            if event
-                .params
-                .pointer("/callback/detail/kind")
-                .and_then(Value::as_str)
-                == Some("user_input")
-            {
-                question_app::on_callback_call(app, &event.params);
+            if event.params["callback"]["detail"]["kind"] == "user_input" {
+                return question_app::on_callback_call(app, &event.params);
             }
         }
         // `/mcp login` streams the OAuth URL: show it and open the browser.
         notification::MCP_AUTH_URL => {
-            let Some(url) = event.params.get("url").and_then(Value::as_str) else {
+            let Some(url) = event.params["url"].as_str() else {
                 return true;
             };
             // The OAuth bottom-app owns the URL of the login it started; only
@@ -937,7 +928,7 @@ pub fn apply_notification(app: &mut App, client: &Arc<Client>, event: &Notificat
                 crate::mcp_oauth::on_auth_url(app, url);
                 return true;
             }
-            local::add_command_result(
+            local::add_command_warning(
                 &mut app.view.transcript,
                 &submission::new_message_id(),
                 &format!("Open this URL in your browser:\n\n  {url}"),
@@ -945,28 +936,23 @@ pub fn apply_notification(app: &mut App, client: &Arc<Client>, event: &Notificat
             crate::external_url::open(url);
         }
         // The catalog publishes it alongside the canonical one; swallowing it
-        // keeps the URL from being handled twice (Python `consume_notification`).
+        // keeps the URL from being handled twice.
         notification::MCP_AUTH_URL_LEGACY => {}
-        notification::TELEPORT_EVENT => crate::teleport::on_event(app, client, &event.params),
         _ => {}
     }
     true
 }
 
-fn entry_finishes_reasoning(params: &Value) -> bool {
-    match params.pointer("/entry/type").and_then(Value::as_str) {
-        Some("message") => {
-            params.pointer("/entry/role").and_then(Value::as_str) == Some("assistant")
-        }
+fn entry_finishes_reasoning(entry: &EntryHead) -> bool {
+    match entry.entry_type() {
+        Some("message") => entry.role.as_deref() == Some("assistant"),
         Some("effect" | "callback") => true,
-        Some("checkpoint") => {
-            params.pointer("/entry/kind").and_then(Value::as_str) == Some("compaction")
-        }
+        Some("checkpoint") => entry.kind.as_deref() == Some("compaction"),
         _ => false,
     }
 }
 
-/// Python `_RETRYABLE_TURN_ERROR_CODES`: arm `/retry` only on these server-side errors.
+/// Arm `/retry` only on these server-side errors.
 const RETRYABLE_ERROR_CODES: &[&str] = &[
     "backend_error",
     "rate_limit",
@@ -974,44 +960,26 @@ const RETRYABLE_ERROR_CODES: &[&str] = &[
     "incomplete_stream",
 ];
 
-/// Whether a `turn/completed` notification carries a retryable failure,
-/// matching Python's `offer_retry` gate in `_mount_turn_error`.
-fn is_retryable_turn_error(params: &Value) -> bool {
-    let status = params.pointer("/turn/status").and_then(Value::as_str);
-    if status != Some("failed") {
-        return false;
-    }
-    let Some(code) = params.pointer("/turn/error/code").and_then(Value::as_str) else {
-        return false;
-    };
-    RETRYABLE_ERROR_CODES.contains(&code)
-}
-
-/// Python `_resolve_turn_error_message` + `_retry_hint`: the error text shown
+/// The error text shown
 /// in the transcript on a failed turn. Returns `(message, hint)` where hint
 /// is the `/retry` suffix for retryable errors.
-fn turn_error_message(app: &App, params: &Value, retryable: bool) -> Option<(String, String)> {
-    let status = params.pointer("/turn/status").and_then(Value::as_str)?;
-    if status != "failed" {
+fn turn_error_message(app: &App, turn: &PublicTurn, retryable: bool) -> Option<(String, String)> {
+    if turn.status() != Some("failed") {
         return None;
     }
-    let message = match params.pointer("/turn/error/code").and_then(Value::as_str) {
+    let message = match turn.error_code() {
         Some("rate_limit") => rate_limit_message(app.whoami.account()),
-        _ => params
-            .pointer("/turn/error/message")
-            .and_then(Value::as_str)
-            .unwrap_or("Turn failed")
-            .to_owned(),
+        _ => bounded_message(turn.error_message().unwrap_or("Turn failed")).into_owned(),
     };
     let hint = if retryable {
-        "\n\nRun /retry [additional instructions] to continue the interrupted response.".to_owned()
+        "\n\nRun /retry [additional instructions] to try again.".to_owned()
     } else {
         String::new()
     };
     Some((message, hint))
 }
 
-/// Python `_rate_limit_message`: the friendly rate-limit text, with the
+/// The friendly rate-limit text, with the
 /// upgrade line only when the account exposes a rate-limit action.
 pub fn rate_limit_message(account: &Value) -> String {
     if account

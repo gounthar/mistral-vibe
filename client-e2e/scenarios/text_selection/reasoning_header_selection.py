@@ -9,7 +9,7 @@ from e2e.app_server.events import (
     turn_started,
     user_msg,
 )
-from e2e.app_server.scenario import Timeline
+from e2e.app_server.scenario import Timeline, take_snapshot
 
 env = {"SSH_TTY": "/dev/pts/0"}
 
@@ -18,7 +18,7 @@ handshake = {
     "runtime/read": {"runtime": {"config": {"showThinkingNodes": True}}},
 }
 
-_HEADER_DRAG = "\x1b[<0;3;15M\x1b[<32;8;15M\x1b[<0;8;15m"
+_HEADER_DRAG = "\x1b[<0;3;11M\x1b[<32;8;11M\x1b[<0;8;11m"
 
 timeline: Timeline = [
     "think about it\r",
@@ -28,4 +28,5 @@ timeline: Timeline = [
     assistant_msg("Done."),
     turn_completed(),
     _HEADER_DRAG,
+    take_snapshot(),
 ]

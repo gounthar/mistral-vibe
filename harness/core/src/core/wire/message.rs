@@ -91,7 +91,7 @@ impl CandidateMessage {
     }
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum ToolOutcome {
     Success,
@@ -106,6 +106,11 @@ pub(crate) enum Message {
     },
     User {
         content: Vec<ContentBlock>,
+        /// Model-only context that the Runtime gave with a Turn start or a
+        /// steer, not the user's own words. A completion adapter may present it
+        /// apart from the user's text.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        context: bool,
     },
     Assistant {
         content: Vec<AssistantPart>,
@@ -133,9 +138,8 @@ pub(crate) enum StoredMessageSource {
 pub(crate) struct StoredMessage {
     pub message: Message,
     pub source: StoredMessageSource,
-    /// Identifies keyed hook context so Core can skip an unchanged delivery.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub context_key: Option<String>,
+    pub turn_index: Option<u64>,
 }
 
 impl Message {
@@ -146,7 +150,17 @@ impl Message {
     }
 
     pub(crate) fn user(content: Vec<ContentBlock>) -> Self {
-        Self::User { content }
+        Self::User {
+            content,
+            context: false,
+        }
+    }
+
+    pub(crate) fn context(content: Vec<ContentBlock>) -> Self {
+        Self::User {
+            content,
+            context: true,
+        }
     }
 
     pub(crate) fn user_text(content: impl Into<String>) -> Self {
@@ -191,6 +205,7 @@ impl Message {
         Self::tool_success(call_id, name, text_content(content))
     }
 
+    #[cfg(test)]
     pub(crate) fn tool_failure_text(
         call_id: String,
         name: String,
@@ -220,7 +235,7 @@ impl Message {
                     ));
                 }
             }
-            Self::User { content } => {
+            Self::User { content, .. } => {
                 validate_non_empty_content(content, "user message content")?;
             }
             Self::Assistant { content } => {
@@ -281,7 +296,7 @@ impl StoredMessage {
         Self {
             message,
             source: StoredMessageSource::History,
-            context_key: None,
+            turn_index: None,
         }
     }
 
@@ -289,15 +304,7 @@ impl StoredMessage {
         Self {
             message,
             source: StoredMessageSource::Injection,
-            context_key: None,
-        }
-    }
-
-    pub(crate) fn keyed_injection(key: String, message: Message) -> Self {
-        Self {
-            message,
-            source: StoredMessageSource::Injection,
-            context_key: Some(key),
+            turn_index: None,
         }
     }
 
@@ -305,12 +312,8 @@ impl StoredMessage {
         Self {
             message,
             source: StoredMessageSource::GeneratedSystem,
-            context_key: None,
+            turn_index: None,
         }
-    }
-
-    pub(crate) fn context_key(&self) -> Option<&str> {
-        self.context_key.as_deref()
     }
 
     pub(crate) fn is_injected(&self) -> bool {

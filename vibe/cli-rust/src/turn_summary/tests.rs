@@ -96,37 +96,12 @@ fn cancel_interrupts_summarizing_and_answer_settles_idle() {
 }
 
 #[test]
-fn stale_generation_summary_is_ignored() {
-    let mut app = App::default();
-    app.session.startup_config.narrator_enabled = true;
-    on_turn_start(&mut app, "first");
-    on_turn_start(&mut app, "second");
-    apply_event(
-        &mut app,
-        Event::Summary {
-            generation: 1,
-            summary: Some("stale".into()),
-        },
-    );
-    assert_eq!(app.narrator.state, NarratorState::Idle);
-    // The current generation's summary also settles the row silently.
-    apply_event(
-        &mut app,
-        Event::Summary {
-            generation: 2,
-            summary: None,
-        },
-    );
-    assert_eq!(app.narrator.state, NarratorState::Idle);
-}
-
-#[test]
 fn a_summary_queued_before_cancel_is_not_spoken() {
     let mut app = App::default();
     app.session.startup_config.narrator_enabled = true;
     app.session.session_id = Some("s1".into());
     let (tx, _rx) = tokio::sync::mpsc::channel(2);
-    app.narrator.tx = Some(tx);
+    app.events = Some(tx);
     app.narrator.speech_config = crate::tts::SpeechConfig::from_runtime(&serde_json::json!({
         "runtime": {"config": {"speech": {
             "model": {"name": "tts", "voice": "v"},

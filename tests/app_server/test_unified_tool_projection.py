@@ -16,6 +16,7 @@ from mistralai_vibe_local_harness.protocol import (
 from vibe.app_server._provided_tools import VIBE_TOOL_GROUP, VibeProvidedTools
 from vibe.app_server._unified_scratchpad import SCRATCHPAD_TOOL_NAME
 from vibe.app_server._unified_tool_projection import (
+    _parse_grep_invocation,
     is_large_output_receipt,
     project_unified_history_entry,
     unified_tool_category,
@@ -25,12 +26,13 @@ from vibe.app_server.models import (
     CompletedEffectState,
     EffectResultDisplay,
     FailedEffectState,
-    FileEditEffectBatchInput,
     FileEditEffectDetail,
+    FileEditEffectInput,
     FileEditEffectOutput,
     FileReadEffectDetail,
     FileReadEffectOutput,
     FileSearchEffectDetail,
+    FileSearchEffectInput,
     FileSearchEffectOutput,
     FileWriteEffectDetail,
     FileWriteEffectOutput,
@@ -101,6 +103,34 @@ def test_projects_unified_read_file_with_nullable_limit() -> None:
             was_truncated=False,
         )
     )
+
+
+def test_an_image_read_says_it_read_the_image() -> None:
+    entry = _effect(
+        "file_system.read_file",
+        {"path": "shot.png"},
+        result={
+            "content": [
+                {"type": "text", "text": "{}"},
+                {"type": "image", "data": "aW1hZ2U=", "mimeType": "image/png"},
+            ],
+            "structured_content": {
+                "path": "/workspace/shot.png",
+                "content": "Image file (image/png, 5 bytes).",
+                "file_size_bytes": 5,
+                "returned_bytes": 0,
+                "offset": 0,
+                "lines_read": 0,
+                "was_truncated": False,
+            },
+        },
+    )
+
+    projected = project_unified_history_entry(entry)
+
+    assert isinstance(projected, PublicEffectEntry)
+    assert isinstance(projected.state, CompletedEffectState)
+    assert projected.state.display.message == "the image /workspace/shot.png"
 
 
 @pytest.mark.parametrize(
@@ -187,6 +217,48 @@ def test_projects_unified_write_file_over_an_existing_file() -> None:
     assert projected.state.display.verb == "Updated"
 
 
+@pytest.mark.parametrize(
+    ("previous", "content", "written"),
+    [
+        ("one\r\ntwo\r\n", "alpha\nbeta\r\n", "alpha\r\nbeta\r\n"),
+        ("one\ntwo\n", "alpha\r\nbeta\r\n", "alpha\nbeta\n"),
+        ("one\rtwo\r", "alpha\nbeta\n", "alpha\rbeta\r"),
+        ("one", "alpha\r\nbeta\n", "alpha\r\nbeta\n"),
+    ],
+)
+def test_projects_a_write_with_the_line_endings_of_the_replaced_file(
+    previous: str, content: str, written: str
+) -> None:
+    """*Prepare*: A write over a file with known line endings.
+    *Do*: Project the completed call.
+    *Assert*: The written content carries the replaced file's dominant line
+    ending, as the Runtime wrote it, or stands as given without one.
+    """
+    # Prepare
+    entry = _effect(
+        "write_file",
+        {"path": "notes.txt", "content": content},
+        result={
+            "structured_content": {
+                "path": "/workspace/notes.txt",
+                "bytes_written": len(written),
+                "file_existed": True,
+            },
+            "_meta": {"mistralai.vibe.sdk.write_file": {"previous_content": previous}},
+        },
+    )
+
+    # Do
+    projected = project_unified_history_entry(entry)
+
+    # Assert
+    assert isinstance(projected, PublicEffectEntry)
+    assert isinstance(projected.state, CompletedEffectState)
+    output = FileWriteEffectOutput.model_validate(projected.state.output)
+    assert output.content == written
+    assert output.previous_content == previous
+
+
 def test_projects_unified_write_file_the_runtime_could_not_diff() -> None:
     # The Runtime omits the annotation for a file too large or not text.
     entry = _effect(
@@ -227,20 +299,19 @@ def test_leaves_a_write_generic_when_the_runtime_omits_file_existed() -> None:
     assert isinstance(projected.detail, GenericEffectDetail)
 
 
-def test_projects_unified_batched_search_replace_and_occurrences() -> None:
+def test_projects_unified_edit_and_occurrences() -> None:
     entry = _effect(
-        "file_system.search_replace",
+        "file_system.edit",
         {
             "file_path": "notes.txt",
-            "content": [
-                {"old_str": "alpha", "new_str": "beta"},
-                {"old_str": "one", "new_str": "two", "replace_all": True},
-            ],
+            "old_string": "one\n",
+            "new_string": "two\n",
+            "replace_all": True,
         },
         result={
             "structured_content": {
                 "file": "/workspace/notes.txt",
-                "lines_changed": 3,
+                "lines_changed": 2,
                 "warnings": ["review generated content"],
             },
             "_meta": {
@@ -249,8 +320,8 @@ def test_projects_unified_batched_search_replace_and_occurrences() -> None:
                         {
                             "old_start_line": 2,
                             "new_start_line": 2,
-                            "old_lines": ["alpha"],
-                            "new_lines": ["beta"],
+                            "old_lines": ["one\n"],
+                            "new_lines": ["two\n"],
                         },
                         {
                             "old_start_line": 5,
@@ -268,20 +339,90 @@ def test_projects_unified_batched_search_replace_and_occurrences() -> None:
 
     assert isinstance(projected, PublicEffectEntry)
     assert isinstance(projected.detail, FileEditEffectDetail)
-    assert isinstance(projected.detail.input, FileEditEffectBatchInput)
-    assert [change.old_string for change in projected.detail.input.changes] == [
-        "alpha",
-        "one",
-    ]
-    assert projected.detail.input.changes[1].replace_all
+    assert projected.detail.input == FileEditEffectInput(
+        file_path="notes.txt", old_string="one\n", new_string="two\n", replace_all=True
+    )
     assert isinstance(projected.state, CompletedEffectState)
     output = FileEditEffectOutput.model_validate(projected.state.output)
     assert output.old_string is None
     assert output.new_string is None
     assert [
         (item.start_line, item.old_text, item.new_text) for item in output.occurrences
-    ] == [(2, "alpha", "beta"), (5, "one\n", "two\n")]
+    ] == [(2, "one\n", "two\n"), (5, "one\n", "two\n")]
     assert projected.state.display.warnings == ["review generated content"]
+
+
+def test_projects_edit_carried_preedit_text_and_anchors() -> None:
+    entry = _effect(
+        "file_system.edit",
+        {"file_path": "notes.txt", "old_string": "one\n", "new_string": "two\n"},
+        result={
+            "structured_content": {
+                "file": "/workspace/notes.txt",
+                "lines_changed": 1,
+                "warnings": [],
+            },
+            "_meta": {
+                "mistralai.vibe.sdk.search_replace": {
+                    "blocks": [
+                        {
+                            "old_start_line": 2,
+                            "new_start_line": 2,
+                            "old_lines": ["one\n"],
+                            "new_lines": ["two\n"],
+                        }
+                    ],
+                    "previous_content": "zero\none\n",
+                }
+            },
+        },
+    )
+
+    projected = project_unified_history_entry(entry)
+
+    assert isinstance(projected, PublicEffectEntry)
+    assert isinstance(projected.state, CompletedEffectState)
+    output = FileEditEffectOutput.model_validate(projected.state.output)
+    assert output.previous_content == "zero\none\n"
+    assert [
+        (item.start_line, item.new_start_line, item.old_text, item.new_text)
+        for item in output.occurrences
+    ] == [(2, 2, "one\n", "two\n")]
+
+
+def test_projects_edit_without_carried_text_stays_positional() -> None:
+    # A runtime predating the carried pre-edit text annotates blocks only;
+    # the reversal falls back to the hunks alone.
+    entry = _effect(
+        "file_system.edit",
+        {"file_path": "notes.txt", "old_string": "alpha", "new_string": "beta"},
+        result={
+            "structured_content": {
+                "file": "/workspace/notes.txt",
+                "lines_changed": 1,
+                "warnings": [],
+            },
+            "_meta": {
+                "mistralai.vibe.sdk.search_replace": {
+                    "blocks": [
+                        {
+                            "old_start_line": 2,
+                            "old_lines": ["alpha"],
+                            "new_lines": ["beta"],
+                        }
+                    ]
+                }
+            },
+        },
+    )
+
+    projected = project_unified_history_entry(entry)
+
+    assert isinstance(projected, PublicEffectEntry)
+    assert isinstance(projected.state, CompletedEffectState)
+    output = FileEditEffectOutput.model_validate(projected.state.output)
+    assert output.previous_content is None
+    assert output.occurrences[0].new_start_line is None
 
 
 def test_projects_unified_shell_result_from_structured_transcript() -> None:
@@ -433,7 +574,17 @@ def test_unknown_or_malformed_unified_tools_remain_exactly_generic(
 
 @pytest.mark.parametrize(
     ("name", "verb", "message", "settled_verb"),
-    [("subagent.wait", "Waiting", "for a subagent", "Waited")],
+    [
+        ("agents.list_configs", "Listing", "subagent configs", "Listed"),
+        ("agents.list", "Listing", "subagents", "Listed"),
+        ("agents.send_message", "Sending", "a message to a subagent", "Sent"),
+        ("agents.interrupt", "Interrupting", "a subagent", "Interrupted"),
+        # Deprecated pre-rename spellings; persisted sessions still replay them.
+        ("subagent.list", "Listing", "subagents", "Listed"),
+        ("subagent.send_message", "Sending", "a message to a subagent", "Sent"),
+        ("subagent.interrupt", "Interrupting", "a subagent", "Interrupted"),
+        ("subagent.wait", "Waiting", "for a subagent", "Waited"),
+    ],
 )
 def test_humanizes_namespaced_builtin_labels(
     name: str, verb: str, message: str, settled_verb: str
@@ -489,6 +640,9 @@ def test_projects_process_start_with_command_in_display() -> None:
     assert projected.state.display.verb == "Started"
     assert projected.state.display.message == "sleep 30"
     assert projected.state.display.suffix == "(running)"
+    # Clients use the id to show the live status of the started process.
+    assert isinstance(projected.state.output, dict)
+    assert projected.state.output["processId"] == "process-abc12345-abcdef"
 
 
 def test_self_sleep_label_renders_the_verb_alone() -> None:
@@ -517,6 +671,34 @@ def test_self_sleep_label_renders_the_verb_alone() -> None:
     assert isinstance(projected.state, CompletedEffectState)
     assert projected.state.display.verb == "Slept"
     assert projected.state.display.message == ""
+
+
+def test_self_wait_label_hides_the_raw_tool_key() -> None:
+    # The Harness stamps the raw tool key as the settled result message.
+    entry = _effect(
+        "self.wait",
+        {"timeout_ms": 1000, "deadline_unix_ms": 1},
+        result={"structured_content": {"reason": "input_available"}},
+    )
+    entry = entry.model_copy(
+        update={
+            "state": entry.state.model_copy(
+                update={
+                    "display": EffectResultDisplay(success=True, message="self.wait")
+                }
+            )
+        }
+    )
+
+    projected = project_unified_history_entry(entry)
+
+    assert isinstance(projected, PublicEffectEntry)
+    assert isinstance(projected.detail, GenericEffectDetail)
+    assert projected.detail.display.verb == "Waiting"
+    assert projected.detail.display.message == "for background work"
+    assert isinstance(projected.state, CompletedEffectState)
+    assert projected.state.display.verb == "Waited"
+    assert projected.state.display.message == "for background work"
 
 
 @pytest.mark.parametrize(
@@ -550,7 +732,7 @@ def test_self_sleep_label_renders_the_verb_alone() -> None:
         ),
         ("connector_mistral_ai.list_skills", "Listing", "skills", "Listed"),
         ("connector_slack.slack_send_message", "Sending", "a Slack message", "Sent"),
-        ("connector_web_search.web_search", "Searching", "the web", "Searched"),
+        ("connector_web_search.news_search", "Searching", "news", "Searched"),
     ],
 )
 def test_humanizes_connector_tool_labels(
@@ -811,8 +993,8 @@ def test_edit_write_and_grep_paths_display_relative(tmp_path: Path) -> None:
     root = tmp_path / "repo"
     target = str(root / "notes.txt")
     edit = _effect(
-        "file_system.search_replace",
-        {"file_path": target, "content": [{"old_str": "a", "new_str": "b"}]},
+        "file_system.edit",
+        {"file_path": target, "old_string": "a", "new_string": "b"},
         error="failed",
     )
     write = _effect(
@@ -1083,6 +1265,96 @@ def test_projects_unified_web_fetch_result() -> None:
     assert "11 chars" in projected.state.display.message
     assert "text/html" in projected.state.display.message
     assert projected.state.display.suffix == "(truncated)"
+
+
+def test_projects_unified_connector_web_search_result() -> None:
+    # The connector answers with cards keyed by opaque reference ids, listed
+    # out of rank order: the projected sources follow `rank`.
+    entry = _effect(
+        "connector_web_search.web_search",
+        {"query": "mistral ai", "limit": 10},
+        result={
+            "structured_content": {
+                "xNyQ0Yof": {
+                    "url": "https://mistral.ai",
+                    "title": "Mistral AI",
+                    "description": "AI company",
+                    "snippets": [],
+                    "date": None,
+                    "rank": 1,
+                    "can_open": True,
+                    "metadata": {"lang": "en", "source": "brave"},
+                },
+                "CyGcVA9F": {
+                    "url": "https://wikipedia.org",
+                    "title": "Wikipedia",
+                    "description": "Encyclopedia",
+                    "snippets": [],
+                    "date": None,
+                    "rank": 0,
+                    "can_open": True,
+                    "metadata": {"lang": "en", "source": "brave"},
+                },
+            }
+        },
+    )
+
+    projected = project_unified_history_entry(entry)
+
+    assert isinstance(projected, PublicEffectEntry)
+    assert isinstance(projected.detail, WebSearchEffectDetail)
+    assert projected.detail.tool_name == "connector_web_search.web_search"
+    assert projected.detail.input is not None
+    assert projected.detail.input.query == "mistral ai"
+    assert projected.detail.display.verb == "Searching"
+    assert "mistral ai" in projected.detail.display.summary
+    assert isinstance(projected.state, CompletedEffectState)
+    output = WebSearchEffectOutput.model_validate(projected.state.output)
+    assert output.query == "mistral ai"
+    assert output.answer == ""
+    assert [source.url for source in output.sources] == [
+        "https://wikipedia.org",
+        "https://mistral.ai",
+    ]
+    assert output.sources[0].title == "Wikipedia"
+    assert projected.state.display.verb == "Searched"
+    assert "2 sources" in projected.state.display.message
+    assert unified_tool_category(entry) == "web_search"
+
+
+def test_projects_unified_connector_open_url_result() -> None:
+    entry = _effect(
+        "connector_web_search.open_url",
+        {"url": "https://example.com/page"},
+        result={
+            "structured_content": {
+                "url": "https://example.com/page",
+                "content": "# Hello\n\nworld\n",
+                "can_open": True,
+                "title": "Hello",
+                "description": None,
+                "date": None,
+            }
+        },
+    )
+
+    projected = project_unified_history_entry(entry)
+
+    assert isinstance(projected, PublicEffectEntry)
+    assert isinstance(projected.detail, WebFetchEffectDetail)
+    assert projected.detail.tool_name == "connector_web_search.open_url"
+    assert projected.detail.input is not None
+    assert projected.detail.input.url == "https://example.com/page"
+    assert "example.com" in projected.detail.display.summary
+    assert isinstance(projected.state, CompletedEffectState)
+    output = WebFetchEffectOutput.model_validate(projected.state.output)
+    assert output.url == "https://example.com/page"
+    assert output.content == "# Hello\n\nworld\n"
+    assert output.content_type == ""
+    assert output.was_truncated is False
+    assert projected.state.display.verb == "Fetched"
+    assert "15 chars" in projected.state.display.message
+    assert unified_tool_category(entry) == "web_fetch"
 
 
 def test_projects_unified_grep_result() -> None:
@@ -1511,6 +1783,26 @@ def _generic_detail(name: str, input_value: object) -> dict[str, object]:
             "Scheduled",
             "cron 0 9 * * 1-5 (local time): review CI",
         ),
+        (
+            {
+                "action": "schedule",
+                "interval_seconds": 60,
+                "prompt": "CI watch\nCheck CI and report failures.",
+            },
+            "Scheduling",
+            "Scheduled",
+            "every 1 minute: CI watch",
+        ),
+        (
+            {
+                "action": "schedule",
+                "interval_seconds": 60,
+                "prompt": "\n  CI watch\nCheck CI and report failures.",
+            },
+            "Scheduling",
+            "Scheduled",
+            "every 1 minute: CI watch",
+        ),
         ({"action": "list"}, "Listing", "Listed", "scheduled prompts"),
         (
             {"action": "cancel", "id": "abc"},
@@ -1680,8 +1972,12 @@ async def test_cron_executor_result_projects_through_the_public_boundary(
     from vibe.app_server._unified_scheduled_loops import UnifiedScheduledLoops
 
     store = UnifiedScheduledLoops(tmp_path / "loops.json", persistent=lambda: False)
+
+    async def resolve_loops(_session_id: str) -> UnifiedScheduledLoops:
+        return store
+
     executor = VibeProvidedTools().executor_factory(
-        tmp_path, max_todos=lambda: 10, scheduled_loops=lambda _: store
+        tmp_path, max_todos=lambda: 10, scheduled_loops=resolve_loops
     )("session-1")
     arguments: JsonObject = {
         "action": "schedule",
@@ -1731,3 +2027,321 @@ def test_cron_clear_display_uses_structured_count_not_result_prose(count):
     noun = f"{count} scheduled loop{'s' if count != 1 else ''}"
     assert projected.state.display.message == noun
     assert projected.state.output == f"Cleared {noun}"
+
+
+def _shell_result(
+    command: str,
+    stdout: str = "",
+    stderr: str = "",
+    returncode: int = 0,
+    was_truncated: bool = False,
+) -> dict[str, object]:
+    return {
+        "structured_content": {
+            "command": command,
+            "stdout": stdout,
+            "stderr": stderr,
+            "output": "",
+            "returncode": returncode,
+            "was_truncated": was_truncated,
+        }
+    }
+
+
+def test_a_plain_bash_grep_projects_as_a_file_search() -> None:
+    command = 'grep -rn "NEEDLE" src/'
+    stdout = "src/a.ts:12:  needle here\nsrc/b.ts:3:NEEDLE\n"
+    projected = project_unified_history_entry(
+        _effect(
+            "bash", {"command": command}, result=_shell_result(command, stdout=stdout)
+        )
+    )
+
+    assert isinstance(projected, PublicEffectEntry)
+    assert isinstance(projected.detail, FileSearchEffectDetail)
+    assert projected.detail.tool_name == "grep"
+    assert projected.detail.input == FileSearchEffectInput(
+        pattern="NEEDLE", path="src/"
+    )
+    assert projected.detail.display.summary == "Grepping 'NEEDLE' in src/"
+    assert isinstance(projected.state, CompletedEffectState)
+    assert projected.state.display.success is True
+    output = FileSearchEffectOutput.model_validate(projected.state.output)
+    assert output.matches == stdout
+    assert output.match_count == 2
+    assert output.was_truncated is False
+    assert [(match.path, match.line) for match in output.parsed_matches] == [
+        ("src/a.ts", 12),
+        ("src/b.ts", 3),
+    ]
+    # The model still sees the raw grep output.
+    assert projected.state.output_text == stdout
+
+
+def test_an_rg_invocation_projects_as_a_file_search() -> None:
+    # Piped rg prints line numbers only with -n; with a directory target it
+    # prints the path prefix on its own.
+    command = "rg --no-ignore -n needle ."
+    stdout = "./src/app.ts:42:const needle = 1;\n"
+    projected = project_unified_history_entry(
+        _effect(
+            "bash", {"command": command}, result=_shell_result(command, stdout=stdout)
+        )
+    )
+
+    assert isinstance(projected, PublicEffectEntry)
+    assert isinstance(projected.detail, FileSearchEffectDetail)
+    assert projected.detail.input == FileSearchEffectInput(pattern="needle", path=".")
+    assert isinstance(projected.state, CompletedEffectState)
+    output = FileSearchEffectOutput.model_validate(projected.state.output)
+    # The leading ./ from `grep -r .`-style output is stripped for the chips.
+    assert [(match.path, match.line) for match in output.parsed_matches] == [
+        ("src/app.ts", 42)
+    ]
+
+
+def test_an_rg_invocation_without_line_numbers_stays_a_shell_call() -> None:
+    # Piped rg omits line numbers without -n, so the output shape is unknown.
+    command = "rg --no-ignore needle ."
+    projected = project_unified_history_entry(
+        _effect("bash", {"command": command}, result=_shell_result(command))
+    )
+
+    assert isinstance(projected, PublicEffectEntry)
+    assert isinstance(projected.detail, ShellEffectDetail)
+
+
+def test_an_rg_invocation_on_a_single_file_stays_a_shell_call() -> None:
+    # Piped rg omits the path prefix for a single file target without -H.
+    command = "rg -n needle src/app.ts"
+    projected = project_unified_history_entry(
+        _effect("bash", {"command": command}, result=_shell_result(command))
+    )
+
+    assert isinstance(projected, PublicEffectEntry)
+    assert isinstance(projected.detail, ShellEffectDetail)
+
+
+def test_an_rg_invocation_with_with_filename_projects_as_a_file_search() -> None:
+    command = "rg -nH needle src/app.ts"
+    stdout = "src/app.ts:42:const needle = 1;\n"
+    projected = project_unified_history_entry(
+        _effect(
+            "bash", {"command": command}, result=_shell_result(command, stdout=stdout)
+        )
+    )
+
+    assert isinstance(projected, PublicEffectEntry)
+    assert isinstance(projected.detail, FileSearchEffectDetail)
+    assert isinstance(projected.state, CompletedEffectState)
+    output = FileSearchEffectOutput.model_validate(projected.state.output)
+    assert [(match.path, match.line) for match in output.parsed_matches] == [
+        ("src/app.ts", 42)
+    ]
+
+
+def test_a_recognized_grep_with_unparseable_output_falls_back_to_shell() -> None:
+    # A recognized invocation whose output does not parse (e.g. a
+    # RIPGREP_CONFIG_PATH override) falls back to the raw shell entry instead
+    # of reporting "0 matches".
+    command = "grep -rn foo src/"
+    projected = project_unified_history_entry(
+        _effect(
+            "bash",
+            {"command": command},
+            result=_shell_result(command, stdout="some unparseable line\n"),
+        )
+    )
+
+    assert isinstance(projected, PublicEffectEntry)
+    assert isinstance(projected.detail, GenericEffectDetail)
+    assert projected.detail.tool_name == "bash"
+
+
+def test_a_grep_with_multiple_paths_searches_the_workspace_root() -> None:
+    command = "grep -rn foo src tests"
+    projected = project_unified_history_entry(
+        _effect("bash", {"command": command}, result=_shell_result(command))
+    )
+
+    assert isinstance(projected, PublicEffectEntry)
+    assert isinstance(projected.detail, FileSearchEffectDetail)
+    assert projected.detail.input is not None
+    assert projected.detail.input.path == "."
+
+
+def test_a_grep_without_line_numbers_stays_a_shell_call() -> None:
+    command = "grep -r foo ."
+    projected = project_unified_history_entry(
+        _effect("bash", {"command": command}, result=_shell_result(command))
+    )
+
+    assert isinstance(projected, PublicEffectEntry)
+    assert isinstance(projected.detail, ShellEffectDetail)
+
+
+def test_a_grep_without_a_path_prefix_flag_stays_a_shell_call() -> None:
+    command = "grep -n foo file.txt"
+    projected = project_unified_history_entry(
+        _effect("bash", {"command": command}, result=_shell_result(command))
+    )
+
+    assert isinstance(projected, PublicEffectEntry)
+    assert isinstance(projected.detail, ShellEffectDetail)
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "grep -rn foo . | head -3",
+        "cd src && grep -rn foo .",
+        "grep -rn foo > out.txt",
+        "grep -rln foo src",
+        "grep -rn foo",
+        "grep -rn foo -",
+        "grep -rn -B2 foo src",
+        "rg needle .",
+        "rg -n needle file.txt",
+        "rg --no-line-number foo src",
+        "grep -rn `date` .",
+        "ls -la",
+        "printf out; printf err >&2",
+    ],
+)
+def test_an_ambiguous_bash_command_stays_a_shell_call(command: str) -> None:
+    projected = project_unified_history_entry(
+        _effect("bash", {"command": command}, result=_shell_result(command))
+    )
+
+    assert isinstance(projected, PublicEffectEntry)
+    assert isinstance(projected.detail, ShellEffectDetail)
+
+
+def test_a_grep_without_matches_reports_zero_matches() -> None:
+    command = "grep -rn nothing-here ."
+    projected = project_unified_history_entry(
+        _effect(
+            "bash", {"command": command}, result=_shell_result(command, returncode=1)
+        )
+    )
+
+    assert isinstance(projected, PublicEffectEntry)
+    assert isinstance(projected.detail, FileSearchEffectDetail)
+    assert isinstance(projected.state, CompletedEffectState)
+    # Exit 1 means "no matches", not an error.
+    assert projected.state.display.success is True
+    output = FileSearchEffectOutput.model_validate(projected.state.output)
+    assert output.match_count == 0
+    assert output.parsed_matches == []
+
+
+def test_a_grep_error_is_a_failed_search() -> None:
+    command = "grep -rn foo missing-dir"
+    stderr = "grep: missing-dir: No such file or directory\n"
+    projected = project_unified_history_entry(
+        _effect(
+            "bash",
+            {"command": command},
+            result=_shell_result(command, stderr=stderr, returncode=2),
+        )
+    )
+
+    assert isinstance(projected, PublicEffectEntry)
+    assert isinstance(projected.detail, FileSearchEffectDetail)
+    assert isinstance(projected.state, CompletedEffectState)
+    assert projected.state.display.success is False
+    # The model still sees the grep error.
+    assert projected.state.output_text == stderr
+
+
+def test_a_bash_grep_parses_binary_file_matches_without_a_line() -> None:
+    command = "grep -rn logo ."
+    stdout = "Binary file assets/logo.png matches\n"
+    projected = project_unified_history_entry(
+        _effect(
+            "bash", {"command": command}, result=_shell_result(command, stdout=stdout)
+        )
+    )
+
+    assert isinstance(projected, PublicEffectEntry)
+    assert isinstance(projected.state, CompletedEffectState)
+    output = FileSearchEffectOutput.model_validate(projected.state.output)
+    assert [(match.path, match.line) for match in output.parsed_matches] == [
+        ("assets/logo.png", None)
+    ]
+
+
+def test_a_bash_grep_caps_the_parsed_matches() -> None:
+    command = "grep -rn foo ."
+    stdout = "".join(f"src/f{index}.ts:{index}:foo\n" for index in range(1, 300))
+    projected = project_unified_history_entry(
+        _effect(
+            "bash", {"command": command}, result=_shell_result(command, stdout=stdout)
+        )
+    )
+
+    assert isinstance(projected, PublicEffectEntry)
+    assert isinstance(projected.state, CompletedEffectState)
+    output = FileSearchEffectOutput.model_validate(projected.state.output)
+    assert output.match_count == 200
+    assert output.was_truncated is True
+    assert projected.state.display.suffix == "(truncated)"
+
+
+@pytest.mark.parametrize(
+    ("command", "expected"),
+    [
+        ('grep -rn "TODO" src/', ("TODO", "src/")),
+        ("rg -n pattern .", ("pattern", ".")),
+        ("rg -n pattern src/", ("pattern", "src/")),
+        ("rg --line-number pattern .", ("pattern", ".")),
+        ("rg --vimgrep pattern .", ("pattern", ".")),
+        ("rg -nH pattern src/app.ts", ("pattern", "src/app.ts")),
+        ("rg -n pattern src/app.ts src/other.ts", ("pattern", ".")),
+        ("grep -rn foo .", ("foo", ".")),
+        ("grep -Hn foo file.txt", ("foo", "file.txt")),
+        ("/usr/bin/grep -rn foo src", ("foo", "src")),
+        ("grep -rnm5 foo src", ("foo", "src")),
+        ('grep -rn --include="*.ts" foo src', ("foo", "src")),
+        ('grep -rn "foo|bar" src', ("foo|bar", "src")),
+        ('grep -rn "foo$" .', ("foo$", ".")),
+        ('grep -rn "a b" "my dir/"', ("a b", "my dir/")),
+        ("grep -rn foo src tests", ("foo", ".")),
+    ],
+)
+def test_parse_grep_invocation_recognizes_plain_invocations(
+    command: str, expected: tuple[str, str]
+) -> None:
+    parsed = _parse_grep_invocation(command)
+    assert parsed is not None
+    assert (parsed.pattern, parsed.path) == expected
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "grep -n foo file.txt",
+        "grep -rn foo . | head -5",
+        "grep -rn foo",
+        "grep -e foo -e bar src",
+        "grep -rln foo src",
+        "rg --no-line-number foo src",
+        "rg pattern src",
+        "rg -n pattern src",
+        "rg -n pattern src/app.ts",
+        "grep -rn -C1 foo src",
+        "rg -n --context=1 pattern .",
+        "grep -rn --after-context=2 foo src",
+        "grep -rnv foo src",
+        "grep -rn --invert-match foo src",
+        "rg -nv pattern .",
+        "rg -rn pattern .",
+        "rg -r foo pattern .",
+        "grep -rn foo > out.txt",
+        "grep -rn foo -",
+        'grep -rn "unbalanced src',
+        "ls -la",
+    ],
+)
+def test_parse_grep_invocation_rejects_ambiguous_invocations(command: str) -> None:
+    assert _parse_grep_invocation(command) is None

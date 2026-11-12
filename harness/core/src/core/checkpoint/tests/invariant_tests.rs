@@ -3,7 +3,7 @@ use serde_json::json;
 use super::cases::{checkpoint_with_turn, restorable_active_tool_checkpoint};
 use crate::core::checkpoint::{Checkpoint, decode_checkpoint};
 use crate::core::features::compaction::{
-    CompactionBudget, CompactionProjection, CompactionProjectionFit, CompactionTrigger,
+    CompactionBudgets, CompactionProjection, CompactionProjectionFit, CompactionTrigger,
     PendingCompaction,
 };
 use crate::core::testing::config;
@@ -14,6 +14,31 @@ use crate::core::{
 
 type HarnessStateMutation = fn(&mut crate::core::HarnessState);
 type ProgramExecutionMutation = fn(&mut crate::core::ProgramExecution);
+
+#[test]
+fn rejects_checkpoint_with_pending_queued_requests() {
+    let mut checkpoint = restorable_active_tool_checkpoint();
+    checkpoint["turn"]["queued"] = json!({
+        "type": "pending",
+        "turn_id": "turn-queued",
+        "messages": [{
+            "message": {
+                "role": "user",
+                "content": [{ "type": "text", "text": "queued request" }]
+            },
+            "source": "history"
+        }]
+    });
+    let encoded = checkpoint.to_string();
+    let decoded = decode_checkpoint(&encoded).unwrap();
+
+    let error = decoded.restore(config()).unwrap_err();
+
+    assert_eq!(
+        error,
+        "checkpoint contains pending queued requests; resume with the previous build before upgrading"
+    );
+}
 
 /// *Prepare*: Build live compaction tokens in lifecycle positions that normal Core transitions cannot create.
 /// *Do*: Capture each malformed state through checkpoint V1.
@@ -32,7 +57,6 @@ fn capture_rejects_compaction_state_that_disagrees_with_its_lifecycle() {
                     crate::core::action_id::compaction("task", 1),
                     "different-turn".to_string(),
                     active.iterations,
-                    Vec::new(),
                     projection,
                 ),
             };
@@ -57,7 +81,6 @@ fn capture_rejects_compaction_state_that_disagrees_with_its_lifecycle() {
                     crate::core::action_id::compaction("task", 1),
                     "work".to_string(),
                     0,
-                    Vec::new(),
                     projection,
                 ),
             };
@@ -82,11 +105,13 @@ fn compaction_projection(state: &crate::core::HarnessState) -> CompactionProject
         state.context.messages(),
         state.generated_system_message(),
         "",
-        state.resolved_tools.top_level_tools(),
-        CompactionBudget {
-            token_threshold: state.config.settings.context.compaction.token_threshold(),
-            image_delivery: state.config.settings.context.image_delivery.compaction,
-        },
+        state.resolved_tools().top_level_tools(),
+        CompactionBudgets::from_settings(
+            &state.config().settings.context,
+            state.estimate_correction,
+        )
+        .request,
+        &state.config().settings.prompts.compaction,
     )
     .expect("test compaction projection can be estimated");
     let CompactionProjectionFit::Fitted(projection) = projection else {
@@ -225,50 +250,8 @@ fn restore_rejects_noncanonical_turn_identities() {
     }));
     terminal["last_finished_turn_id"] = json!("");
 
-    let mut queued = restorable_active_tool_checkpoint();
-    queued["turn"]["queued"] = json!({
-        "type": "pending",
-        "turn_id": "",
-        "messages": [{
-            "message": {
-                "role": "user",
-                "content": [{ "type": "text", "text": "queued" }]
-            },
-            "source": "history"
-        }]
-    });
-
-    let mut previous_turn = checkpoint_with_turn(json!({
-        "type": "active",
-        "turn_id": "turn-new",
-        "iterations": 0,
-        "phase": {
-            "type": "awaiting_hook",
-            "pending": {
-                "hook": "pre_agent_turn",
-                "hook_binding_ids": ["binding-1"],
-                "user_content": [{ "type": "text", "text": "start" }],
-                "previous_turn": {
-                    "type": "terminal",
-                    "turn_id": "turn-previous",
-                    "outcome": { "type": "rejected", "reason": "no" }
-                }
-            }
-        },
-        "queued": { "type": "empty" },
-        "pending_steer": [],
-        "model_input_ready": false
-    }));
-    previous_turn["last_finished_turn_id"] = json!("turn-other");
-
-    for (label, value) in [
-        ("empty terminal identity", terminal),
-        ("empty queued identity", queued),
-        ("mismatched previous turn", previous_turn),
-    ] {
-        let checkpoint = decode_checkpoint(&value.to_string()).unwrap();
-        assert!(checkpoint.restore(config()).is_err(), "restored {label}");
-    }
+    let checkpoint = decode_checkpoint(&terminal.to_string()).unwrap();
+    assert!(checkpoint.restore(config()).is_err());
 }
 
 #[test]
@@ -290,19 +273,6 @@ fn restore_rejects_pending_calls_with_invalid_model_arguments() {
 
 #[test]
 fn restore_rejects_noncanonical_control_messages() {
-    let mut queued = restorable_active_tool_checkpoint();
-    queued["turn"]["queued"] = json!({
-        "type": "pending",
-        "turn_id": "turn-queued",
-        "messages": [{
-            "message": {
-                "role": "user",
-                "content": [{ "type": "text", "text": "queued" }]
-            },
-            "source": "injection"
-        }]
-    });
-
     let mut steering = restorable_active_tool_checkpoint();
     steering["turn"]["pending_steer"] = json!([{
         "message": {
@@ -312,11 +282,9 @@ fn restore_rejects_noncanonical_control_messages() {
         "source": "injection"
     }]);
 
-    for (label, value) in [("queued turn", queued), ("pending steering", steering)] {
-        let checkpoint = decode_checkpoint(&value.to_string()).unwrap();
-        let error = checkpoint.restore(config()).unwrap_err();
-        assert!(error.contains("visible user messages"), "{label}: {error}");
-    }
+    let checkpoint = decode_checkpoint(&steering.to_string()).unwrap();
+    let error = checkpoint.restore(config()).unwrap_err();
+    assert!(error.contains("visible user messages"), "{error}");
 }
 
 #[test]

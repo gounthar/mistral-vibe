@@ -1,8 +1,7 @@
-//! The pre-session setup surface (Python `vibe/setup`): the onboarding
+//! The pre-session setup surface: the onboarding
 //! wizard and its auth helpers, the `--setup` exit, and the loop's
 //! missing-key exit handling. Driven by the entrypoint only — the steady
-//! event loop and the app import nothing from here (Python's `textual_ui`
-//! imports nothing from `setup` either). One child per setup round
+//! event loop and the app import nothing from here. One child per setup round
 //! (decision 7): initialized for `setup/*` and reused through
 //! store-credential, submit-choices, and the session (`--setup` and the
 //! probe-negative pre-loop round both boot it behind the wizard's welcome
@@ -29,7 +28,7 @@ use crate::startup::HandshakeParams;
 use crate::terminal::Tui;
 
 /// One wizard round's verdict for its caller, every terminal message
-/// already printed inside (Python `run_onboarding`'s exit match).
+/// already printed inside.
 #[derive(Debug, PartialEq)]
 pub enum SetupVerdict {
     /// The wizard completed; the continue-anyway warnings ride along for
@@ -51,8 +50,7 @@ pub enum SetupRound {
     Exit(std::process::ExitCode),
 }
 
-/// One wizard round's shared half (Python `require_api_key_or_onboard` /
-/// `run_onboarding`): open the wizard, run its flow to the close, and fold
+/// One wizard round's shared half: open the wizard, run its flow to the close, and fold
 /// the close into the verdict. The seed precedes every choice either way —
 /// a pending boot seeds behind the flow's welcome gate, a ready boot seeds
 /// before the open (`--setup` and the probe-negative pre-loop round overlap
@@ -70,8 +68,8 @@ pub(crate) async fn run_setup_round(
     Ok(wizard::actions::onboarding_finished(close))
 }
 
-/// The live verdict's wizard round (Python runs `run_onboarding` from the
-/// entrypoint, never from inside the TUI): a handshake ran and failed
+/// The live verdict's wizard round (run from the entrypoint, never from
+/// inside the TUI): a handshake ran and failed
 /// unauthorized, so stop the child that can never see the persisted key,
 /// spawn a FRESH child and initialize it BEFORE the wizard, run the wizard
 /// talking `setup/*` on that connection, then re-run the handshake on the
@@ -86,7 +84,7 @@ pub async fn onboarding_round(run: EventLoop, provider: Option<String>) -> Resul
     // SIGKILL is all the cleanup it needs.
     run.client.close_stdin().await;
     if let Some(child) = run.child.take() {
-        tokio::spawn(async move {
+        crate::work::spawn_daemon(async move {
             match child.wait_with_grace().await {
                 Some(status) => {
                     tracing::debug!(status = %status, "app-server reaped before onboarding")
@@ -98,14 +96,9 @@ pub async fn onboarding_round(run: EventLoop, provider: Option<String>) -> Resul
     let (client, child, notifications, crash_rx) = match Client::spawn(run.launch.clone()).await {
         Ok(spawned) => spawned,
         Err(error) => {
-            // The Sentry bridge only carries ERROR records, so the startup
-            // window's own failure sites log their own fatal errors.
-            tracing::error!(
-                vibe_boundary = "startup",
-                fatal = true,
-                "respawn app-server: {error:#}"
-            );
-            return Err(error.context("respawn app-server"));
+            let error = error.context("respawn app-server");
+            crate::startup::failure::log_spawn(&error);
+            return Err(error);
         }
     };
     let client = Arc::new(client);
@@ -152,7 +145,7 @@ pub async fn onboarding_round(run: EventLoop, provider: Option<String>) -> Resul
             reap_round_child(&client, child).await;
             Ok(SetupRound::Exit(code))
         }
-        // Python prints the continue-anyway warnings in every mode; the round
+        // The continue-anyway warnings print in every mode; the round
         // owes them on the real terminal before the loop repaints.
         SetupVerdict::Continue { warnings } => {
             if let Some(message) = crate::setup::exit::warnings_message(&warnings) {
@@ -199,6 +192,7 @@ fn adopt_and_retry(
     crash_rx: tokio::sync::watch::Receiver<bool>,
     server_version: String,
 ) {
+    run.app.credential_client = Some(client.clone());
     run.client = client;
     run.child = Some(child);
     run.crash_rx = crash_rx;
@@ -231,7 +225,7 @@ pub fn retry_handshake(
 ) {
     let (trust_tx, trust_rx) = mpsc::channel::<String>(1);
     run.app.trust.tx = Some(trust_tx);
-    tokio::spawn(crate::startup::handshake(
+    crate::work::spawn_daemon(crate::startup::handshake(
         run.client.clone(),
         run.ready_tx.clone(),
         trust_rx,

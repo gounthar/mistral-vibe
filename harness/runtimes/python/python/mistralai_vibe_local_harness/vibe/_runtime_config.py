@@ -7,9 +7,15 @@ from typing import Literal
 
 from mistralai_vibe_local_harness.protocol import (
     RustHarnessConfig,
+    RustMessage,
     RustRuntimeBuiltinToolName,
+    RustToolDefinition,
 )
 from mistralai_vibe_local_harness.session_protocol import PublicRetryCategory
+from mistralai_vibe_local_harness.vibe._completion_budget import (
+    CompletionPricing,
+    SharedCompletionBudget,
+)
 from mistralai_vibe_local_harness.vibe._credentials import (
     ProviderCredentialProvider,
     StaticProviderCredentials,
@@ -20,8 +26,21 @@ from mistralai_vibe_local_harness.vibe._sandbox import (
     SandboxAdapter,
     sandbox_path,
 )
+from mistralai_vibe_local_harness.vibe.completion_profile import (
+    FIRST_OUTPUT_WAIT_SECONDS,
+    REASONING_OFF,
+    REQUIRED_MAX_TOKENS_FALLBACK,
+    STREAM_IDLE_SECONDS,
+    ReasoningSetting,
+    ReasoningSupport,
+    RequestReasoning,
+    StreamGuard,
+    WireFormat,
+    request_reasoning,
+)
 
-type ThinkingLevel = Literal["off", "low", "medium", "high", "max"]
+# Off, a standard level, or a level of the model's own: sent as written.
+type ThinkingLevel = ReasoningSetting
 
 # "classify" defers to the smart-approve risk classifier at dispatch time; the
 # other three are frozen decisions.
@@ -49,12 +68,14 @@ type ProviderRetryObserver = Callable[[ProviderRetry | None], Awaitable[None]]
 class ProviderStreamDelta:
     """One streamed chunk's visible fragments, straight off the provider stream.
 
-    A chunk carries text, reasoning, or both; empty fragments mean the chunk
-    had neither and the observer is not called for it.
+    A chunk carries text, reasoning, part of a tool call, or several of them;
+    the observer is not called for a chunk with none. ``tool_call`` only says
+    that the chunk carries part of one: the call itself arrives in the result.
     """
 
     text: str = ""
     reasoning: str = ""
+    tool_call: bool = False
 
 
 # Per-chunk observer for a provider stream in progress. Emission is
@@ -111,7 +132,8 @@ class RequestSentTelemetry:
     remaining request metrics once per provider call. ``turn_id`` is the turn
     an agent or compaction call serves, which tells a Session's own calls
     from its subagents' when they share one sink; utility completions have
-    none.
+    none. ``reasoning_effort`` is the reasoning setting the request sends, or
+    ``off`` when it sends none.
     """
 
     model: str
@@ -121,6 +143,7 @@ class RequestSentTelemetry:
     nb_context_messages: int
     nb_prompt_chars: int
     turn_id: str | None = None
+    reasoning_effort: ReasoningSetting = REASONING_OFF
 
 
 # Host sink for per-completion request telemetry, called once per LLM call.
@@ -128,19 +151,104 @@ type RequestSentSink = Callable[[RequestSentTelemetry], None]
 
 
 @dataclass(frozen=True, slots=True)
+class ModelRequest:
+    """The model input of one agent completion, reported once the call succeeded.
+
+    ``messages`` and ``tools`` are exactly what the completion sent: the
+    assembled system prompt, the conversation, and the tool catalogue. A Host
+    can measure them to explain what fills the model's context window; as only
+    successful calls are reported, the newest input always pairs with the
+    newest usage reading. They are shared with the Runtime, so a sink must not
+    mutate them.
+    ``turn_id`` is the turn the call serves, which tells a Session's own calls
+    from its subagents' when they share one sink.
+    """
+
+    turn_id: str
+    messages: tuple[RustMessage, ...]
+    tools: tuple[RustToolDefinition, ...]
+
+
+# Host sink for each agent completion's model input, called once per agent call.
+type ModelRequestSink = Callable[[ModelRequest], None]
+
+# The ways a provider response can break the tool call contract Core enforces,
+# each named after the rejection it would cause.
+type MalformedToolCallReason = Literal[
+    "tool_call_finish_without_tool_call",
+    "empty_tool_call_identity",
+    "tool_call_with_non_tool_call_finish",
+]
+
+
+@dataclass(frozen=True, slots=True)
+class MalformedToolCallsTelemetry:
+    """One completion whose provider responses broke the tool call contract.
+
+    Reported once, when the completion ends, and only when the adapters had to
+    repair at least one response. ``reasons`` names each kind of repair made.
+    ``nb_unusable_attempts`` counts the responses whose every tool call lacked a
+    name, which the retry policy retries. ``nb_dropped_tool_calls`` counts the
+    tool calls dropped for lacking a name. ``succeeded`` says whether the
+    completion still produced a result. ``purpose``, ``iteration`` and
+    ``turn_id`` mean what they mean on ``RequestSentTelemetry``.
+    """
+
+    model: str
+    backend: str
+    api_style: str
+    purpose: CompletionPurpose
+    iteration: int
+    reasons: tuple[MalformedToolCallReason, ...]
+    nb_unusable_attempts: int
+    nb_dropped_tool_calls: int
+    succeeded: bool
+    turn_id: str | None = None
+
+
+# Host sink for malformed tool call telemetry, called at most once per LLM call.
+type MalformedToolCallsSink = Callable[[MalformedToolCallsTelemetry], None]
+
+
+@dataclass(frozen=True, slots=True)
 class LocalModelRoute:
     model: str = "mistral-vibe-cli-latest"
     temperature: float = 1.0
     thinking: ThinkingLevel = "off"
-    supports_images: bool = True
     # Nucleus sampling; None leaves it to the provider's default.
     top_p: float | None = None
-    # This model's cap on output tokens per request, used when the adapter
-    # config sets no ``max_tokens`` of its own.
+    # The model's max output, sent as ``max_tokens`` where the format requires one
+    # and the adapter config sets none of its own.
     max_output_tokens: int | None = None
+    # What the model's window leaves for output once a request's input reaches
+    # the compaction threshold; None when unknown.
+    output_room: int | None = None
+    # The model's reasoning levels; None when nobody knows them.
+    reasoning: ReasoningSupport | None = None
+    # One request's own setting, such as the lowest for a summary; None keeps
+    # ``thinking``.
+    request_thinking: RequestReasoning | None = None
+    pricing: CompletionPricing | None = None
+
+    def reasoning_setting(self, wire: WireFormat) -> ReasoningSetting | None:
+        """The setting one request on this route sends; None leaves the field out."""
+        return request_reasoning(
+            wire, self.thinking, self.reasoning, self.request_thinking
+        )
 
 
 _DEFAULT_LOCAL_MODEL_ROUTE = LocalModelRoute()
+
+
+def output_room(context_window: int, compaction_threshold: int) -> int | None:
+    """What a request at the compaction threshold leaves the model for output.
+
+    A server that checks input plus ``max_tokens`` against the window refuses
+    more. A window with no room left at the threshold overflows on input
+    alone, so it bounds nothing and the room is None.
+    """
+    room = context_window - compaction_threshold
+    return room if room > 0 else None
 
 
 @dataclass(frozen=True, slots=True)
@@ -227,6 +335,8 @@ class LocalRuntimeAdapterPorts:
     permission_resolver: PermissionResolver | None
     correlation_id_sink: CorrelationIdSink | None
     request_sent_sink: RequestSentSink | None
+    malformed_tool_calls_sink: MalformedToolCallsSink | None = None
+    model_request_sink: ModelRequestSink | None = None
     sandbox: SandboxAdapter | None = None
     helper_crashes: HelperCrashCount = field(
         default_factory=HelperCrashCount, compare=False
@@ -256,10 +366,13 @@ class LocalRuntimeAdapterConfig:
     # Reasoning effort passed to reasoning-capable providers: "off" or a level.
     thinking: ThinkingLevel = "off"
     active_model: LocalModelRoute = field(default_factory=LocalModelRoute)
-    # Only used to record profile changes in the transcript; None disables it.
+    # The agent configuration this session runs: recorded in the transcript when it
+    # changes, and matched by post_agent hooks. None disables the transcript record.
     active_agent: str | None = None
     compaction_model: LocalModelRoute = field(default_factory=LocalModelRoute)
     title_model: LocalModelRoute | None = None
+    # System prompt of the title completion; None uses the built-in one.
+    title_prompt: str | None = None
     # Optional destination for the title completion when it must run on a
     # different provider than the session's active one (e.g. the fast Mistral
     # model while the session runs on Anthropic). ``None`` keeps the title on the
@@ -271,10 +384,24 @@ class LocalRuntimeAdapterConfig:
     # routes the classify call to Mistral with Mistral credentials. ``None``
     # keeps the classifier on the session provider (already Mistral).
     classifier_provider: LocalProviderRoute | None = None
-    # Model for the classify gate; empty keeps the Runtime default. A name, not a
-    # route: the gate pins its own sampling settings.
+    # Model for the classify gate; empty keeps the Runtime default. The gate pins
+    # its own sampling settings, while pricing follows this selected model.
     classifier_model: str = ""
+    classifier_pricing: CompletionPricing | None = None
+    completion_budget: SharedCompletionBudget | None = None
     max_tokens: int | None = None
+    # Caps sent as ``max_tokens`` on every agent or compaction request whatever
+    # the format; None sends one only where the format requires it.
+    agent_max_tokens: int | None = None
+    compaction_max_tokens: int | None = None
+    # How the Runtime shapes compaction requests. The names match the Vibe
+    # settings. The first, in-context request reuses the conversation's prompt
+    # prefix, tool catalog and reasoning; the standalone fallback always runs
+    # without tools and without reasoning.
+    # Reasoning, in estimated tokens, after which the in-context request is
+    # abandoned so Core falls back to the standalone request. ``None`` lets it
+    # reason up to the output cap.
+    compaction_reasoning_limit_tokens: int | None = 32_000
     # OpenAI-compatible providers expose reasoning under different keys.
     reasoning_field_name: str = "reasoning_content"
     # Some OpenAI-compatible endpoints never emit a finish reason.
@@ -288,15 +415,20 @@ class LocalRuntimeAdapterConfig:
     # Vertex AI routing.
     project_id: str = ""
     region: str = ""
-    timeout_s: float = 60.0
-    # Silence allowed between output items once a response has started
-    # streaming. ``timeout_s`` must also cover the wait for the first token, so
-    # it is too long to notice a provider that stalls mid-response. ``None``
-    # applies no limit: some providers, Mistral included, send a tool call in one
-    # piece once it is fully generated, so a long tool call is a long silence
-    # that no fixed limit can tell apart from a stall.
-    stream_idle_timeout_s: float | None = None
+    # How long a response stream may wait for the model's first output. The
+    # transport read timeout sits above it and above the idle limit.
+    timeout_s: float = FIRST_OUTPUT_WAIT_SECONDS
+    # Silence allowed once the model has produced output. ``None`` gives that
+    # silence the first-output wait instead: some providers, Mistral included,
+    # send a tool call in one piece once it is fully generated, so a long tool
+    # call is a long silence that a short limit cannot tell apart from a stall.
+    stream_idle_timeout_s: float | None = STREAM_IDLE_SECONDS
     retry_max_elapsed_time_s: float = 300.0
+    # Verify provider certificates with the operating system's trust store (the
+    # macOS Keychain, for example) instead of OpenSSL's default roots plus
+    # Certifi. That store also skips the strict chain checks of Python's
+    # default context, which some private CAs fail.
+    enable_system_trust_store: bool = False
     workspace: SessionWorkspace = field(default_factory=SessionWorkspace)
     # The environment of commands run on the host. Commands in a Sandbox
     # Environment run with the sandbox's own environment and never see it.
@@ -315,6 +447,14 @@ class LocalRuntimeAdapterConfig:
     # them all. Per-tool decisions come from ``permission_resolver`` instead, and a
     # Host can override the mode per group via ``configure_provided_tool_executor``.
     provided_tool_mode: ToolApprovalMode = "allow"
+    # Subagent admission limits for the session's controller, resolved into
+    # ``SubagentLimits`` when the subagent configuration is built. ``None``
+    # keeps the Runtime default.
+    subagent_max_children: int | None = None
+    subagent_max_concurrent_turns: int | None = None
+    # Whether the Session API serves this session. Only then does the Runtime
+    # record the Session API facts and save them in the Session file.
+    session_api: bool = False
     # Host-bound per-call permission resolver: refines an ``ask`` call into allow/ask/deny
     # (main's Vibe rules — .env prompt, denylists, allowlist grants), named by a builtin's
     # name or a provided tool's full route. Under smart approve it runs first, and only
@@ -322,6 +462,8 @@ class LocalRuntimeAdapterConfig:
     permission_resolver: PermissionResolver | None = None
     correlation_id_sink: CorrelationIdSink | None = None
     request_sent_sink: RequestSentSink | None = None
+    malformed_tool_calls_sink: MalformedToolCallsSink | None = None
+    model_request_sink: ModelRequestSink | None = None
     skills: Mapping[str, str] = field(default_factory=dict)
     # Where workspace file and shell tools run. None runs them on this host;
     # an adapter runs them in its Sandbox Environment, whose paths ``workspace``
@@ -336,6 +478,22 @@ class LocalRuntimeAdapterConfig:
     )
 
     def __post_init__(self) -> None:
+        for name in ("agent_max_tokens", "compaction_max_tokens"):
+            cap = getattr(self, name)
+            if cap is not None and cap < 1:
+                raise ValueError(f"{name} must be positive")
+        if (
+            self.compaction_reasoning_limit_tokens is not None
+            and self.compaction_reasoning_limit_tokens < 1
+        ):
+            raise ValueError("compaction_reasoning_limit_tokens must be positive")
+        if self.subagent_max_children is not None and self.subagent_max_children < 1:
+            raise ValueError("subagent_max_children must be positive")
+        if (
+            self.subagent_max_concurrent_turns is not None
+            and self.subagent_max_concurrent_turns < 1
+        ):
+            raise ValueError("subagent_max_concurrent_turns must be positive")
         # ``sandbox`` decides where tools run; the workspace and the process
         # tools have to agree with it.
         if self.workspace.path_space != self.path_space:
@@ -412,15 +570,26 @@ class LocalRuntimeAdapterConfig:
             headers["x-affinity"] = affinity_id
         return headers
 
-    def output_token_cap(self, route: LocalModelRoute) -> int | None:
-        """The output-token cap for one request on ``route``.
+    def stream_guard(self) -> StreamGuard:
+        """A guard for one response stream, with this config's limits."""
+        idle_s = self.stream_idle_timeout_s
+        return StreamGuard(self.timeout_s, self.timeout_s if idle_s is None else idle_s)
+
+    def output_token_cap(
+        self, route: LocalModelRoute, *, required: bool = False
+    ) -> int | None:
+        """The ``max_tokens`` one request on ``route`` sends, or None for none.
 
         ``max_tokens`` wins when set, so a caller that pins a short completion
-        (a title, say) keeps its cap whatever the model allows.
+        (a title, say) keeps its cap whatever the model allows. Otherwise only a
+        format that requires the field sends it: the model's max output, else a
+        fixed fallback.
         """
         if self.max_tokens is not None:
             return self.max_tokens
-        return route.max_output_tokens
+        if not required:
+            return None
+        return route.max_output_tokens or REQUIRED_MAX_TOKENS_FALLBACK
 
     def with_workspace(self, workspace: SessionWorkspace) -> LocalRuntimeAdapterConfig:
         """Return this config projected onto the Session's canonical workspace."""
@@ -439,6 +608,8 @@ class LocalRuntimeAdapterConfig:
             permission_resolver=self.permission_resolver,
             correlation_id_sink=self.correlation_id_sink,
             request_sent_sink=self.request_sent_sink,
+            malformed_tool_calls_sink=self.malformed_tool_calls_sink,
+            model_request_sink=self.model_request_sink,
             sandbox=self.sandbox,
             helper_crashes=self.helper_crashes,
         )
@@ -459,6 +630,8 @@ class LocalRuntimeAdapterConfig:
             permission_resolver=ports.permission_resolver,
             correlation_id_sink=ports.correlation_id_sink,
             request_sent_sink=ports.request_sent_sink,
+            malformed_tool_calls_sink=ports.malformed_tool_calls_sink,
+            model_request_sink=ports.model_request_sink,
             sandbox=ports.sandbox,
             helper_crashes=ports.helper_crashes,
         )
@@ -476,8 +649,14 @@ _LOCAL_RUNTIME_ADAPTER_BEHAVIOR_FIELDS = frozenset({
     "active_agent",
     "compaction_model",
     "title_model",
+    "title_prompt",
     "classifier_model",
+    "classifier_pricing",
+    "completion_budget",
     "max_tokens",
+    "agent_max_tokens",
+    "compaction_max_tokens",
+    "compaction_reasoning_limit_tokens",
     "reasoning_field_name",
     "emits_finish_reason",
     "extra_headers",
@@ -486,6 +665,7 @@ _LOCAL_RUNTIME_ADAPTER_BEHAVIOR_FIELDS = frozenset({
     "timeout_s",
     "stream_idle_timeout_s",
     "retry_max_elapsed_time_s",
+    "enable_system_trust_store",
     "env",
     "command_environment",
     "shell",
@@ -493,6 +673,9 @@ _LOCAL_RUNTIME_ADAPTER_BEHAVIOR_FIELDS = frozenset({
     "bypass_approval",
     "tool_modes",
     "provided_tool_mode",
+    "subagent_max_children",
+    "subagent_max_concurrent_turns",
+    "session_api",
     "skills",
 })
 
@@ -530,6 +713,11 @@ __all__ = [
     "LocalProviderRoute",
     "LocalRuntimeAdapterConfig",
     "LocalRuntimeAdapterPorts",
+    "MalformedToolCallReason",
+    "MalformedToolCallsSink",
+    "MalformedToolCallsTelemetry",
+    "ModelRequest",
+    "ModelRequestSink",
     "ProcessAuthority",
     "ProviderDeltaObserver",
     "ProviderStreamDelta",

@@ -10,7 +10,7 @@ from e2e.app_server.events import (
     turn_started,
     user_msg,
 )
-from e2e.app_server.scenario import Timeline
+from e2e.app_server.scenario import Timeline, take_snapshot
 
 handshake = {
     "config/read": {"config": {"showThinkingNodes": True}},
@@ -25,9 +25,9 @@ _THOUGHT = (
     "Short second line."
 )
 
-# The folded group header lands on SGR row 15, then its `⏵ Thought` row on 16.
-_CLICK_GROUP = "\x1b[<0;1;15M\x1b[<0;1;15m"
-_CLICK_THOUGHT = "\x1b[<0;5;16M\x1b[<0;5;16m"
+# The folded group header lands on SGR row 11, then its `⏵ Thought` row on 12.
+_CLICK_GROUP = "\x1b[<0;1;11M\x1b[<0;1;11m"
+_CLICK_THOUGHT = "\x1b[<0;5;12M\x1b[<0;5;12m"
 
 timeline: Timeline = [
     f"{_PROMPT}\r",
@@ -39,4 +39,5 @@ timeline: Timeline = [
     turn_completed(),
     _CLICK_GROUP,
     _CLICK_THOUGHT,
+    take_snapshot(),
 ]

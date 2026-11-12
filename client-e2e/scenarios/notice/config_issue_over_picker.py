@@ -1,4 +1,4 @@
-"""A startup config-issue toast stays visible over a modal picker (VIBE-4622)."""
+"""A startup config issue stays in the transcript above a modal picker (VIBE-4099)."""
 
 from __future__ import annotations
 
@@ -15,13 +15,7 @@ handshake = {
     }
 }
 
-# Python surfaces config issues through Textual `App.notify`, whose toast mounts
-# on a later frame and is not deterministically captured; Rust draws it inline.
-skip_terminal_parity = (
-    "python's Textual notify toast mounts async; rust draws it inline"
-)
-
-# Open the `/theme` picker; the startup toast (10s) must still float over it.
+# Open the `/theme` picker; the warnings box stays in the transcript above it.
 timeline: Timeline = ["/theme", "\r"]
 
-screen_contains = {"rust": ("Failed to parse: bad toml",)}
+screen_contains = ("Failed to parse: bad toml",)

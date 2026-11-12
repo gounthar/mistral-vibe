@@ -9,7 +9,7 @@ from e2e.app_server.events import (
     turn_started,
     user_msg,
 )
-from e2e.app_server.scenario import Timeline
+from e2e.app_server.scenario import Timeline, take_snapshot
 
 _PROMPT = "use /lint and /code-review please"
 _MESSAGE_ID = "user-skill-mentions"
@@ -49,17 +49,15 @@ handshake = {
     },
 }
 
-screen_contains = {
-    "rust": (
-        _PROMPT,
-        "Loaded 2 skills",
-        "Loaded skill: lint",
-        "Loaded skill: code-review",
-        "Lint first.",
-        "Review twice.",
-        "Both applied.",
-    )
-}
+screen_contains = (
+    _PROMPT,
+    "Loaded 2 skills",
+    "Loaded skill: lint",
+    "Loaded skill: code-review",
+    "Lint first.",
+    "Review twice.",
+    "Both applied.",
+)
 
 timeline: Timeline = [
     f"{_PROMPT}\r",
@@ -74,4 +72,5 @@ timeline: Timeline = [
     assistant_msg("Both applied."),
     turn_completed(),
     "\x0f",
+    take_snapshot(),
 ]

@@ -1,27 +1,29 @@
-//! Edit-effect diff rows, mirroring the Textual `diff_rendering` widget.
+//! Edit-effect diff rows.
 
 mod line_numbers;
+mod sides;
 mod wrap;
 
 use line_numbers::next_line_number;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::Span;
+use sides::Sides;
 use unicode_width::UnicodeWidthStr;
 pub use wrap::{banded, wrap_row};
 
-use super::super::{highlight, theme};
+use super::super::theme;
 use super::difflib;
 
-/// Python `_BAND_ALPHA_DARK` / `_BAND_ALPHA_LIGHT`: the row tint over the backdrop.
+/// The row tint over the backdrop, per theme brightness.
 const BAND_ALPHA_DARK: f32 = 0.10;
 const BAND_ALPHA_LIGHT: f32 = 0.20;
-/// Context lines kept around each change (Python's `unified_diff(..., n=2)`).
+/// Context lines kept around each change.
 const CONTEXT_LINES: usize = 2;
 /// Minimum line-number width and fixed sign width in the diff gutter.
 const MIN_LINENO_WIDTH: u16 = 5;
 const SIGN_WIDTH: u16 = 2;
 
-/// Python `DiffOccurrence`: one match, expanded to whole lines, anchored at `start_line`.
+/// One match, expanded to whole lines, anchored at `start_line`.
 pub struct DiffOccurrence {
     pub start_line: Option<u32>,
     pub old_lines: String,
@@ -36,7 +38,7 @@ pub struct DiffRow {
     pub spans: Vec<Span<'static>>,
 }
 
-/// Python `EditResultWidget._occurrences`: the reported occurrences, else the bare strings.
+/// The reported occurrences, else the bare strings.
 pub fn occurrences(output: &crate::server::FileEditEffectOutput) -> Vec<DiffOccurrence> {
     if output.occurrences.is_empty() {
         return vec![DiffOccurrence {
@@ -56,7 +58,7 @@ pub fn occurrences(output: &crate::server::FileEditEffectOutput) -> Vec<DiffOccu
         .collect()
 }
 
-/// Python `DiffView._gutter_width`: the widest row gutter, uniform per view.
+/// The widest row gutter, uniform per view.
 /// It is chrome, so selection and copy start after it.
 pub fn gutter_width(occurrences: &[DiffOccurrence]) -> u16 {
     let line_number_width = occurrences
@@ -74,12 +76,12 @@ pub fn gutter_width(occurrences: &[DiffOccurrence]) -> u16 {
     SIGN_WIDTH + line_number_width
 }
 
-/// Python `language_for_path`: the bare file extension, else no language.
+/// The bare file extension, else no language.
 pub fn language(file: &str) -> &str {
     file.rsplit_once('.').map(|(_, ext)| ext).unwrap_or("")
 }
 
-/// Python `render_edit_diff`: every occurrence's hunks, separated by gap rows.
+/// Every occurrence's hunks, separated by gap rows.
 pub fn render_edit_diff(occurrences: &[DiffOccurrence], lang: &str) -> Vec<DiffRow> {
     let gutter_width = gutter_width(occurrences);
     let mut rows = Vec::new();
@@ -91,6 +93,7 @@ pub fn render_edit_diff(occurrences: &[DiffOccurrence], lang: &str) -> Vec<DiffR
         // a real empty line anchored at `start_line`.
         let old = split_lines(&occurrence.old_lines);
         let new = split_lines(&occurrence.new_lines);
+        let sides = Sides::new(&old, &new, lang);
         let offset = occurrence.start_line.unwrap_or(1).saturating_sub(1) as usize;
         for (index, hunk) in difflib::unified_diff(&old, &new, CONTEXT_LINES)
             .iter()
@@ -105,7 +108,7 @@ pub fn render_edit_diff(occurrences: &[DiffOccurrence], lang: &str) -> Vec<DiffR
                 hunk,
                 occurrence.start_line.map(|_| offset),
                 gutter_width,
-                lang,
+                &sides,
             ));
         }
     }
@@ -121,25 +124,37 @@ fn render_hunk(
     hunk: &difflib::Hunk,
     offset: Option<usize>,
     gutter_width: u16,
-    lang: &str,
+    sides: &Sides,
 ) -> Vec<DiffRow> {
     let mut old_lineno = hunk.old_start;
     let mut new_lineno = hunk.new_start;
     let mut rows = Vec::new();
     for (prefix, code) in &hunk.rows {
+        let side_lineno = if *prefix == '-' {
+            old_lineno
+        } else {
+            new_lineno
+        };
         let lineno = next_line_number(*prefix, &mut old_lineno, &mut new_lineno);
+        let spans = sides.line(*prefix, side_lineno);
         rows.push(row(
             *prefix,
             offset.map(|offset| lineno + offset),
             gutter_width,
             code,
-            lang,
+            spans,
         ));
     }
     rows
 }
 
-fn row(prefix: char, lineno: Option<usize>, gutter_width: u16, code: &str, lang: &str) -> DiffRow {
+fn row(
+    prefix: char,
+    lineno: Option<usize>,
+    gutter_width: u16,
+    code: &str,
+    spans_hint: Option<Vec<Span<'static>>>,
+) -> DiffRow {
     let band = band(prefix);
     let background = band.unwrap_or_else(theme::background);
     let (sign_style, lineno_style) = gutter_styles(prefix, background);
@@ -156,7 +171,7 @@ fn row(prefix: char, lineno: Option<usize>, gutter_width: u16, code: &str, lang:
         ));
     }
     spans.push(Span::styled(format!("{prefix} "), sign_style));
-    spans.extend(body(code, prefix, lang));
+    spans.extend(body(code, prefix, spans_hint));
     DiffRow {
         border: border_style(prefix),
         band,
@@ -170,7 +185,7 @@ fn formatted_line_number(lineno: usize, width: u16) -> String {
     format!("{lineno:>width$} ")
 }
 
-/// Python `_gap_line`: the ellipsis separator between hunks and occurrences.
+/// The ellipsis separator between hunks and occurrences.
 fn gap_row() -> DiffRow {
     let style = if theme::is_ansi() {
         theme::muted_style()
@@ -185,8 +200,8 @@ fn gap_row() -> DiffRow {
     }
 }
 
-/// Python `_BAND_TINT_BY_CLASS`: added/removed rows tint the whole row width.
-/// ANSI themes leave the background untouched (the old `&:ansi` rule).
+/// Added/removed rows tint the whole row width.
+/// ANSI themes leave the background untouched.
 fn band(prefix: char) -> Option<Color> {
     if theme::is_ansi() {
         return None;
@@ -204,7 +219,7 @@ fn band(prefix: char) -> Option<Color> {
     Some(theme::blend(theme::background(), tint, alpha))
 }
 
-/// Python `DIFF_BORDER_COLOR_BY_CLASS`: the expanding border tracks each row's class.
+/// The expanding border tracks each row's class.
 fn border_style(prefix: char) -> Style {
     match prefix {
         '+' => theme::text(theme::status_ready()),
@@ -213,7 +228,7 @@ fn border_style(prefix: char) -> Style {
     }
 }
 
-/// Python `_gutter_styles`, resolved against the row's own background.
+/// Gutter styles, resolved against the row's own background.
 fn gutter_styles(prefix: char, background: Color) -> (Style, Style) {
     let muted = dim_muted(background);
     match (prefix, theme::is_ansi()) {
@@ -241,11 +256,10 @@ fn dim_muted(background: Color) -> Style {
     }
 }
 
-/// Python `_build_diff_body`: the code, highlighted a line at a time (so no
-/// parser state crosses rows, as in Textual), dimmed on removed ANSI rows.
-fn body(code: &str, prefix: char, lang: &str) -> Vec<Span<'static>> {
+/// The row's code, from its side's whole-text highlight, dimmed on removed ANSI rows.
+fn body(code: &str, prefix: char, highlighted: Option<Vec<Span<'static>>>) -> Vec<Span<'static>> {
     // A tab occupies no cell, so it would leave the row's band and the cells it
-    // covers unpainted; Textual renders it as one space.
+    // covers unpainted; render it as one space.
     let code = &code.replace('\t', " ");
     let dim = prefix == '-' && theme::is_ansi();
     let plain = || {
@@ -259,10 +273,7 @@ fn body(code: &str, prefix: char, lang: &str) -> Vec<Span<'static>> {
             },
         )]
     };
-    let Some(rows) = highlight::code(code, lang) else {
-        return plain();
-    };
-    let Some(spans) = rows.into_iter().next() else {
+    let Some(spans) = highlighted else {
         return plain();
     };
     spans

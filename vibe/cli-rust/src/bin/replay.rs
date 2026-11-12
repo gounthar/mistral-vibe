@@ -10,6 +10,9 @@ use std::thread;
 
 use serde_json::{json, Map, Value};
 
+#[path = "replay/jitter.rs"]
+mod jitter;
+
 const TURN_ENQUEUE: &str = "session/turn/enqueue";
 const TURN_START: &str = "turn/start";
 const TURN_QUEUE_REPLACE: &str = "session/turn/queue/replace";
@@ -27,16 +30,38 @@ const REQUEST_LOG_ENV: &str = "VIBE_REPLAY_REQUEST_LOG";
 /// One released batch: the client message id, optional queue id, and its events.
 type Batch = (Option<String>, Option<String>, Vec<Value>);
 
-/// Methods answered with another method's canned result (reconnect reuses start).
+/// The stdout writer queue; `None` flushes and ends it so a stop never drops frames.
+type Writer = Sender<Option<String>>;
+
+/// Emitter work, in wire order: a released batch, or the drain sentinel of a request id.
+enum Emit {
+    Batch(Batch),
+    Drained(Value),
+}
+
+/// Tells the client a request's response and every event it released are written.
+fn drained_frame(request_id: &Value) -> Value {
+    json!({"jsonrpc": "2.0", "method": "replay/drained", "params": {"requestId": request_id}})
+}
+
+/// A harness fence: the client acks it once the gated event before it has settled.
+fn fence_frame() -> Value {
+    json!({"jsonrpc": "2.0", "method": "replay/fence", "params": {}})
+}
+
+/// Methods answered with another method's canned result: resume reuses start, continue the saved session.
 fn resolve_response(handshake: &mut Map<String, Value>, method: &str) -> Option<Value> {
     if let Some(entry) = handshake.get_mut(method) {
         return canned(entry);
     }
-    let alias = match method {
-        "session/resume" | "session/continue" => "session/start",
+    let aliases: &[&str] = match method {
+        "session/resume" => &["session/start"],
+        "session/continue" => &["session/resume", "session/start"],
         _ => return None,
     };
-    handshake.get_mut(alias).and_then(canned)
+    aliases
+        .iter()
+        .find_map(|alias| handshake.get_mut(*alias).and_then(canned))
 }
 
 /// A list entry answers its requests in order, repeating the last one; a
@@ -55,9 +80,13 @@ fn canned(entry: &mut Value) -> Option<Value> {
     Some(entry.clone())
 }
 
-/// Check if the handshake declares an error response for a method.
-fn resolve_error<'a>(handshake: &'a Map<String, Value>, method: &str) -> Option<&'a Value> {
-    let entry = handshake.get(method)?;
+/// Check if the handshake declares an error response for a method, per session first.
+fn resolve_error<'a>(
+    handshake: &'a Map<String, Value>,
+    method: &str,
+    params: Option<&Value>,
+) -> Option<&'a Value> {
+    let entry = session_scoped_response(handshake, method, params).or(handshake.get(method))?;
     entry.get("error")
 }
 
@@ -149,8 +178,12 @@ fn agent_update_response(handshake: &Map<String, Value>, params: Option<&Value>)
     Some(json!({ "runtime": runtime }))
 }
 
-/// Rewrite the first user message entry's id to the turn's client id.
-fn stamp_user_message_id(batch: &mut [Value], client_message_id: &str) {
+/// Rewrite the first user message entry's id to the turn's client id, remembering the rename.
+fn stamp_user_message_id(
+    batch: &mut [Value],
+    client_message_id: &str,
+    renamed: &mut HashMap<String, String>,
+) {
     for event in batch.iter_mut() {
         if event.get("method").and_then(Value::as_str) != Some("history/entryAdded") {
             continue;
@@ -161,22 +194,41 @@ fn stamp_user_message_id(batch: &mut [Value], client_message_id: &str) {
         let is_user = entry.get("type").and_then(Value::as_str) == Some("message")
             && entry.get("role").and_then(Value::as_str) == Some("user");
         if is_user {
+            if let Some(scripted) = entry.get("id").and_then(Value::as_str) {
+                renamed.insert(scripted.to_owned(), client_message_id.to_owned());
+            }
             entry["id"] = json!(client_message_id);
             return;
         }
     }
 }
 
-/// Bind `$operationId` placeholders (shell entry ids, teleport events) to the request's id.
+/// Give snapshot history the client ids the live user messages were renamed to.
+fn stamp_snapshot_ids(batch: &mut [Value], renamed: &HashMap<String, String>) {
+    for event in batch.iter_mut() {
+        let Some(history) = event
+            .pointer_mut("/params/state/history")
+            .and_then(Value::as_array_mut)
+        else {
+            continue;
+        };
+        for entry in history.iter_mut() {
+            let client_id = entry["id"].as_str().and_then(|id| renamed.get(id));
+            if let Some(client_id) = client_id {
+                entry["id"] = json!(client_id);
+            }
+        }
+    }
+}
+
+/// Bind `$operationId` shell entry id placeholders to the request's id.
 fn stamp_operation_id(events: &mut [Value], operation_id: &str) {
     for event in events {
-        for pointer in ["/params/entry/id", "/params/event/operationId"] {
-            if let Some(slot) = event
-                .pointer_mut(pointer)
-                .filter(|slot| slot.as_str() == Some("$operationId"))
-            {
-                *slot = json!(operation_id);
-            }
+        if let Some(slot) = event
+            .pointer_mut("/params/entry/id")
+            .filter(|slot| slot.as_str() == Some("$operationId"))
+        {
+            *slot = json!(operation_id);
         }
     }
 }
@@ -240,9 +292,9 @@ fn set_field(handshake: &mut Map<String, Value>, method: &str, field: &str, valu
 }
 
 /// Serialize and enqueue a frame for the single stdout writer.
-fn send(writer: &Sender<String>, frame: Value) {
+fn send(writer: &Writer, frame: Value) {
     if let Ok(line) = serde_json::to_string(&frame) {
-        let _ = writer.send(line);
+        let _ = writer.send(Some(line));
     }
 }
 
@@ -283,7 +335,7 @@ fn stamp_queue_item_id(batch: &mut [Value], queue_item_id: &str) {
 }
 
 /// Send one event, numbering it from the shared eventId counter.
-fn send_event(writer: &Sender<String>, event_id: &AtomicU64, event: &Value) {
+fn send_event(writer: &Writer, event_id: &AtomicU64, event: &Value) {
     let method = event.get("method").cloned().unwrap_or(Value::Null);
     let mut params = event
         .get("params")
@@ -308,23 +360,31 @@ fn send_event(writer: &Sender<String>, event_id: &AtomicU64, event: &Value) {
 }
 
 /// Drain released batches, stamping a monotonic eventId across all of them.
-fn run_emitter(
-    rx: std::sync::mpsc::Receiver<Batch>,
-    writer: Sender<String>,
-    event_id: Arc<AtomicU64>,
-) {
+fn run_emitter(rx: std::sync::mpsc::Receiver<Emit>, writer: Writer, event_id: Arc<AtomicU64>) {
     let mut step = std::env::var_os(STEP_FIFO_ENV)
         .and_then(|path| OpenOptions::new().read(true).write(true).open(path).ok());
-    while let Ok((client_message_id, queue_item_id, mut batch)) = rx.recv() {
+    let mut renamed = HashMap::new();
+    while let Ok(emit) = rx.recv() {
+        let (client_message_id, queue_item_id, mut batch) = match emit {
+            Emit::Batch(batch) => batch,
+            Emit::Drained(request_id) => {
+                send(&writer, drained_frame(&request_id));
+                continue;
+            }
+        };
         if let Some(id) = client_message_id.as_deref() {
-            stamp_user_message_id(&mut batch, id);
+            stamp_user_message_id(&mut batch, id, &mut renamed);
         }
+        stamp_snapshot_ids(&mut batch, &renamed);
         if let Some(id) = queue_item_id.as_deref() {
             stamp_queue_item_id(&mut batch, id);
         }
         for event in batch {
             await_step(&mut step);
             send_event(&writer, &event_id, &event);
+            if step.is_some() {
+                send(&writer, fence_frame());
+            }
         }
     }
 }
@@ -402,11 +462,15 @@ fn main() {
     // Shared with the emitter thread so both number their events in one sequence.
     let event_id = Arc::new(AtomicU64::new(1));
 
-    let (writer_tx, writer_rx) = channel::<String>();
-    thread::spawn(move || {
+    let (writer_tx, writer_rx) = channel::<Option<String>>();
+    let writer = thread::spawn(move || {
         let stdout = std::io::stdout();
         let mut out = stdout.lock();
-        while let Ok(line) = writer_rx.recv() {
+        let mut jitter = jitter::Jitter::from_env();
+        while let Ok(Some(line)) = writer_rx.recv() {
+            if let Some(jitter) = jitter.as_mut() {
+                jitter.delay();
+            }
             if out.write_all(line.as_bytes()).is_err() || out.write_all(b"\n").is_err() {
                 break;
             }
@@ -414,10 +478,19 @@ fn main() {
         }
     });
 
-    let (emitter_tx, emitter_rx) = channel::<Batch>();
+    let (emitter_tx, emitter_rx) = channel::<Emit>();
     let emitter_writer = writer_tx.clone();
     let emitter_event_id = event_id.clone();
     thread::spawn(move || run_emitter(emitter_rx, emitter_writer, emitter_event_id));
+    // Gated batches wait on the capture, so their drain sentinel cannot queue behind them.
+    let gated = std::env::var_os(STEP_FIFO_ENV).is_some();
+    let drained = |request_id: &Value| {
+        if gated {
+            send(&writer_tx, drained_frame(request_id));
+        } else {
+            let _ = emitter_tx.send(Emit::Drained(request_id.clone()));
+        }
+    };
 
     let mut next_batch = 0usize;
     let mut enqueues = 0usize;
@@ -451,6 +524,7 @@ fn main() {
                     },
                 }),
             );
+            drained(id);
             continue;
         }
         // Every accepted prompt gets its own queue id, like the real server; the
@@ -511,11 +585,12 @@ fn main() {
             clear_missing_key_errors(&mut handshake);
         }
         // Check for a canned error response (e.g. unauthorized on session/start).
-        if let Some(err) = resolve_error(&handshake, method) {
+        if let Some(err) = resolve_error(&handshake, method, msg.get("params")) {
             send(
                 &writer_tx,
                 json!({"jsonrpc": "2.0", "id": id, "error": err}),
             );
+            drained(id);
             continue;
         }
         match response {
@@ -555,6 +630,7 @@ fn main() {
         // the stop: the client asks its exit questions with the server still
         // up, and stdin EOF (its close) ends this loop instead.
         if method == SESSION_STOP && !handshake.contains_key(WORKTREE_REMOVE) {
+            drained(id);
             break;
         }
         // Shell streaming events precede its response; other request events follow it.
@@ -571,9 +647,13 @@ fn main() {
                     .and_then(Value::as_str)
                     .map(str::to_owned);
                 let batch = batches[next_batch].clone();
-                let _ = emitter_tx.send((client_message_id, Some(queue_item_id), batch));
+                let _ =
+                    emitter_tx.send(Emit::Batch((client_message_id, Some(queue_item_id), batch)));
                 next_batch += 1;
             }
         }
+        drained(id);
     }
+    let _ = writer_tx.send(None);
+    let _ = writer.join();
 }

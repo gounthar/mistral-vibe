@@ -1,8 +1,10 @@
-//! `--continue`/`--resume` CLI intent resolution, mirroring the Python
-//! `_session_intent` (entrypoint.py).
+//! `--continue`/`--resume` CLI intent resolution.
 
 use clap::Parser;
+use serde_json::json;
 use vibe_rs::cli::{Cli, StartupResume};
+use vibe_rs::server::{AgentConfig, RequestFailure, RpcError, WorktreeInput, HISTORY_LIMIT};
+use vibe_rs::startup::{continue_params, nothing_to_continue, resume_params, start_kind};
 
 #[test]
 fn no_flags_is_no_intent() {
@@ -34,40 +36,61 @@ fn resume_without_id_is_picker_intent() {
     assert_eq!(cli.startup_resume(), StartupResume::Picker);
 }
 
+/// Only a session a resume replaces at once starts as a warm-up; the picker's is the user's own.
 #[test]
-fn continue_and_resume_are_mutually_exclusive() {
-    let result = Cli::try_parse_from(["vibe-rs", "--continue", "--resume", "id"]);
-    assert!(result.is_err(), "--continue and --resume must conflict");
+fn only_a_resume_or_continue_starts_a_warm_up_session() {
+    assert_eq!(
+        start_kind(&StartupResume::ById("abc".into())),
+        Some("ephemeral")
+    );
+    assert_eq!(start_kind(&StartupResume::Continue), Some("ephemeral"));
+    assert_eq!(start_kind(&StartupResume::Picker), None);
+    assert_eq!(start_kind(&StartupResume::None), None);
 }
 
+fn terminal_config() -> AgentConfig {
+    AgentConfig {
+        cwd: Some("/work".into()),
+        terminal_key: Some("/dev/ttys003".into()),
+        worktree: Some(WorktreeInput::Auto { prompt: None }),
+        ..Default::default()
+    }
+}
+
+/// The server picks the session, so continue names none and sends the terminal.
 #[test]
-fn resume_id_and_resume_picker_are_distinct() {
-    assert_ne!(
-        Cli::parse_from(["vibe-rs", "--resume", "id"]).startup_resume(),
-        Cli::parse_from(["vibe-rs", "--resume"]).startup_resume(),
+fn continue_sends_the_terminal_without_a_session_or_worktree() {
+    assert_eq!(
+        continue_params(&terminal_config()),
+        json!({
+            "agentConfig": {"cwd": "/work", "terminalKey": "/dev/ttys003"},
+            "historyLimit": HISTORY_LIMIT,
+        })
     );
 }
 
 #[test]
-fn no_intent_keeps_the_started_session() {
-    assert_eq!(StartupResume::None.target(None), None);
+fn resume_sends_the_terminal_without_a_worktree() {
+    let params = resume_params("abc", &terminal_config());
+    assert_eq!(params["sessionId"], "abc");
+    assert_eq!(
+        params["agentConfig"],
+        json!({"cwd": "/work", "terminalKey": "/dev/ttys003"})
+    );
 }
 
-/// The picker attaches the fresh session; Esc has to land somewhere.
-#[test]
-fn the_picker_keeps_the_started_session() {
-    assert_eq!(StartupResume::Picker.target(Some("latest".into())), None);
+fn not_found(data: Option<serde_json::Value>) -> anyhow::Error {
+    anyhow::Error::new(RequestFailure::Rpc(RpcError {
+        code: json!("not_found"),
+        message: "nope".into(),
+        data,
+    }))
 }
 
+/// Only the server's "nothing to continue" starts fresh; other misses, like disabled logging, say why.
 #[test]
-fn resume_by_id_attaches_that_session() {
-    let id = StartupResume::ById("abc".into());
-    assert_eq!(id.target(Some("latest".into())), Some("abc".into()));
-}
-
-#[test]
-fn continue_attaches_the_session_the_list_resolved() {
-    let resolved = StartupResume::Continue.target(Some("latest".into()));
-    assert_eq!(resolved, Some("latest".into()));
-    assert_eq!(StartupResume::Continue.target(None), None);
+fn only_nothing_to_continue_counts_as_no_previous_session() {
+    let nothing = not_found(Some(json!({"harnessCode": "nothing_to_continue"})));
+    assert!(nothing_to_continue(&nothing));
+    assert!(!nothing_to_continue(&not_found(None)));
 }

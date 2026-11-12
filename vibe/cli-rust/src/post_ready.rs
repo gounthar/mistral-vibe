@@ -1,5 +1,4 @@
-//! Post-ready startup work: the account plan and the greeting (Python
-//! `_complete_post_ready_startup`).
+//! Post-ready startup work: the account plan and the greeting.
 
 use std::sync::Arc;
 
@@ -35,7 +34,7 @@ fn field(response: Value, key: &str) -> Value {
     response.get(key).cloned().unwrap_or(Value::Null)
 }
 
-/// The plan label the banner appends to its version line.
+/// The plan label the banner appends to its model line.
 pub fn plan_title(account: &Value) -> Option<String> {
     account
         .pointer("/plan/title")
@@ -51,9 +50,10 @@ pub fn fetch(app: &mut App, client: &Arc<Client>, show_greeting: bool) {
     else {
         return;
     };
-    app.commit_started();
+    let model = crate::usage_gauge::account_model(app).to_owned();
+    app.whoami.ask(model.clone());
     let client = client.clone();
-    tokio::spawn(async move {
+    crate::work::spawn(async move {
         let reads = read(&client, &session_id).await;
         let greeting = reads
             .as_ref()
@@ -63,11 +63,15 @@ pub fn fetch(app: &mut App, client: &Arc<Client>, show_greeting: bool) {
         if greeting.is_some() {
             greeting_cache::mark_shown();
         }
-        let _ = tx.try_send(CommandEvent::PostReady { reads, greeting });
+        let _ = tx.try_send(CommandEvent::PostReady {
+            model,
+            reads,
+            greeting,
+        });
     });
 }
 
-/// Python `GreetingMessage`, shown only when identity exposes a first name.
+/// The greeting, shown only when identity exposes a first name.
 fn greeting(identity: &Value) -> Option<String> {
     let username = identity
         .get("firstName")

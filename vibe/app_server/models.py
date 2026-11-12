@@ -28,6 +28,7 @@ from vibe.app_server._effect_models import (
     FileWriteEffectInput as FileWriteEffectInput,
     FileWriteEffectOutput as FileWriteEffectOutput,
     GenericEffectDetail as GenericEffectDetail,
+    McpAppReference as McpAppReference,
     ProcessEffectDetail as ProcessEffectDetail,
     ScratchpadEffectDetail as ScratchpadEffectDetail,
     ScratchpadEffectInput as ScratchpadEffectInput,
@@ -116,14 +117,22 @@ class AccountApiKeyView(ProtocolModel):
     access_scope: str | None = None
 
 
+class AccountBudgetView(ProtocolModel):
+    """The monthly Vibe Code allowance, from ``/v1/billing/budget``."""
+
+    usage_percentage: float
+    reset_at: str | None = None
+    # Usage past 100% is billed instead of paused.
+    payg_enabled: bool = False
+
+
 class AccountView(ProtocolModel):
     status: AccountStatus
     plan: AccountPlanView | None = None
     plan_offer: AccountAction | None = None
     rate_limit_action: AccountAction | None = None
-    teleport_eligible: bool = False
-    teleport_action: AccountAction | None = None
     api_key: AccountApiKeyView | None = None
+    budget: AccountBudgetView | None = None
 
 
 class IdentityEntityView(ProtocolModel):
@@ -422,6 +431,8 @@ class TurnErrorCode(StrEnum):
     INVALID_MODEL = auto()
     INVALID_API_KEY = auto()
     INTERNAL_ERROR = auto()
+    # A price budget is set, but a model the run uses has no price.
+    PRICING_UNAVAILABLE = auto()
 
 
 class PublicError(ProtocolModel):
@@ -434,6 +445,8 @@ class TokenUsage(ProtocolModel):
     input_tokens: int = 0
     output_tokens: int = 0
     total_tokens: int = 0
+    # The part of ``input_tokens`` the provider served from its prompt cache.
+    cached_input_tokens: int = 0
 
 
 class AgentStatsSnapshot(ProtocolModel):
@@ -484,6 +497,7 @@ class AgentStatsSnapshot(ProtocolModel):
             input_tokens=self.session_prompt_tokens,
             output_tokens=self.session_completion_tokens,
             total_tokens=self.session_total_llm_tokens,
+            cached_input_tokens=self.session_cached_tokens,
         )
 
 
@@ -506,112 +520,6 @@ class DebugLogPage(ProtocolModel):
     entries: list[DebugLogEntry]
     has_more: bool
     cursor: int | None = None
-
-
-class VibeCodeRepository(ProtocolModel):
-    repo_url: str
-    default_branch: str | None = None
-
-
-class VibeCodeProject(ProtocolModel):
-    project_id: str
-    name: str
-    repositories: list[VibeCodeRepository] = Field(default_factory=list)
-    is_read_only: bool = False
-
-
-class RemoteProjectLink(ProtocolModel):
-    repo_root: str
-    repo_url: str
-    project_id: str
-    project_name: str
-
-
-class VibeCodePickerContext(ProtocolModel):
-    repo_root: str
-    repo_url: str
-    repo_name: str
-    saved_link: RemoteProjectLink | None = None
-
-
-class VibeCodeGitInfo(ProtocolModel):
-    remote_name: str
-    remote_url: str
-    repo: str
-    branch: str | None = None
-    default_branch: str | None = None
-
-
-class VibeCodePickerState(ProtocolModel):
-    projects: list[VibeCodeProject]
-    next_cursor: str | None = None
-    repo_url: str = ""
-
-    @property
-    def has_more(self) -> bool:
-        return self.next_cursor is not None
-
-
-class VibeCodePickerView(ProtocolModel):
-    context: VibeCodePickerContext
-    state: VibeCodePickerState
-    git: VibeCodeGitInfo
-    saved_project_link_cleared: bool = False
-    project_repo_remote_changed: bool = False
-
-
-type VibeCodePickerPurpose = Literal["configure", "teleport"]
-
-
-class TeleportSummarizingContext(ProtocolModel):
-    kind: Literal["summarizing_context"] = "summarizing_context"
-    operation_id: str
-
-
-class TeleportCheckingGit(ProtocolModel):
-    kind: Literal["checking_git"] = "checking_git"
-    operation_id: str
-
-
-class TeleportPushRequired(ProtocolModel):
-    kind: Literal["push_required"] = "push_required"
-    operation_id: str
-    unpushed_count: int
-    branch_not_pushed: bool = False
-
-
-class TeleportPushing(ProtocolModel):
-    kind: Literal["pushing"] = "pushing"
-    operation_id: str
-
-
-class TeleportStartingWorkflow(ProtocolModel):
-    kind: Literal["starting_workflow"] = "starting_workflow"
-    operation_id: str
-
-
-class TeleportComplete(ProtocolModel):
-    kind: Literal["complete"] = "complete"
-    operation_id: str
-    url: str
-
-
-class TeleportFailed(ProtocolModel):
-    kind: Literal["failed"] = "failed"
-    operation_id: str
-    error: PublicError
-
-
-type TeleportEvent = Annotated[
-    TeleportSummarizingContext
-    | TeleportCheckingGit
-    | TeleportPushRequired
-    | TeleportPushing
-    | TeleportStartingWorkflow
-    | TeleportComplete
-    | TeleportFailed,
-    Field(discriminator="kind"),
-]
 
 
 class AgentSummary(ProtocolModel):
@@ -638,6 +546,7 @@ class SkillSummary(ProtocolModel):
     registry: RegistryRefView | None = None
     enabled: bool = True
     locked: bool = False
+    active: bool = True
 
 
 class SkillCatalogEntry(ProtocolModel):
@@ -677,7 +586,6 @@ class SkillDetailView(ProtocolModel):
 
 class ToolSummary(ProtocolModel):
     name: str
-    is_custom: bool = False
 
 
 # The closed set the App Server contract declares. Vibe never emits "unknown";
@@ -775,6 +683,7 @@ class MCPSourceStatus(StrEnum):
     ENABLED = auto()
     NEEDS_AUTH = auto()
     NEEDS_SETUP = auto()
+    NEEDS_CONNECT = auto()
     UNAVAILABLE = auto()
 
 
@@ -810,6 +719,7 @@ class MCPState(ProtocolModel):
     discovery_errors: dict[str, str] = Field(default_factory=dict)
     connector_error: str | None = None
     manage_connectors_url: str | None = None
+    private_connectors_hidden: bool = False
 
     def resolve_source(self, query: str) -> MCPSourceSummary | None:
         # `/mcp <query>` takes an alias, or the display name the browser shows.
@@ -853,23 +763,6 @@ class SessionLogSummary(ProtocolModel):
     path: str | None = None
     title: str | None = None
     needs_initial_auto_title: bool = False
-
-
-class SavedSessionSummary(ProtocolModel):
-    session_id: str
-    cwd: str
-    parent_session_id: str | None = None
-    title: str | None = None
-    end_time: str | None = None
-    preview: str = ""
-
-    @property
-    def option_id(self) -> str:
-        return self.session_id
-
-    @property
-    def short_id(self) -> str:
-        return self.session_id[:8]
 
 
 class PendingEffectState(ProtocolModel):
@@ -984,12 +877,31 @@ class _PublicHistoryEntryBase(ProtocolModel):
 type PublicMessageSource = Literal["turn_start", "turn_steer", "harness"]
 
 
+class CommittedGenerationOutcome(ProtocolModel):
+    type: Literal["committed"] = "committed"
+
+
+class DiscardedGenerationOutcome(ProtocolModel):
+    type: Literal["discarded"] = "discarded"
+    # Any string, not the Harness's current set: an app-server must not reject
+    # an entry over a cause a newer Harness added.
+    cause: str
+
+
+# Whether completed assistant output was kept or discarded, and why. Unset while
+# the entry is generating and on entries a Harness does not settle.
+type GenerationOutcome = Annotated[
+    CommittedGenerationOutcome | DiscardedGenerationOutcome, Field(discriminator="type")
+]
+
+
 class PublicMessageEntry(_PublicHistoryEntryBase):
     type: Literal["message"] = "message"
     role: Literal["system", "user", "assistant"]
     content: list[ContentBlock]
     source: PublicMessageSource | None = None
     user_display_content: UserDisplayContent | None = None
+    outcome: GenerationOutcome | None = None
 
     @property
     def text(self) -> str:
@@ -1010,6 +922,7 @@ class PublicReasoningEntry(_PublicHistoryEntryBase):
     type: Literal["reasoning"] = "reasoning"
     text: str
     summary: list[str] = Field(default_factory=list)
+    outcome: GenerationOutcome | None = None
 
 
 class PublicEffectEntry(_PublicHistoryEntryBase):
@@ -1031,6 +944,7 @@ class HookScope(StrEnum):
     POST_AGENT = auto()
     PRE_TOOL = auto()
     POST_TOOL = auto()
+    PRE_AGENT = auto()
 
 
 class HookSeverity(StrEnum):
@@ -1056,23 +970,9 @@ class AgentChangedNoticeDetail(ProtocolModel):
     agent_name: str
 
 
-class ContextClearedNoticeDetail(ProtocolModel):
-    kind: Literal["context_cleared"] = "context_cleared"
-    plan_file_path: str | None = None
-
-
 class SessionTitleUpdatedNoticeDetail(ProtocolModel):
     kind: Literal["session_title_updated"] = "session_title_updated"
     title: str
-
-
-class PlanReviewStartedNoticeDetail(ProtocolModel):
-    kind: Literal["plan_review_started"] = "plan_review_started"
-    file_path: str
-
-
-class PlanReviewEndedNoticeDetail(ProtocolModel):
-    kind: Literal["plan_review_ended"] = "plan_review_ended"
 
 
 class WaitingForInputNoticeDetail(ProtocolModel):
@@ -1090,10 +990,7 @@ class ScheduledLoopFiredNoticeDetail(ProtocolModel):
 NoticeDetail = Annotated[
     HookNoticeDetail
     | AgentChangedNoticeDetail
-    | ContextClearedNoticeDetail
     | SessionTitleUpdatedNoticeDetail
-    | PlanReviewStartedNoticeDetail
-    | PlanReviewEndedNoticeDetail
     | WaitingForInputNoticeDetail
     | ScheduledLoopFiredNoticeDetail,
     Field(discriminator="kind"),
@@ -1199,10 +1096,20 @@ class PublicSessionWorktree(ProtocolModel):
     created: bool
 
 
+class PublicSessionProject(ProtocolModel):
+    """The project stamp in a session's metadata; ``id`` is None for ``none``."""
+
+    kind: Literal["local", "cloud", "none"]
+    id: str | None = None
+
+
 class PublicSession(ProtocolModel):
     id: str
     root_session_id: str | None = None
     parent_session_id: str | None = None
+    started_by_session_id: str | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
     title: str | None = None
     preview: str = ""
     status: PublicSessionStatus
@@ -1224,6 +1131,21 @@ class PublicSession(ProtocolModel):
     token_usage: TokenUsage | None = None
     context_usage: TokenUsage | None = None
     harness: Literal["legacy", "unified"] | None = None
+    # Scheduled loops persisted for this session. The additive default keeps
+    # old clients and old servers working (ADR 0014).
+    loops: list[ScheduledLoop] = Field(default_factory=list)
+    # None while unstamped. With local projects on, a listing stamps an unstamped
+    # session whose folder is a local project's.
+    project: PublicSessionProject | None = None
+
+    @model_validator(mode="after")
+    def _default_bumped_at(self) -> Self:
+        # A session that has not started a user turn yet ranks by its creation.
+        # Clients that each picked their own fallback ranked it differently
+        # depending on the endpoint that answered, so the session moved.
+        if self.bumped_at is None:
+            self.bumped_at = self.created_at
+        return self
 
 
 class PublicChildSession(ProtocolModel):
@@ -1251,10 +1173,20 @@ class PublicQueuedTurn(ProtocolModel):
 TURN_QUEUE_MAX_ITEMS = 32
 
 
+class PublicTurnQueueEditState(ProtocolModel):
+    queue_item_id: str
+
+
 class PublicTurnQueue(ProtocolModel):
     items: list[PublicQueuedTurn] = Field(default_factory=list)
     paused: bool = False
     max_items: int = Field(default=TURN_QUEUE_MAX_ITEMS, ge=1, strict=True)
+    editing: PublicTurnQueueEditState | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
+
+
+BudgetStopReason = Literal["token_limit", "price_limit"]
 
 
 class PublicTurn(ProtocolModel):
@@ -1266,6 +1198,11 @@ class PublicTurn(ProtocolModel):
     completed_at: int | None = None
     error: PublicError | None = None
     stop_reason: PublicTurnStopReason | None = None
+    # Set only on an ``interrupted`` turn that a cumulative completion budget
+    # stopped before its next completion; any other interruption leaves it out.
+    budget_stop_reason: BudgetStopReason | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
     queue_item_id: str | None = None
 
 
@@ -1290,6 +1227,31 @@ class PublicBackgroundProcess(ProtocolModel):
     status: Literal["running", "completed", "failed", "stopped", "orphaned"]
     exit_code: int | None = None
     created_at: str
+
+
+class ImportJobStatus(StrEnum):
+    QUEUED = auto()
+    RUNNING = auto()
+    COMPLETED = auto()
+    FAILED = auto()
+
+
+class ImportHarness(StrEnum):
+    CLAUDE = auto()
+
+
+class ImportHarnessDiscovery(ProtocolModel):
+    harness: ImportHarness
+    project_count: int = Field(ge=0, strict=True)
+    session_count: int = Field(ge=0, strict=True)
+
+
+class ImportJob(ProtocolModel):
+    id: str
+    status: ImportJobStatus
+    message: str | None = None
+    created_at: int
+    updated_at: int
 
 
 class PublicSessionState(ProtocolModel):
@@ -1325,11 +1287,3 @@ class ScheduledLoop(ProtocolModel):
     interval_seconds: int | None = None
     cron: str | None = Field(default=None, exclude_if=lambda value: value is None)
     next_fire_at: float
-
-
-class CompactionDetails(ProtocolModel):
-    current_context_tokens: int | None = None
-    threshold: int | None = None
-    summary_length: int | None = None
-    old_session_id: str | None = None
-    new_session_id: str | None = None

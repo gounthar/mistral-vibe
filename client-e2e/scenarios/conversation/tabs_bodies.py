@@ -9,14 +9,14 @@ from e2e.app_server.events import (
     user_msg,
     write_file,
 )
-from e2e.app_server.scenario import Timeline
+from e2e.app_server.scenario import Timeline, take_snapshot
 
 _PROMPT = "write the makefile"
 
 # The folded group header, then the write and bash headers under it.
-_EXPAND_GROUP = "\x1b[<0;1;15M\x1b[<0;1;15m"
-_EXPAND_WRITE = "\x1b[<0;1;16M\x1b[<0;1;16m"
-_EXPAND_BASH = "\x1b[<0;1;20M\x1b[<0;1;20m"
+_EXPAND_GROUP = "\x1b[<0;1;11M\x1b[<0;1;11m"
+_EXPAND_WRITE = "\x1b[<0;1;12M\x1b[<0;1;12m"
+_EXPAND_BASH = "\x1b[<0;1;16M\x1b[<0;1;16m"
 
 timeline: Timeline = [
     f"{_PROMPT}\r",
@@ -31,4 +31,5 @@ timeline: Timeline = [
     _EXPAND_GROUP,
     _EXPAND_WRITE,
     _EXPAND_BASH,
+    take_snapshot(),
 ]

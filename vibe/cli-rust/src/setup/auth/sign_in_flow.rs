@@ -21,6 +21,7 @@ pub enum SignInEvent {
     Started { sign_in_url: String },
     StatusChanged(SignInStatus),
     Completed { api_key: String },
+    OidcCompleted,
     Failed { message: String },
 }
 
@@ -59,9 +60,6 @@ pub async fn run_sign_in(
     let _ = tx
         .send(SignInEvent::StatusChanged(SignInStatus::Completed))
         .await;
-    // Python `SUCCESS_EXIT_DELAY_SECONDS`: the Finished step shows "Sign-in
-    // complete" for two seconds before the wizard moves on.
-    tokio::time::sleep(Duration::from_secs(2)).await;
     let _ = tx.send(SignInEvent::Completed { api_key }).await;
     Ok(())
 }
@@ -88,8 +86,8 @@ async fn replay_sign_in(tx: mpsc::Sender<SignInEvent>) -> Result<(), SignInError
 }
 
 /// Poll until completion, expired, or error. The server advertises the
-/// sign-in deadline (`expires_at`); polling stops when it passes, like
-/// Python's `expires_at` check in `authenticate`. After three consecutive
+/// sign-in deadline (`expires_at`); polling stops when it passes. After
+/// three consecutive
 /// failures the error propagates: the spawn wrapper turns it into the
 /// `Failed` event.
 async fn poll_for_completion(
@@ -110,7 +108,7 @@ async fn poll_for_completion(
                 failures = 0;
                 match result.status.as_str() {
                     "pending" => {
-                        tokio::time::sleep(Duration::from_secs(3)).await;
+                        crate::clock::sleep_real(Duration::from_secs(3)).await;
                     }
                     "completed" => {
                         return result.exchange_token.ok_or(SignInError {
@@ -149,7 +147,7 @@ async fn poll_for_completion(
                 if failures >= 3 {
                     return Err(e);
                 }
-                tokio::time::sleep(Duration::from_secs(3)).await;
+                crate::clock::sleep_real(Duration::from_secs(3)).await;
             }
             Err(e) => return Err(e),
         }
@@ -166,7 +164,7 @@ fn generate_pkce_pair() -> (String, String) {
 }
 
 fn generate_code_verifier() -> String {
-    // Python `secrets.token_urlsafe(64)`: 64 random bytes, base64url. A broken
+    // 64 random bytes, base64url. A broken
     // system RNG has no safe fallback; fail instead of guessing.
     let mut bytes = [0u8; 64];
     getrandom::fill(&mut bytes).expect("system RNG unavailable");

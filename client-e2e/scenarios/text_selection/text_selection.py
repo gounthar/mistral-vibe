@@ -1,12 +1,12 @@
 from __future__ import annotations
 
 from e2e.app_server.events import assistant_msg, turn_completed, turn_started, user_msg
-from e2e.app_server.scenario import Timeline
+from e2e.app_server.scenario import Timeline, take_snapshot
 
 # Force deterministic OSC 52 copying across hosts.
 env = {"SSH_TTY": "/dev/pts/0"}
 
-# Select a wide mid-transcript row shared by both clients.
+# Select a wide mid-transcript row.
 _ROW = 20
 _COL_START = 12
 _COL_MID = 30
@@ -30,10 +30,10 @@ _AUTO_PRESS = f"\x1b[<0;{_COL_START};{_EDGE_ROW}M"
 _AUTO_DRAG = "\x1b[<32;120;1M"
 _AUTO_RELEASE = "\x1b[<0;120;1m"
 _TOP_SELECT = (
-    f"\x1b[<0;{_COL_START};21M"
-    f"\x1b[<32;{_COL_MID};21M"
-    f"\x1b[<32;{_COL_END};21M"
-    f"\x1b[<0;{_COL_END};21m"
+    f"\x1b[<0;{_COL_START};17M"
+    f"\x1b[<32;{_COL_MID};17M"
+    f"\x1b[<32;{_COL_END};17M"
+    f"\x1b[<0;{_COL_END};17m"
 )
 
 
@@ -62,6 +62,5 @@ timeline: Timeline = [
     _WHEEL_UP * 2,
     _WHEEL_DOWN * 40,
     _WHEEL_DOWN * 2,
+    take_snapshot(),
 ]
-
-capture_steps = {0, 1, 2, 3, 8, 9, 10, 11}

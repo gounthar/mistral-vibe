@@ -1,15 +1,16 @@
-use std::collections::BTreeSet;
-
 use serde::Deserialize;
 use serde::Serialize;
 use serde_json::Value;
 
+mod result_consistency;
 mod tool_identity;
 
+pub(crate) use result_consistency::post_tool_call_warning;
 pub(crate) use tool_identity::{HookToolKey, HookToolTarget};
 
 use crate::core::error::CoreError;
 use crate::core::tools::external::HookToolCall;
+use crate::core::tools::result::model_visible_content_block;
 use crate::core::wire::completion::{AgentCompletionAcceptance, CompletionCandidate};
 use crate::core::wire::content::{ContentBlock, text_content, validate_non_empty_content};
 use crate::core::wire::tool::{ProtocolError, StructuredContent, ToolResult};
@@ -35,48 +36,11 @@ pub(crate) enum PreAgentTurnOutput {
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub(crate) enum PreLlmCallOutput {
-    Continue {
-        #[serde(default, skip_serializing_if = "Vec::is_empty")]
-        context_messages: Vec<KeyedContextMessage>,
-    },
+    Continue,
     Skip {
         #[serde(default)]
         reason: Vec<ContentBlock>,
     },
-}
-
-/// Model-only context returned by a `pre_llm_call` hook.
-///
-/// `key` identifies one context item across hook calls. Before the model call,
-/// Core injects `content` as a user message unless the latest injection for
-/// that key has identical content. Changed content is appended rather than
-/// replacing the earlier message. This context never appears in public history.
-#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct KeyedContextMessage {
-    pub key: String,
-    pub content: Vec<ContentBlock>,
-}
-
-pub(crate) fn validate_keyed_context_messages(
-    messages: &[KeyedContextMessage],
-) -> Result<(), CoreError> {
-    let mut keys = BTreeSet::new();
-    for message in messages {
-        if message.key.is_empty() {
-            return Err(CoreError::invalid_command(
-                "pre-LLM hook context key must not be empty",
-            ));
-        }
-        validate_non_empty_content(&message.content, "pre-LLM hook context content")?;
-        if !keys.insert(message.key.as_str()) {
-            return Err(CoreError::invalid_command(format!(
-                "pre-LLM hook context key {:?} appears more than once",
-                message.key
-            )));
-        }
-    }
-    Ok(())
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
@@ -177,19 +141,37 @@ pub(crate) fn hook_action_id(subject_action_id: &str, point: HookPoint) -> Strin
     crate::core::action_id::hook(subject_action_id, suffix)
 }
 
+/// The reason is the result's content and, when it has model-visible text,
+/// also the error message: a program calling the tool sees only the message
+/// of the error it catches, and the reason must reach the model on both paths.
 pub(crate) fn skipped_tool_result(reason: Vec<ContentBlock>) -> Result<ToolResult, CoreError> {
     validate_non_empty_content(&reason, "pre-tool hook skip reason")?;
+    let message = skip_reason_text(&reason)
+        .unwrap_or_else(|| "Tool execution was skipped by Runtime policy.".to_string());
     Ok(ToolResult::Failure {
         content: reason,
         structured_content: StructuredContent::Absent,
         meta: None,
         error: ProtocolError {
             code: "tool_skipped".to_string(),
-            message: "Tool execution was skipped by Runtime policy.".to_string(),
+            message,
             retryable: false,
             details: Value::Null,
         },
     })
+}
+
+fn skip_reason_text(reason: &[ContentBlock]) -> Option<String> {
+    let text = reason
+        .iter()
+        .filter(|block| matches!(block, ContentBlock::Text(_)))
+        .filter_map(|block| match model_visible_content_block(block.clone()) {
+            Some(ContentBlock::Text(content)) => Some(content.text),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    (!text.trim().is_empty()).then_some(text)
 }
 
 pub(crate) fn hook_failure_tool_result(error: ProtocolError) -> ToolResult {
@@ -198,56 +180,5 @@ pub(crate) fn hook_failure_tool_result(error: ProtocolError) -> ToolResult {
         structured_content: StructuredContent::Absent,
         meta: None,
         error,
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use serde_json::json;
-
-    use super::*;
-
-    #[test]
-    fn pre_llm_continue_context_is_optional_and_closed() {
-        let bare = serde_json::from_value::<PreLlmCallOutput>(json!({"type": "continue"}))
-            .expect("bare continue decodes");
-        assert_eq!(
-            bare,
-            PreLlmCallOutput::Continue {
-                context_messages: Vec::new(),
-            }
-        );
-        assert_eq!(
-            serde_json::to_value(&bare).expect("continue encodes"),
-            json!({"type": "continue"})
-        );
-
-        let keyed = json!({
-            "type": "continue",
-            "context_messages": [{
-                "key": "github",
-                "content": [{"type": "text", "text": "GitHub is connected."}],
-            }],
-        });
-        let decoded = serde_json::from_value::<PreLlmCallOutput>(keyed.clone())
-            .expect("keyed continue decodes");
-        assert_eq!(
-            serde_json::to_value(&decoded).expect("keyed continue encodes"),
-            keyed
-        );
-
-        let error = serde_json::from_value::<PreLlmCallOutput>(json!({
-            "type": "continue",
-            "context_messages": [{
-                "key": "github",
-                "content": [{"type": "text", "text": "GitHub is connected."}],
-                "role": "system",
-            }],
-        }))
-        .expect_err("unknown context field is rejected");
-        assert!(
-            error.to_string().contains("unknown field `role`"),
-            "{error}"
-        );
     }
 }

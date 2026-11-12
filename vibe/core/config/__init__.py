@@ -7,7 +7,6 @@ if TYPE_CHECKING:
         AUTO_THEME,
         DEFAULT_API_RETRY_MAX_ELAPSED_TIME,
         DEFAULT_API_TIMEOUT,
-        DEFAULT_AUTO_COMPACT_THRESHOLD,
         DEFAULT_CONSOLE_BASE_URL,
         DEFAULT_MISTRAL_API_ENV_KEY,
         DEFAULT_MISTRAL_BROWSER_AUTH_API_BASE_URL,
@@ -15,7 +14,6 @@ if TYPE_CHECKING:
         DEFAULT_MISTRAL_SERVER_URL,
         DEFAULT_THEME,
         DEFAULT_VIBE_BASE_URL,
-        FALLBACK_THEME,
     )
     from vibe.core.config.default_orchestrator import (
         build_default_orchestrator,
@@ -36,6 +34,7 @@ if TYPE_CHECKING:
     from vibe.core.config.layers.default import DefaultConfigLayer
     from vibe.core.config.layers.discovered import DiscoveredConfigLayer
     from vibe.core.config.layers.growthbook import GrowthbookLayer
+    from vibe.core.config.layers.model_catalog import ModelCatalogLayer
     from vibe.core.config.models import (
         THINKING_LEVELS,
         ConnectorConfig,
@@ -97,10 +96,14 @@ if TYPE_CHECKING:
         DEFAULT_TRANSCRIBE_PROVIDERS,
         DEFAULT_TTS_MODELS,
         DEFAULT_TTS_PROVIDERS,
+        EnvValueOrigin,
         VibeConfigSchema,
         create_default_config,
+        env_value_origin,
+        forget_env_value_origin,
         get_persisted_config,
         load_dotenv_values,
+        record_env_value_origin,
         resolve_api_key,
     )
     from vibe.core.prompts import MissingPromptFileError
@@ -112,7 +115,6 @@ __all__ = [
     "DEFAULT_ACTIVE_MODEL_CONFIG",
     "DEFAULT_API_RETRY_MAX_ELAPSED_TIME",
     "DEFAULT_API_TIMEOUT",
-    "DEFAULT_AUTO_COMPACT_THRESHOLD",
     "DEFAULT_CONSOLE_BASE_URL",
     "DEFAULT_MISTRAL_API_ENV_KEY",
     "DEFAULT_MISTRAL_BROWSER_AUTH_API_BASE_URL",
@@ -126,7 +128,6 @@ __all__ = [
     "DEFAULT_TTS_MODELS",
     "DEFAULT_TTS_PROVIDERS",
     "DEFAULT_VIBE_BASE_URL",
-    "FALLBACK_THEME",
     "MISSING_BACKING_STORE_DATA_FINGERPRINT",
     "THINKING_LEVELS",
     "AddOperationPatch",
@@ -145,6 +146,7 @@ __all__ = [
     "DiscoveredConfigLayer",
     "DuplicateMergeMetadataError",
     "EmptyLayerError",
+    "EnvValueOrigin",
     "ExperimentsConfig",
     "GrowthbookLayer",
     "LayerConfigSnapshot",
@@ -159,6 +161,7 @@ __all__ = [
     "MergeFieldMetadata",
     "MissingAPIKeyError",
     "MissingPromptFileError",
+    "ModelCatalogLayer",
     "ModelConfig",
     "OtelRedactionMode",
     "OtelSpanExporterConfig",
@@ -191,8 +194,11 @@ __all__ = [
     "build_default_orchestrator",
     "build_user_config_orchestrator",
     "create_default_config",
+    "env_value_origin",
+    "forget_env_value_origin",
     "get_persisted_config",
     "load_dotenv_values",
+    "record_env_value_origin",
     "resolve_api_key",
 ]
 
@@ -203,10 +209,6 @@ _MAPPING: dict[str, tuple[str, str]] = {
         "DEFAULT_API_RETRY_MAX_ELAPSED_TIME",
     ),
     "DEFAULT_API_TIMEOUT": ("vibe.core.config._defaults", "DEFAULT_API_TIMEOUT"),
-    "DEFAULT_AUTO_COMPACT_THRESHOLD": (
-        "vibe.core.config._defaults",
-        "DEFAULT_AUTO_COMPACT_THRESHOLD",
-    ),
     "DEFAULT_CONSOLE_BASE_URL": (
         "vibe.core.config._defaults",
         "DEFAULT_CONSOLE_BASE_URL",
@@ -229,7 +231,6 @@ _MAPPING: dict[str, tuple[str, str]] = {
     ),
     "DEFAULT_THEME": ("vibe.core.config._defaults", "DEFAULT_THEME"),
     "DEFAULT_VIBE_BASE_URL": ("vibe.core.config._defaults", "DEFAULT_VIBE_BASE_URL"),
-    "FALLBACK_THEME": ("vibe.core.config._defaults", "FALLBACK_THEME"),
     "build_default_orchestrator": (
         "vibe.core.config.default_orchestrator",
         "build_default_orchestrator",
@@ -257,6 +258,7 @@ _MAPPING: dict[str, tuple[str, str]] = {
         "DiscoveredConfigLayer",
     ),
     "GrowthbookLayer": ("vibe.core.config.layers.growthbook", "GrowthbookLayer"),
+    "ModelCatalogLayer": ("vibe.core.config.layers.model_catalog", "ModelCatalogLayer"),
     "THINKING_LEVELS": ("vibe.core.config.models", "THINKING_LEVELS"),
     "ConnectorConfig": ("vibe.core.config.models", "ConnectorConfig"),
     "ExperimentsConfig": ("vibe.core.config.models", "ExperimentsConfig"),
@@ -326,6 +328,16 @@ _MAPPING: dict[str, tuple[str, str]] = {
     "DEFAULT_TTS_PROVIDERS": ("vibe.core.config.vibe_schema", "DEFAULT_TTS_PROVIDERS"),
     "VibeConfigSchema": ("vibe.core.config.vibe_schema", "VibeConfigSchema"),
     "create_default_config": ("vibe.core.config.vibe_schema", "create_default_config"),
+    "EnvValueOrigin": ("vibe.core.config.vibe_schema", "EnvValueOrigin"),
+    "env_value_origin": ("vibe.core.config.vibe_schema", "env_value_origin"),
+    "forget_env_value_origin": (
+        "vibe.core.config.vibe_schema",
+        "forget_env_value_origin",
+    ),
+    "record_env_value_origin": (
+        "vibe.core.config.vibe_schema",
+        "record_env_value_origin",
+    ),
     "get_persisted_config": ("vibe.core.config.vibe_schema", "get_persisted_config"),
     "load_dotenv_values": ("vibe.core.config.vibe_schema", "load_dotenv_values"),
     "resolve_api_key": ("vibe.core.config.vibe_schema", "resolve_api_key"),

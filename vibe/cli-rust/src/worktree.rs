@@ -1,5 +1,6 @@
 //! The session worktree, tracked from the `worktree` transcript effect.
 
+use serde::Deserialize;
 use serde_json::Value;
 
 use crate::app::App;
@@ -8,7 +9,7 @@ use crate::server::{
 };
 
 /// A managed worktree the app-server moved the session into, reported by the
-/// settled `worktree` effect (Python `WorktreeEffect`). `created` is the
+/// settled `worktree` effect (app-server `WorktreeEffect`). `created` is the
 /// effect's verdict for the run that created it; a resumed session's
 /// restored projection also reports true, and the exit cleanup gate
 /// additionally requires `--worktree` to have been requested this run.
@@ -18,7 +19,7 @@ pub struct WorktreeInfo {
     pub branch: String,
     pub path: String,
     /// True only when this run created it; reused worktrees are never
-    /// auto-cleaned (Python `_run_cli_with_worktree_cleanup`).
+    /// auto-cleaned.
     pub created: bool,
 }
 
@@ -42,7 +43,7 @@ impl WorktreeInfo {
             .find_map(Self::from_entry)
     }
 
-    /// The session state's reported worktree (Python `PublicSessionWorktree`).
+    /// The session state's reported worktree (app-server `PublicSessionWorktree`).
     /// The additive field is the only source a session that has not run a
     /// turn has: the transcript effect only lands with the deferred first
     /// turn, while the state update rides the session move itself.
@@ -56,7 +57,7 @@ impl WorktreeInfo {
         })
     }
 
-    /// Parse a `worktree` effect (Python `WorktreeEffect`): `detail.input`
+    /// Parse a `worktree` effect (app-server `WorktreeEffect`): `detail.input`
     /// carries the name, branch, and path, and the settled verb says Created
     /// vs Reused. Only a completed effect resolves: while it runs the call
     /// display hardcodes `settledVerb: Created` (`WorktreeProgress`), and a
@@ -90,25 +91,33 @@ pub fn track_entry(app: &mut App, params: &Value) {
     }
 }
 
+/// Track a snapshot's worktree.
+pub fn adopt_state(app: &mut App, state: &PublicSessionState) {
+    track_state(app, state);
+}
+
 /// Track the session's worktree from a snapshot's history page, falling back
 /// to the session state's reported worktree when the page misses the effect.
 /// A page miss never drops a tracked worktree (the server keeps the last
 /// `HISTORY_LIMIT` entries and the start-of-session effect is the first, so
 /// long sessions legitimately lose it) and never moves the cwd backwards:
 /// the session's own cwd is the move's authoritative value, applied after the
-/// worktree so a root-only worktree path cannot shadow it.
-pub fn track_state(app: &mut App, state: &PublicSessionState) {
+/// worktree so a root-only worktree path cannot shadow it. True when the
+/// tracked worktree changed.
+pub fn track_state(app: &mut App, state: &PublicSessionState) -> bool {
     let info =
         WorktreeInfo::from_state(state).or_else(|| WorktreeInfo::from_session(&state.session));
-    if let Some(info) = info {
-        track(app, info);
-        // Applied inside the worktree arm only, never on its own: a snapshot
-        // from before the move (session still in the checkout, no worktree
-        // in the history page) must not drag the footer back.
-        if let Some(cwd) = &state.session.cwd {
-            app.session.cwd = Some(cwd.clone());
-        }
+    let Some(info) = info else {
+        return false;
+    };
+    let moved = track(app, info);
+    // Applied inside the worktree arm only, never on its own: a snapshot
+    // from before the move (session still in the checkout, no worktree
+    // in the history page) must not drag the footer back.
+    if let Some(cwd) = &state.session.cwd {
+        app.session.cwd = Some(cwd.clone());
     }
+    moved
 }
 
 /// A `session/updated` JSON patch's `replace` ops as (path, value): the shape
@@ -143,8 +152,7 @@ pub fn track_patch(app: &mut App, patch: &Value) {
                 }
             }
             "/worktree" => {
-                if let Ok(worktree) = serde_json::from_value::<PublicSessionWorktree>(value.clone())
-                {
+                if let Ok(worktree) = PublicSessionWorktree::deserialize(value) {
                     track(
                         app,
                         WorktreeInfo {
@@ -165,13 +173,13 @@ pub fn track_patch(app: &mut App, patch: &Value) {
 }
 
 /// Follow the server-side move: the session now runs in the worktree, so the
-/// client's notion of its cwd follows (Python chdirs the whole process; here
-/// the server moved the session). The worktree's path is the root, so this is
-/// the fallback; a snapshot's session cwd or the announce's `/cwd` value
-/// refines it to the subdirectory the session actually runs in.
-pub fn track(app: &mut App, info: WorktreeInfo) {
+/// client's notion of its cwd follows. The worktree's path is the root, so
+/// this is the fallback; a snapshot's session cwd or the announce's `/cwd`
+/// value refines it to the subdirectory the session actually runs in. True
+/// when the tracked worktree changed.
+pub fn track(app: &mut App, info: WorktreeInfo) -> bool {
     if app.session.worktree.as_ref() == Some(&info) {
-        return;
+        return false;
     }
     tracing::info!(
         worktree = info.name,
@@ -180,4 +188,5 @@ pub fn track(app: &mut App, info: WorktreeInfo) {
     );
     app.session.cwd = Some(info.path.clone());
     app.session.worktree = Some(info);
+    true
 }

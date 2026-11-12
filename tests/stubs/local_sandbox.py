@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from contextlib import aclosing
 import json
 import os
 from pathlib import Path
@@ -26,6 +27,9 @@ from mistralai_vibe_local_harness.protocol import (
     RustTokenUsage,
 )
 from mistralai_vibe_local_harness.vibe import SandboxExecResult
+from vibe.app_server.events import CallbackRequested
+from vibe.app_server.local import LocalHarnessHost, LocalHarnessOptions
+from vibe.app_server.models import TurnStop, turn_stop
 from vibe.core.trusted_folders import trusted_folders_manager
 
 ROOT_DOC = "Root rule: keep answers short."
@@ -118,6 +122,39 @@ class RecordingSandbox:
             return None
 
 
+class FakeFailingSandbox(RecordingSandbox):
+    """Its helper answers an operation in ``failing`` with that error, exiting 0 as the
+    helper does when it reports a tool failure.
+    """
+
+    def __init__(self, workspace: Path) -> None:
+        super().__init__(workspace)
+        self.down = False
+        self.unreachable = 0
+        self.failing: dict[str, str] = {}
+
+    async def execute(
+        self, command: str, cwd: str, timeout: float | None
+    ) -> SandboxExecResult:
+        if self.down:
+            self.unreachable += 1
+            raise ConnectionError("sandbox down")
+        error = self.failing.get(_helper_operation(command))
+        if error is None:
+            return await super().execute(command, cwd, timeout)
+        self.commands.append(command)
+        answer = {"ok": False, "error": error}
+        return SandboxExecResult(exit_code=0, stdout=json.dumps(answer), stderr="")
+
+
+def _helper_operation(command: str) -> str:
+    argv = shlex.split(command)
+    for option in ("--request-base64", "--request-file"):
+        if option in argv:
+            return argv[argv.index(option) - 1]
+    return ""
+
+
 def build_trusted_project(root: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     """A git repository with a root and a subdirectory AGENTS.md, trusted on the host."""
     monkeypatch.setenv("MISTRAL_API_KEY", "test-key")
@@ -206,3 +243,22 @@ class ScriptedModel:
                 usage=RustTokenUsage(input_tokens=1, output_tokens=1, total_tokens=2),
             ),
         )
+
+
+async def run_turn(
+    host: LocalHarnessHost, options: LocalHarnessOptions, prompt: str
+) -> TurnStop | None:
+    """Run ``prompt`` as one headless turn, denying every callback.
+
+    Returns how the turn stopped, or None when it finished; a turn error raises.
+    """
+    session = await host.start(options)
+    try:
+        await session.resources.runtime.wait_until_ready()
+        async with aclosing(session.act(prompt)) as events:
+            async for event in events:
+                if isinstance(event, CallbackRequested):
+                    await session.deny_callback(event.callback)
+        return turn_stop(next(reversed(session.state.turns or []), None))
+    finally:
+        await session.close()

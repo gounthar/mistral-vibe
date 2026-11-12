@@ -10,9 +10,8 @@ from datetime import UTC, datetime
 import hashlib
 import json
 import time
+from typing import TYPE_CHECKING
 import weakref
-
-from mcp.client.auth import OAuthFlowError
 
 from vibe.app_server._session_backend_port import (
     MCPAuthorizationProvider,
@@ -44,6 +43,11 @@ from vibe.core.config import (
     MCPStreamableHttp,
 )
 from vibe.utils.http import VibeAsyncHTTPClient, build_ssl_context
+
+# The MCP SDK is imported where used: its package import loads ~230 modules.
+if TYPE_CHECKING:
+    from mcp.shared.auth import AuthorizationCodeResult
+
 
 type RemoteMCPServer = MCPHttp | MCPStreamableHttp
 type AuthURLSink = Callable[[str], Awaitable[None]]
@@ -329,6 +333,8 @@ class MCPAuthenticationService(MCPAuthorizationProvider):
     async def _resolve_oauth(  # noqa: PLR0911 - closed authorization outcomes
         self, server: RemoteMCPServer, declared_headers: Mapping[str, str]
     ) -> MCPAuthorizationResult:
+        from mcp.client.auth import OAuthFlowError
+
         try:
             current_fingerprint = Fingerprint.compute(server)
             storage = KeyringTokenStorage(alias=server.name)
@@ -385,10 +391,12 @@ class MCPAuthenticationService(MCPAuthorizationProvider):
         return self._snapshot(server.name, headers, expires_at)
 
     async def _refresh_oauth(self, server: RemoteMCPServer) -> None:
+        from mcp.client.auth import OAuthFlowError
+
         async def reject_redirect(_url: str) -> None:
             raise OAuthFlowError("Interactive MCP OAuth login is required")
 
-        async def reject_callback() -> tuple[str, str | None]:
+        async def reject_callback() -> AuthorizationCodeResult:
             raise OAuthFlowError("Interactive MCP OAuth login is required")
 
         provider = build_oauth_provider(
@@ -400,6 +408,7 @@ class MCPAuthenticationService(MCPAuthorizationProvider):
                 timeout=server.startup_timeout_sec,
                 verify=build_ssl_context(),
             ) as client:
+                await provider.discover_authorization_server(client)
                 await client.get(server.url)
         except Exception as exc:
             classified = unwrap_oauth_refresh_error(exc)

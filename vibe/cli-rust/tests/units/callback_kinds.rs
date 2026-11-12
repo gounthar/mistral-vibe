@@ -1,18 +1,19 @@
 //! Callback kinds stay advertised and require a semantic answer from the UI.
 
-use std::collections::HashMap;
 use std::sync::atomic::AtomicU64;
 use std::sync::{Arc, Mutex};
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use serde_json::{json, Value};
 use tokio::sync::mpsc;
-use vibe_rs::app::{App, Status, ToastSeverity};
+use vibe_rs::app::{App, Severity, Status};
 use vibe_rs::approval::{self, Event as ApprovalEvent, KeyAction, State, MAX_PENDING_APPROVALS};
 use vibe_rs::server::{
     callback, server_method, ActiveSession, ApprovalCallback, ApprovalDecisionType, Pending,
     CALLBACK_KINDS,
 };
+
+use crate::support::{ctrl, key, stub, with_status};
 
 fn approval_callback(callback_id: &str) -> ApprovalCallback {
     serde_json::from_value(json!({
@@ -56,8 +57,8 @@ fn approval_callbacks_tolerate_older_backend_shapes() {
     }))
     .unwrap();
 
-    assert_eq!(callback.callback_id, "approval-1");
-    assert_eq!(callback.session_id, "");
+    assert_eq!(callback.address.callback_id, "approval-1");
+    assert_eq!(callback.address.session_id, None);
     assert_eq!(callback.detail.effect.tool_name, "");
     assert!(callback.detail.effect.input.is_null());
 }
@@ -128,15 +129,14 @@ fn approval_waits_for_startup_readiness() {
         app.approval
             .active
             .as_ref()
-            .map(|item| item.session_id.as_str()),
+            .and_then(|item| item.address.session_id.as_deref()),
         Some("session-child")
     );
 }
 
 #[test]
 fn approval_only_advances_after_a_successful_response() {
-    let mut app = App::default();
-    app.session.status = Status::Ready;
+    let mut app = with_status(Status::Ready);
     app.approval
         .enqueue(approval_callback("approval-1"))
         .unwrap();
@@ -157,7 +157,7 @@ fn approval_only_advances_after_a_successful_response() {
         app.approval
             .active
             .as_ref()
-            .map(|callback| callback.callback_id.as_str()),
+            .map(|callback| callback.address.callback_id.as_str()),
         Some("approval-1")
     );
 
@@ -172,29 +172,23 @@ fn approval_only_advances_after_a_successful_response() {
         app.approval
             .active
             .as_ref()
-            .map(|callback| callback.callback_id.as_str()),
+            .map(|callback| callback.address.callback_id.as_str()),
         Some("approval-2")
     );
 }
 
 #[test]
-fn answering_approval_keeps_unrelated_toasts() {
-    let mut app = App::default();
-    app.session.status = Status::Ready;
+fn answering_approval_keeps_an_unrelated_notice() {
+    let mut app = with_status(Status::Ready);
     app.approval
         .enqueue(approval_callback("approval-1"))
         .unwrap();
     approval::show_pending(&mut app);
     app.approval.mount_time = None;
-    app.show_toast("server warning".into(), ToastSeverity::Warning, 5);
-    let client = Arc::new(vibe_rs::server::Client::stub());
+    vibe_rs::ui::notice::show(&mut app, Severity::Information, "Copied to clipboard", 5);
 
-    approval::handle_key(
-        &mut app,
-        &client,
-        KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
-    );
-    assert_eq!(app.overlays.toasts.len(), 1);
+    approval::handle_key(&mut app, &stub(), key(KeyCode::Enter));
+    assert!(app.overlays.notice.is_some());
 
     approval::apply_event(
         &mut app,
@@ -202,14 +196,14 @@ fn answering_approval_keeps_unrelated_toasts() {
             callback_id: "approval-1".into(),
         },
     );
-    assert_eq!(app.overlays.toasts.len(), 1);
+    assert!(app.overlays.notice.is_some());
 }
 
 #[test]
 fn approval_character_shortcuts_require_no_modifiers() {
-    let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
-    let bare_y = KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE);
-    let ctrl_y = KeyEvent::new(KeyCode::Char('y'), KeyModifiers::CONTROL);
+    let enter = key(KeyCode::Enter);
+    let bare_y = key(KeyCode::Char('y'));
+    let ctrl_y = ctrl('y');
     let alt_three = KeyEvent::new(KeyCode::Char('3'), KeyModifiers::ALT);
 
     assert_eq!(approval::key_action(&enter), Some(KeyAction::Submit));
@@ -224,7 +218,7 @@ async fn approval_callback_is_acknowledged_and_forwarded_without_auto_approval()
     // `notif_tx`), so the receiver is unused; the sender still wires `DenyWiring`.
     let (notification_tx, _notifications) = mpsc::channel(1);
     let (writer_tx, mut writer) = mpsc::unbounded_channel();
-    let pending: Pending = Arc::new(Mutex::new(HashMap::new()));
+    let pending = Pending::default();
     let active_session: ActiveSession = Arc::new(Mutex::new(None));
     let next_request_id = AtomicU64::new(1);
     let callback = json!({
@@ -270,7 +264,7 @@ async fn approval_callback_is_acknowledged_and_forwarded_without_auto_approval()
 async fn denial_without_session_id_falls_back_to_the_active_session() {
     let (notification_tx, _notifications) = mpsc::channel(1);
     let (writer_tx, mut writer) = mpsc::unbounded_channel();
-    let pending: Pending = Arc::new(Mutex::new(HashMap::new()));
+    let pending = Pending::default();
     let active_session: ActiveSession = Arc::new(Mutex::new(Some("session-live".to_owned())));
     let next_request_id = AtomicU64::new(1);
     // Tolerated older backend shape: no `sessionId` (ADR 0014).
@@ -308,5 +302,5 @@ async fn denial_without_session_id_falls_back_to_the_active_session() {
     );
     // The deny result is registered so a rejection is delivered, not dropped.
     let deny_id = deny["id"].as_u64().unwrap();
-    assert!(pending.lock().unwrap().contains_key(&deny_id));
+    assert!(pending.take(deny_id).is_some());
 }

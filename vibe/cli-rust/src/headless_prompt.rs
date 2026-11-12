@@ -1,6 +1,7 @@
-//! Piped-prompt reading: bounded, mirroring Python `get_prompt_from_stdin`.
+//! Bounded piped-prompt reading.
 
 use std::io::IsTerminal;
+use std::path::Path;
 
 use tokio::io::AsyncReadExt;
 
@@ -8,12 +9,50 @@ use tokio::io::AsyncReadExt;
 /// cap keeps a hostile pipe from exhausting memory before the app-server starts.
 pub const MAX_STDIN_PROMPT_BYTES: usize = 1024 * 1024;
 
+/// Maximum prompt file size: 1 MiB, same as the stdin cap.
+pub const MAX_PROMPT_FILE_BYTES: u64 = 1024 * 1024;
+
 /// What the piped bytes decode to.
 pub enum PipedPrompt {
     Prompt(String),
     TooLarge,
     InvalidUtf8,
     Empty,
+}
+
+/// Read a prompt from a file, with bounded size.
+/// Returns the trimmed content. An empty file yields an empty string so the
+/// caller can fall back to stdin.
+/// Returns an error message suitable for stderr on I/O or size-cap failures.
+pub fn read_prompt_file(path: &Path) -> Result<String, String> {
+    read_text_file(path, "prompt file")
+}
+
+/// An empty file is an error here: it would silently keep the product prompt.
+pub fn read_system_prompt_file(path: &Path) -> Result<String, String> {
+    let content = read_text_file(path, "system prompt file")?;
+    if content.is_empty() {
+        return Err(format!(
+            "The system prompt file {} is empty",
+            path.display()
+        ));
+    }
+    Ok(content)
+}
+
+fn read_text_file(path: &Path, what: &str) -> Result<String, String> {
+    let metadata = std::fs::metadata(path)
+        .map_err(|e| format!("Cannot read the {what} {}: {e}", path.display()))?;
+    if metadata.len() > MAX_PROMPT_FILE_BYTES {
+        return Err(format!(
+            "Cannot read the {what} {}: file exceeds {} bytes",
+            path.display(),
+            MAX_PROMPT_FILE_BYTES
+        ));
+    }
+    let content = std::fs::read_to_string(path)
+        .map_err(|e| format!("Cannot read the {what} {}: {e}", path.display()))?;
+    Ok(content.trim().to_owned())
 }
 
 /// Cap on raw bytes: a cutoff splitting a multibyte char still reports the limit.
@@ -32,7 +71,7 @@ pub fn parse_piped_prompt(bytes: Vec<u8>) -> PipedPrompt {
     }
 }
 
-/// Read stdin if it is piped (not a tty), mirroring `get_prompt_from_stdin`.
+/// Read stdin if it is piped (not a tty).
 pub async fn read_stdin_prompt() -> Option<String> {
     if std::io::stdin().is_terminal() {
         return None;
@@ -63,7 +102,7 @@ pub async fn read_stdin_prompt() -> Option<String> {
     }
 }
 
-/// Point stdin back at the terminal after a piped prompt drained it, so the TUI reads keys (Python `sys.stdin = open("/dev/tty")`).
+/// Point stdin back at the terminal after a piped prompt drained it, so the TUI reads keys.
 #[cfg(unix)]
 fn reattach_controlling_tty() {
     use std::io::IsTerminal;
@@ -83,7 +122,7 @@ fn reattach_controlling_tty() {
         unsafe { libc::dup2(2, 0) };
         return;
     }
-    // Last resort when neither std stream is the terminal, mirroring Python.
+    // Last resort when neither std stream is the terminal.
     let tty = std::fs::OpenOptions::new()
         .read(true)
         .write(true)

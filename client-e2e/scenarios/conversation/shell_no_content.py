@@ -3,12 +3,12 @@
 from __future__ import annotations
 
 from e2e.app_server.events import bash, turn_completed, turn_started, user_msg
-from e2e.app_server.scenario import Timeline
+from e2e.app_server.scenario import Timeline, take_snapshot
 
 _PROMPT = "run the silent command"
 
-# The settled disclosure header lands on SGR row 15.
-_CLICK = "\x1b[<0;1;15M\x1b[<0;1;15m"
+# The settled disclosure header lands on SGR row 11.
+_CLICK = "\x1b[<0;1;11M\x1b[<0;1;11m"
 
 timeline: Timeline = [
     f"{_PROMPT}\r",
@@ -17,4 +17,5 @@ timeline: Timeline = [
     bash("cd /tmp", stdout=""),
     turn_completed(),
     _CLICK,
+    take_snapshot(),
 ]

@@ -79,10 +79,74 @@ fn matching_lists_immediate_children_of_a_path_prefix() {
     assert_eq!(found, vec!["@src/main.rs", "@src/util/"]);
 }
 
+fn tree_with_a_large_early_directory() -> BTreeMap<String, bool> {
+    let mut index = paths(&[
+        ("README.md", false),
+        ("data", true),
+        ("data/zz", true),
+        ("data/zz/last.txt", false),
+        ("zebra.txt", false),
+    ]);
+    // More entries than the fuzzy scan cap.
+    index.extend((0..40_000).map(|n| (format!("data/{n:05}.bin"), false)));
+    index
+}
+
+#[test]
+fn matching_lists_root_entries_sorted_after_a_large_directory() {
+    let found = matching(&tree_with_a_large_early_directory(), "", 100);
+    assert_eq!(found, vec!["@README.md", "@data/", "@zebra.txt"]);
+}
+
+#[test]
+fn matching_lists_children_sorted_after_a_large_sibling_tree() {
+    let found = matching(&tree_with_a_large_early_directory(), "data/zz/", 100);
+    assert_eq!(found, vec!["@data/zz/last.txt"]);
+}
+
 #[test]
 fn matching_falls_back_to_fuzzy_when_the_prefix_has_no_children() {
     let index = paths(&[("src/main.rs", false)]);
     assert_eq!(matching(&index, "docs/", 10), Vec::<String>::new());
+}
+
+fn nested_tree() -> BTreeMap<String, bool> {
+    paths(&[
+        ("src", true),
+        ("src/main.py", false),
+        ("src/utils", true),
+        ("src/utils/config.py", false),
+        ("src/utils/error_handling.py", false),
+        ("src/utils/logger.py", false),
+        ("vibe", true),
+        ("vibe/acp", true),
+        ("vibe/acp/agent.py", false),
+        ("vibe/acp/entrypoint.py", false),
+    ])
+}
+
+#[test]
+fn a_path_query_matches_a_file_by_subsequence() {
+    let found = matching(&nested_tree(), "src/utils/handling", 10);
+    assert_eq!(found, vec!["@src/utils/error_handling.py"]);
+}
+
+#[test]
+fn a_path_query_matches_word_boundary_initials() {
+    let found = matching(&nested_tree(), "src/utils/eh", 10);
+    assert!(
+        found.contains(&"@src/utils/error_handling.py".to_owned()),
+        "{found:?}"
+    );
+}
+
+#[test]
+fn a_partial_path_starting_mid_path_finds_the_nested_file() {
+    let found = matching(&nested_tree(), "acp/entry", 10);
+    assert_eq!(
+        found.first().map(String::as_str),
+        Some("@vibe/acp/entrypoint.py")
+    );
 }
 
 #[test]

@@ -1,7 +1,6 @@
 //! Client-to-server prompt-queue requests: enqueue, replace and remove.
 
 use std::sync::Arc;
-use std::time::Instant;
 
 use serde_json::json;
 
@@ -81,7 +80,7 @@ pub(super) fn enqueue_prompt_with_images(
     }
 }
 
-/// Send prompts held until Python's `_session_ready` equivalent is set.
+/// Send prompts held until the session is ready.
 pub fn flush_pending(app: &mut App, client: &Arc<Client>) {
     let unsent: Vec<(String, String)> = app
         .queue
@@ -95,7 +94,7 @@ pub fn flush_pending(app: &mut App, client: &Arc<Client>) {
     }
 }
 
-/// Release a queue the server paused (Python `QueueController.resume`).
+/// Release a queue the server paused.
 pub fn resume(app: &mut App, client: &Arc<Client>) {
     if !app.queue.paused {
         return;
@@ -105,7 +104,7 @@ pub fn resume(app: &mut App, client: &Arc<Client>) {
         return;
     };
     let client = client.clone();
-    tokio::spawn(async move {
+    crate::work::spawn(async move {
         let _ = request(
             &client,
             method::TURN_QUEUE_RESUME,
@@ -115,7 +114,7 @@ pub fn resume(app: &mut App, client: &Arc<Client>) {
     });
 }
 
-/// Remove the highlighted prompt (Python `QueueController.pop_at`).
+/// Remove the highlighted prompt.
 pub fn remove_selected(app: &mut App, client: &Arc<Client>) {
     if let Some(index) = app.queue.selected_position() {
         remove_at(app, client, index);
@@ -130,7 +129,7 @@ pub fn has_removable(app: &App) -> bool {
         .is_some_and(|item| app.view.transcript.is_pending(&item.message_id))
 }
 
-/// Remove the newest queued prompt, the Ctrl+C step of Python's quit ladder.
+/// Remove the newest queued prompt, the Ctrl+C step of the quit ladder.
 pub fn pop_last(app: &mut App, client: &Arc<Client>) -> bool {
     if !has_removable(app) {
         return false;
@@ -145,6 +144,7 @@ pub fn pop_last(app: &mut App, client: &Arc<Client>) -> bool {
 fn remove_at(app: &mut App, client: &Arc<Client>, index: usize) {
     let item = drop_item(app, index);
     app.view.transcript.remove(&item.message_id);
+    super::events::settle_completion(app);
     let (Some(session_id), Some(queue_item_id)) =
         (app.session.session_id.clone(), item.queue_item_id)
     else {
@@ -161,7 +161,7 @@ fn remove_at(app: &mut App, client: &Arc<Client>, index: usize) {
         return;
     }
     let client = client.clone();
-    tokio::spawn(async move {
+    crate::work::spawn(async move {
         let params = TurnQueueRemoveParams {
             session_id,
             queue_item_id,
@@ -170,7 +170,7 @@ fn remove_at(app: &mut App, client: &Arc<Client>, index: usize) {
     });
 }
 
-/// Prepare the prompt then enqueue it, as Python's `_send_prompt` does.
+/// Prepare the prompt then enqueue it.
 fn send(app: &mut App, client: &Arc<Client>, message_id: String, text: String) {
     let Some(session_id) = app.session.session_id.clone() else {
         return;
@@ -187,15 +187,13 @@ fn send(app: &mut App, client: &Arc<Client>, message_id: String, text: String) {
     };
     if matches!(app.session.status, Status::Ready) && !app.compacting {
         app.set_status(Status::Generating {
-            since: Instant::now(),
+            since: crate::clock::now(),
         });
     }
-    let tx = app.queue.tx.clone();
-    let pending = app.commit_started();
     let client = client.clone();
     let pastes = app.chat_input.collapsed_pastes.clone();
-    tokio::spawn(async move {
-        let event = match prepare(&client, &session_id, &text, &existing_images).await {
+    crate::ui_event::spawn(app, async move {
+        match prepare(&client, &session_id, &text, &existing_images).await {
             Ok(mut prepared) => {
                 merge_edit_images(&mut prepared, &existing_images, &text);
                 let images = prepared.images.clone();
@@ -239,7 +237,6 @@ fn send(app: &mut App, client: &Arc<Client>, message_id: String, text: String) {
                 message_id,
                 error: Some(error),
             },
-        };
-        crate::input::deliver(tx, event, &pending).await;
+        }
     });
 }

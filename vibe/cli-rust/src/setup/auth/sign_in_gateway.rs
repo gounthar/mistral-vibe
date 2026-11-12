@@ -1,10 +1,23 @@
-//! HTTP gateway for browser sign-in (Python `HttpBrowserSignInGateway`).
+//! HTTP gateway for browser sign-in.
 
 use std::time::Duration;
 
 use serde::Deserialize;
 
 use super::sign_in_url::validate_url;
+
+/// The error joined with its source chain, so messages name the real transport
+/// cause (DNS, connect, TLS, proxy) instead of reqwest's opaque url wrapper.
+pub fn request_error_details(error: &reqwest::Error) -> String {
+    let mut details = error.to_string();
+    let mut source = std::error::Error::source(error);
+    while let Some(cause) = source {
+        details.push_str(": ");
+        details.push_str(&cause.to_string());
+        source = cause.source();
+    }
+    details
+}
 
 /// Error from the browser sign-in gateway.
 #[derive(Debug, Clone)]
@@ -27,7 +40,7 @@ pub struct SignInProcess {
     pub process_id: String,
     pub sign_in_url: String,
     pub poll_url: String,
-    /// The server-side sign-in deadline (Python `expires_at`).
+    /// The server-side sign-in deadline.
     pub expires_at: time::OffsetDateTime,
 }
 
@@ -44,9 +57,12 @@ pub struct SignInGateway {
     browser_base_url: String,
     api_base_url: String,
     /// Split-horizon sign-in: sign-in URLs may legitimately live on another
-    /// origin than the console base (Python `allow_origin_rewrite`).
+    /// origin than the console base.
     allow_origin_rewrite: bool,
     client: reqwest::Client,
+    /// The effective proxy for the API base's scheme, named in transport
+    /// failures so a refused connect says which proxy it could not reach.
+    pub proxy: Option<String>,
 }
 
 impl SignInGateway {
@@ -61,15 +77,33 @@ impl SignInGateway {
             enable_system_trust_store,
         )
         .map_err(|e| SignInError {
-            message: format!("Failed to start browser sign-in: {e}"),
+            message: format!(
+                "Failed to start browser sign-in: {}",
+                request_error_details(&e)
+            ),
             code: SignInErrorCode::StartFailed,
         })?;
+        let scheme = url::Url::parse(api_base_url)
+            .map(|base| base.scheme().to_owned())
+            .unwrap_or_else(|_| "https".to_owned());
         Ok(Self {
             browser_base_url: browser_base_url.trim_end_matches('/').to_owned(),
             api_base_url: api_base_url.trim_end_matches('/').to_owned(),
             allow_origin_rewrite,
+            proxy: crate::utils::system_proxy::proxy_for_scheme(&scheme),
             client,
         })
+    }
+
+    /// The error joined with its source chain, so messages name the real transport
+    /// cause (DNS, connect, TLS, proxy) instead of reqwest's opaque url wrapper,
+    /// plus the effective proxy when one is configured.
+    fn transport_details(&self, error: &reqwest::Error) -> String {
+        let mut details = request_error_details(error);
+        if let Some(proxy) = &self.proxy {
+            details.push_str(&format!(" (via proxy {proxy})"));
+        }
+        details
     }
 
     /// Create a sign-in process with a PKCE code challenge.
@@ -85,7 +119,10 @@ impl SignInGateway {
             .send()
             .await
             .map_err(|e| SignInError {
-                message: format!("Failed to start browser sign-in: {e}"),
+                message: format!(
+                    "Failed to start browser sign-in: {}",
+                    self.transport_details(&e)
+                ),
                 code: SignInErrorCode::StartFailed,
             })?;
         if !response.status().is_success() {
@@ -110,7 +147,7 @@ impl SignInGateway {
             self.allow_origin_rewrite,
             SignInErrorCode::StartFailed,
         )?;
-        // Python `_parse_expires_at`: RFC 3339 with a Z suffix.
+        // RFC 3339 with a Z suffix.
         let expires_at = time::OffsetDateTime::parse(
             &payload.expires_at,
             &time::format_description::well_known::Rfc3339,
@@ -141,7 +178,10 @@ impl SignInGateway {
             .send()
             .await
             .map_err(|e| SignInError {
-                message: format!("Browser sign-in poll failed: {e}"),
+                message: format!(
+                    "Browser sign-in poll failed: {}",
+                    self.transport_details(&e)
+                ),
                 code: SignInErrorCode::PollFailed,
             })?;
         if response.status().as_u16() == 410 {
@@ -186,7 +226,7 @@ impl SignInGateway {
             .send()
             .await
             .map_err(|e| SignInError {
-                message: format!("Exchange failed: {e}"),
+                message: format!("Exchange failed: {}", self.transport_details(&e)),
                 code: SignInErrorCode::ExchangeFailed,
             })?;
         if !response.status().is_success() {

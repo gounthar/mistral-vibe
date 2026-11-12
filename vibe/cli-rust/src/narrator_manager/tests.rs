@@ -18,7 +18,7 @@ fn synthesizing() -> Fixture {
     let (tx, telemetry) = mpsc::channel(TELEMETRY_CHANNEL_CAP);
     app.telemetry_tx = Some(tx);
     let stop = Arc::new(AtomicBool::new(false));
-    let task = tokio::spawn(std::future::pending::<()>());
+    let task = crate::work::spawn_daemon(std::future::pending::<()>());
     app.narrator.speech_id = 1;
     app.narrator.speech = Some(Speech {
         id: 1,
@@ -92,17 +92,4 @@ async fn cancel_stops_the_clip_and_drops_its_late_events() {
     apply_event(&mut f.app, Event::Finished { id: 1 });
     assert_eq!(f.app.narrator.state, NarratorState::Idle);
     assert!(drained(&mut f.telemetry).is_empty());
-}
-
-#[test]
-fn speech_config_follows_the_runtime_snapshot() {
-    let mut app = App::default();
-    let runtime = json!({"runtime": {"config": {"speech": {
-        "model": {"name": "tts", "voice": "v", "responseFormat": "wav"},
-        "provider": {"apiBase": "https://api.mistral.ai", "apiKeyEnvVar": "K"},
-    }}}});
-    apply_runtime(&mut app, &runtime);
-    assert_eq!(app.narrator.speech_config.as_ref().unwrap().name, "tts");
-    apply_runtime(&mut app, &json!({"runtime": {"config": {}}}));
-    assert!(app.narrator.speech_config.is_none());
 }

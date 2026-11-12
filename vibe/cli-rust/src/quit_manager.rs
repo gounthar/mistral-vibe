@@ -1,6 +1,8 @@
-//! Double-press quit confirmation (Python `QuitManager`).
+//! Double-press quit confirmation.
 
-use std::time::{Duration, Instant};
+use std::time::Duration;
+
+use crate::clock::UiInstant;
 
 /// Window in which a second press of the same key confirms quit.
 pub const QUIT_CONFIRM_DELAY: Duration = Duration::from_secs(1);
@@ -23,14 +25,14 @@ impl QuitConfirmKey {
 #[derive(Clone, Debug)]
 pub struct QuitPending {
     pub key: QuitConfirmKey,
-    pub at: Instant,
+    pub at: UiInstant,
     /// Queue warning frozen when quit was armed, empty when nothing is queued.
     pub extra: String,
 }
 
 pub struct QuitManager {
     pending: Option<QuitPending>,
-    /// Python `ask_confirmation_on_exit`; only gates Ctrl+D.
+    /// The `ask_confirmation_on_exit` setting; only gates Ctrl+D.
     pub ask_confirmation_on_exit: bool,
 }
 
@@ -48,7 +50,7 @@ impl QuitManager {
     pub fn active(&self) -> Option<&QuitPending> {
         self.pending
             .as_ref()
-            .filter(|pending| pending.at.elapsed() < QUIT_CONFIRM_DELAY)
+            .filter(|pending| crate::clock::since(pending.at) < QUIT_CONFIRM_DELAY)
     }
 
     pub fn is_confirmed(&self, key: QuitConfirmKey) -> bool {
@@ -58,7 +60,7 @@ impl QuitManager {
     pub fn request_confirmation(&mut self, key: QuitConfirmKey, queued: usize) {
         self.pending = Some(QuitPending {
             key,
-            at: Instant::now(),
+            at: crate::clock::now(),
             extra: quit_warning_extra(queued),
         });
     }
@@ -68,7 +70,7 @@ impl QuitManager {
     }
 }
 
-/// Python `QueueController.quit_warning_extra`.
+/// The quit warning's note about queued messages.
 pub fn quit_warning_extra(queued: usize) -> String {
     match queued {
         0 => String::new(),

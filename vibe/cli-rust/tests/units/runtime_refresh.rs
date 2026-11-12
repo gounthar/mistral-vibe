@@ -1,4 +1,4 @@
-//! Runtime refreshes preserve live completion and agent choices.
+//! Runtime refreshes preserve live completion and agent choices, and apply live display settings.
 
 use serde_json::json;
 use vibe_rs::app::{App, Status};
@@ -48,12 +48,43 @@ fn runtime_refresh_does_not_reset_the_painted_agent_to_the_default() {
     app.set_status(Status::Ready);
     app.agents.active = agent("ask");
     let config = StartupConfig {
-        default_agent: "plan".into(),
-        agents: vec![agent("ask"), agent("plan")],
+        default_agent: "auto-approve".into(),
+        agents: vec![agent("ask"), agent("auto-approve")],
         ..Default::default()
     };
 
     agents::show_startup_agents(&mut app, &config);
 
     assert_eq!(app.agents.active.name, "ask");
+}
+
+#[test]
+fn a_runtime_update_hides_reasoning_when_show_thinking_nodes_turns_off() {
+    let mut app = App::default();
+    app.view
+        .transcript
+        .add(&json!({"entry": {"id": "r1", "type": "reasoning", "text": "thinking"}}));
+    app.view.transcript.set_show_reasoning(true);
+    assert!(!app.view.transcript.is_empty());
+    let reasoning = json!({"id": "r2", "type": "reasoning", "text": "thinking"});
+    app.subagents
+        .transcripts
+        .replace_history("child", vec![reasoning], true, true);
+    let child_is_empty = |app: &App| {
+        app.subagents
+            .transcripts
+            .child("child")
+            .unwrap()
+            .transcript
+            .is_empty()
+    };
+    assert!(!child_is_empty(&app));
+
+    event_handler::apply_runtime_value(
+        &mut app,
+        &json!({"runtime": {"config": {"showThinkingNodes": false}}}),
+    );
+
+    assert!(app.view.transcript.is_empty());
+    assert!(child_is_empty(&app));
 }

@@ -1,8 +1,7 @@
-//! Wizard seeding from the server's resolved view (`setup/status`), the
-//! Python `OnboardingContext` equivalent: the server owns the config read;
-//! the client keeps only the `VIBE_THEME` override (env wins over config),
-//! and the browser-sign-in answer comes off the wire, not a URL-presence
-//! guess.
+//! Wizard seeding from the server's resolved view (`setup/status`): the
+//! server owns the config read; the client keeps only the `VIBE_THEME`
+//! override (env wins over config), and the browser-sign-in answer comes
+//! off the wire, not a URL-presence guess.
 
 #[path = "../onboarding_common/status.rs"]
 pub(crate) mod status;
@@ -63,4 +62,32 @@ fn a_provider_without_auth_urls_maps_to_the_wizard_empty_state() {
     wizard::seed(&mut wizard, &status);
     assert!(wizard.context.provider.browser_auth_base_url.is_none());
     assert!(!wizard.context.supports_browser_sign_in);
+}
+
+#[test]
+fn a_shell_key_in_use_arms_the_override_warning() {
+    let mut wizard = OnboardingState::default();
+    wizard::seed(
+        &mut wizard,
+        &SetupStatus {
+            active_credential_source: Some("process_env".into()),
+            ..status()
+        },
+    );
+    assert_eq!(
+        wizard.context.shell_key_override.as_deref(),
+        Some("MISTRAL_API_KEY")
+    );
+
+    for source in [None, Some("vibe_home_env_file"), Some("os_keyring")] {
+        let mut wizard = OnboardingState::default();
+        wizard::seed(
+            &mut wizard,
+            &SetupStatus {
+                active_credential_source: source.map(str::to_owned),
+                ..status()
+            },
+        );
+        assert_eq!(wizard.context.shell_key_override, None, "{source:?}");
+    }
 }

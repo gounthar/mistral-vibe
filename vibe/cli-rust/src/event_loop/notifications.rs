@@ -44,6 +44,7 @@ pub fn surface_server_close(app: &mut App, crashed: bool) -> bool {
     // stay inert (`Failed` locks it, submit, and queue edits) until the user
     // restarts the CLI. The crash notice in the transcript carries the message.
     let during_startup = matches!(app.session.status, crate::app::Status::Starting);
+    crate::program_status::reset_shell(app);
     app.set_status(crate::app::Status::Failed);
     app.session.startup_error = Some(
         if during_startup {
@@ -53,6 +54,8 @@ pub fn surface_server_close(app: &mut App, crashed: bool) -> bool {
         }
         .to_string(),
     );
+    app.terminal_notifier
+        .set_error_message(app.session.startup_error.as_deref().unwrap());
     let id = format!("rs-server-closed-{}", app.view.transcript.revision());
     crate::transcript::local::add_notice(
         &mut app.view.transcript,

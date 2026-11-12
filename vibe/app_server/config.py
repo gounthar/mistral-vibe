@@ -6,12 +6,18 @@ from pydantic import Field
 
 from vibe.app_server._model import ProtocolModel
 from vibe.config_values import (
+    DEFAULT_THINKING_LEVELS as DEFAULT_THINKING_LEVELS,
     THINKING_LEVELS as THINKING_LEVELS,
     AudioClient,
     SpeechOutputFormat,
     ThinkingLevel as ThinkingLevel,
     TranscriptionEncoding,
 )
+
+# Where a model comes from, as the pickers group it: `project` covers project
+# config, agent profile, env and session overrides; `local` the user config and
+# built-ins.
+ModelSource = Literal["admin", "growthbook", "catalog", "project", "local"]
 
 
 class ModelConfigView(ProtocolModel):
@@ -23,14 +29,19 @@ class ModelConfigView(ProtocolModel):
     # None when the model's window is unknown; defaulted so older clients
     # tolerate the field's absence (ADR 0014).
     max_context_length: int | None = None
+    auto_compact_threshold: int | None = None
     # The levels the active model offers; defaulted so a client against an
     # older server still renders the five (ADR 0014).
     thinking_levels: list[ThinkingLevel] = Field(
-        default_factory=lambda: list(THINKING_LEVELS)
+        default_factory=lambda: list(DEFAULT_THINKING_LEVELS)
     )
     # Expected delivery of file-backed images; None means the runtime has not
     # advertised a delivery mode. Native model support alone is not a fallback policy.
     image_delivery: Literal["native", "resource_link"] | None = None
+    # The group the model is listed under, from the highest-priority layer that
+    # defines it; None from an older server (ADR 0014) or when no known layer
+    # defines it.
+    source: ModelSource | None = None
 
 
 class TranscribeModelConfigView(ProtocolModel):
@@ -85,8 +96,16 @@ class ConfigView(ProtocolModel):
     disable_welcome_banner_animation: bool
     # Preserve blinking when reading an older app-server response (ADR 0014).
     cursor_blink: bool = True
+    # Preserve the plain input when reading an older app-server response (ADR 0014).
+    vim_keybindings: bool = False
     show_greeting: bool
     autocopy_to_clipboard: bool
+    # Preserve mouse capture when reading an older app-server response (ADR 0014).
+    enable_mouse_capture: bool = True
+    # Preserve the pinned prompt when reading an older app-server response (ADR 0014).
+    enable_sticky_prompt: bool = True
+    # Preserve @ file completion when reading an older app-server response (ADR 0014).
+    enable_file_autocomplete: bool = True
     file_watcher_for_autocomplete: bool
     ask_confirmation_on_exit: bool
     voice_mode_enabled: bool
@@ -104,6 +123,8 @@ class ConfigView(ProtocolModel):
     # Datalake events stay server-gated; clients never decide that.
     enable_telemetry: bool = True
     experimental_enable_registry_skills: bool = False
+    experimental_enable_local_projects: bool = False
+    enable_pr_monitoring: bool = True
     models: list[ModelConfigView]
     transcribe_models: list[str]
     tts_models: list[str]

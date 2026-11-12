@@ -6,11 +6,18 @@ use crate::core::action_id;
 use crate::core::error::CoreError;
 use crate::core::features::permissions::GrantKey;
 use crate::core::features::programmatic_tool_calling::ProgrammaticName;
+use crate::core::features::programmatic_tool_calling::execution::serialized_len;
 use crate::core::features::programmatic_tool_calling::model::{
     PartialEvaluation, ToolFunction, ToolKind, ToolState,
 };
-use crate::core::hooks::{HookCall, HookPoint, hook_action_id};
-use crate::core::step_protocol::Action;
+use crate::core::features::programmatic_tool_calling::time_budget::{
+    ProgramClock, is_shortened_sleep, shortened_sleep_result, sleep_seconds,
+};
+use crate::core::hooks::{HookPoint, hook_action_id};
+use crate::core::step_protocol::{Action, Observation};
+use crate::core::tools::execution::external_call::{
+    ApprovalName, ExternalCallStage, HookSide, PendingExternalCall,
+};
 use crate::core::tools::external::{
     ExternalTool, ExternalToolCall, ToolOrigin, effect_id_for_operation,
 };
@@ -18,28 +25,24 @@ use crate::core::wire::content::ContentBlock;
 use crate::core::wire::tool::{StructuredContent, ToolResult};
 
 #[derive(Clone, Debug, PartialEq)]
-pub(super) struct PendingProgramOperation {
-    call: ExternalToolCall,
-    stage: ProgramOperationStage,
+pub(crate) struct PendingProgramOperation {
+    pub(crate) external: PendingExternalCall,
+    /// For a sent sleep: its length after pre-tool hooks, before Core fit it
+    /// to the time budget. `None` for other calls, and for sleeps restored
+    /// from checkpoints that did not record it.
+    pub(crate) requested_sleep_seconds: Option<f64>,
 }
 
-#[allow(clippy::large_enum_variant)]
-#[derive(Clone, Debug, PartialEq)]
-enum ProgramOperationStage {
-    AwaitingPreHook {
-        hook_action_id: String,
-        hook_binding_ids: Vec<String>,
-    },
-    AwaitingApproval {
-        approval_action_id: String,
-        grant_key: GrantKey,
-        programmatic_name: ProgrammaticName,
-    },
-    Pending,
-    AwaitingPostHook {
-        hook_action_id: String,
-        hook_binding_ids: Vec<String>,
-        result: ToolResult,
+/// How far an unfinished program operation got before its program stopped.
+pub(super) enum UnfinishedOperation {
+    /// Waiting for a pre-tool-call hook or an approval: the tool never ran.
+    NotStarted,
+    /// Sent to the Runtime: the tool may have had effects.
+    Running,
+    /// The tool ran; only its post-tool-call hook was left.
+    Finished {
+        /// The tool returned a failure.
+        failed: bool,
     },
 }
 
@@ -48,18 +51,21 @@ pub(crate) struct ProgramExecution {
     partial_evaluation: PartialEvaluation,
     pending_operations: Vec<PendingProgramOperation>,
     round: u32,
+    clock: ProgramClock,
 }
 
 #[derive(Debug)]
 pub(super) struct ProgramContinuation {
     pub(super) partial_evaluation: PartialEvaluation,
     pub(super) round: u32,
+    pub(super) clock: ProgramClock,
 }
 
 impl ProgramContinuation {
     pub(super) fn after_round(
         partial_evaluation: PartialEvaluation,
         round: u32,
+        clock: ProgramClock,
     ) -> Result<Self, CoreError> {
         let round = round
             .checked_add(1)
@@ -67,20 +73,8 @@ impl ProgramContinuation {
         Ok(Self {
             partial_evaluation,
             round,
+            clock,
         })
-    }
-}
-
-pub(super) enum PendingProgramHook<'a> {
-    Pre(&'a ExternalToolCall),
-    Post(&'a ExternalToolCall),
-}
-
-impl PendingProgramHook<'_> {
-    pub(super) fn call(&self) -> &ExternalToolCall {
-        match self {
-            Self::Pre(call) | Self::Post(call) => call,
-        }
     }
 }
 
@@ -103,7 +97,7 @@ pub(crate) enum ProgramOperationRecord {
     ExternalPending {
         id: String,
         function: ProgramFunctionRecord,
-        pending: Box<PendingProgramRecord>,
+        pending: Box<PendingProgramOperation>,
     },
     ExternalResolved {
         id: String,
@@ -119,39 +113,19 @@ pub(crate) enum ProgramOperationRecord {
     },
 }
 
-#[allow(clippy::large_enum_variant)]
-#[derive(Clone, Debug, PartialEq)]
-pub(crate) enum PendingProgramRecord {
-    AwaitingPreHook {
-        call: ExternalToolCall,
-        hook_action_id: String,
-        hook_binding_ids: Vec<String>,
-    },
-    AwaitingApproval {
-        call: ExternalToolCall,
-        approval_action_id: String,
-        grant_key: GrantKey,
-        programmatic_name: ProgrammaticName,
-    },
-    Pending {
-        call: ExternalToolCall,
-    },
-    AwaitingPostHook {
-        call: ExternalToolCall,
-        hook_action_id: String,
-        hook_binding_ids: Vec<String>,
-        result: ToolResult,
-    },
-}
-
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct ProgramCapture {
     source: String,
     operations: Vec<ProgramOperationRecord>,
     round: u32,
+    clock: ProgramClock,
 }
 
 impl ProgramCapture {
+    pub(crate) fn clock(&self) -> ProgramClock {
+        self.clock
+    }
+
     pub(crate) fn source(&self) -> &str {
         &self.source
     }
@@ -166,24 +140,19 @@ impl ProgramCapture {
 }
 
 impl PendingProgramOperation {
-    pub(super) fn awaiting_pre_hook(
-        call: ExternalToolCall,
-        hook_action_id: String,
-        hook_binding_ids: Vec<String>,
-    ) -> Self {
+    pub(super) fn awaiting_pre_hook(call: ExternalToolCall, hook_binding_ids: Vec<String>) -> Self {
         Self {
-            call,
-            stage: ProgramOperationStage::AwaitingPreHook {
-                hook_action_id,
-                hook_binding_ids,
-            },
+            external: PendingExternalCall::awaiting_pre_hook(call, hook_binding_ids),
+            requested_sleep_seconds: None,
         }
     }
 
-    pub(super) fn pending(call: ExternalToolCall) -> Self {
+    /// An operation sent as `call`, which Core fit to the time budget from
+    /// `requested`.
+    pub(super) fn pending(requested: &ExternalToolCall, call: ExternalToolCall) -> Self {
         Self {
-            call,
-            stage: ProgramOperationStage::Pending,
+            external: PendingExternalCall::pending(call),
+            requested_sleep_seconds: sleep_seconds(requested),
         }
     }
 
@@ -193,12 +162,12 @@ impl PendingProgramOperation {
         programmatic_name: ProgrammaticName,
     ) -> Self {
         Self {
-            stage: ProgramOperationStage::AwaitingApproval {
-                approval_action_id: action_id::approval(&call.action_id),
+            external: PendingExternalCall::awaiting_approval(
+                call,
                 grant_key,
-                programmatic_name,
-            },
-            call,
+                ApprovalName::Programmatic(programmatic_name),
+            ),
+            requested_sleep_seconds: None,
         }
     }
 }
@@ -218,7 +187,17 @@ pub(super) fn resolve_tool_state(
     let ToolState::Pending { kind, id, function } = operation.clone() else {
         unreachable!();
     };
-    *operation = match result {
+    *operation = settled_tool_state(kind, id, function, result);
+    Ok(())
+}
+
+fn settled_tool_state(
+    kind: ToolKind,
+    id: String,
+    function: ToolFunction,
+    result: ToolResult,
+) -> ToolState {
+    match result {
         ToolResult::Failure {
             content,
             structured_content,
@@ -261,8 +240,7 @@ pub(super) fn resolve_tool_state(
                 content: retained_program_content(content),
             }
         }
-    };
-    Ok(())
+    }
 }
 
 impl ProgramExecution {
@@ -270,55 +248,112 @@ impl ProgramExecution {
         partial_evaluation: PartialEvaluation,
         pending_operations: Vec<PendingProgramOperation>,
         round: u32,
+        clock: ProgramClock,
+        now_unix_ms: u64,
     ) -> Self {
-        Self {
+        let mut execution = Self {
             partial_evaluation,
             pending_operations,
             round,
+            clock,
+        };
+        execution.sync_clock(now_unix_ms);
+        execution
+    }
+
+    /// Pauses the budget clock while an operation waits for an approval or a
+    /// hook, and runs it otherwise.
+    pub(super) fn sync_clock(&mut self, now_unix_ms: u64) {
+        let waiting = self
+            .pending_operations
+            .iter()
+            .any(|operation| !matches!(operation.external.stage, ExternalCallStage::Pending));
+        self.clock.set_paused(waiting, now_unix_ms);
+    }
+
+    /// Turns a sleep that the time budget cut short into its catchable budget
+    /// failure.
+    pub(super) fn settle_sleep_result(
+        &mut self,
+        action_id: &str,
+        result: ToolResult,
+        budget_ms: u64,
+        now_unix_ms: u64,
+    ) -> ToolResult {
+        let Some(operation) = self
+            .pending_operations
+            .iter()
+            .find(|operation| operation.external.awaits_tool(action_id))
+        else {
+            return result;
+        };
+        let call = &operation.external.call;
+        // Checkpoints that did not record the requested length fall back to
+        // the length the program asked for.
+        let requested_seconds = operation.requested_sleep_seconds.or_else(|| {
+            self.partial_evaluation
+                .tool_state
+                .iter()
+                .find_map(|operation| match operation {
+                    ToolState::Pending { id, function, .. } if *id == call.call_id => {
+                        function.arguments.get("seconds").and_then(Value::as_f64)
+                    }
+                    _ => None,
+                })
+        });
+        let shortened = requested_seconds
+            .is_some_and(|requested_seconds| is_shortened_sleep(call, requested_seconds));
+        // A sleep cut short by the budget rejects even if the Runtime timer
+        // fired a little early, so the program never mistakes it for a full sleep.
+        if shortened && matches!(result, ToolResult::Success { .. }) {
+            return shortened_sleep_result(budget_ms, self.clock.used_at(now_unix_ms));
+        }
+        result
+    }
+
+    pub(super) fn clock(&self) -> ProgramClock {
+        self.clock
+    }
+
+    pub(super) fn round(&self) -> u32 {
+        self.round
+    }
+
+    pub(super) fn partial_evaluation(&self) -> &PartialEvaluation {
+        &self.partial_evaluation
+    }
+
+    pub(super) fn tool_state(&self) -> &[ToolState] {
+        &self.partial_evaluation.tool_state
+    }
+
+    /// How far the unfinished operation `operation_id` got. Operations
+    /// without a pending stage never started.
+    pub(super) fn unfinished_operation(&self, operation_id: &str) -> UnfinishedOperation {
+        match self
+            .pending_operations
+            .iter()
+            .find(|operation| operation.external.call.call_id == operation_id)
+            .map(|operation| &operation.external.stage)
+        {
+            Some(ExternalCallStage::Pending) => UnfinishedOperation::Running,
+            Some(ExternalCallStage::AwaitingPostHook { result, .. }) => {
+                UnfinishedOperation::Finished {
+                    failed: matches!(result, ToolResult::Failure { .. }),
+                }
+            }
+            Some(
+                ExternalCallStage::AwaitingPreHook { .. }
+                | ExternalCallStage::AwaitingApproval { .. },
+            )
+            | None => UnfinishedOperation::NotStarted,
         }
     }
 
     pub(crate) fn pending_actions(&self, turn_id: &str) -> Vec<Action> {
         self.pending_operations
             .iter()
-            .map(|operation| match &operation.stage {
-                ProgramOperationStage::AwaitingPreHook {
-                    hook_action_id,
-                    hook_binding_ids,
-                } => Action::Hook {
-                    effect_id: hook_action_id.clone(),
-                    turn_id: turn_id.to_string(),
-                    hook_binding_ids: hook_binding_ids.clone(),
-                    call: HookCall::PreToolCall {
-                        tool_call: (&operation.call).into(),
-                    },
-                },
-                ProgramOperationStage::AwaitingApproval {
-                    approval_action_id,
-                    grant_key,
-                    programmatic_name,
-                } => Action::approval(
-                    approval_action_id.clone(),
-                    turn_id,
-                    grant_key,
-                    &operation.call,
-                    programmatic_name.display_name(),
-                ),
-                ProgramOperationStage::Pending => Action::external_tool(&operation.call, turn_id),
-                ProgramOperationStage::AwaitingPostHook {
-                    hook_action_id,
-                    hook_binding_ids,
-                    result,
-                } => Action::Hook {
-                    effect_id: hook_action_id.clone(),
-                    turn_id: turn_id.to_string(),
-                    hook_binding_ids: hook_binding_ids.clone(),
-                    call: HookCall::PostToolCall {
-                        tool_call: (&operation.call).into(),
-                        tool_result: result.clone(),
-                    },
-                },
-            })
+            .map(|operation| operation.external.action(turn_id))
             .collect()
     }
 
@@ -333,58 +368,99 @@ impl ProgramExecution {
     pub(super) fn pending_operation(&self, action_id: &str) -> Option<&ExternalToolCall> {
         self.pending_operations
             .iter()
-            .find(|operation| {
-                operation.call.action_id == action_id
-                    && matches!(operation.stage, ProgramOperationStage::Pending)
-            })
-            .map(|operation| &operation.call)
+            .find(|operation| operation.external.awaits_tool(action_id))
+            .map(|operation| &operation.external.call)
     }
 
-    pub(super) fn pending_hook(&self, action_id: &str) -> Option<PendingProgramHook<'_>> {
+    /// The warning for the result that the post-tool-call hook `action_id`
+    /// returned, if that hook left the result's two views disagreeing.
+    pub(crate) fn post_hook_warning(
+        &self,
+        action_id: &str,
+        hooked: &ToolResult,
+        turn_id: &str,
+    ) -> Option<Observation> {
         self.pending_operations
             .iter()
-            .find_map(|operation| match &operation.stage {
-                ProgramOperationStage::AwaitingPreHook { hook_action_id, .. }
-                    if hook_action_id == action_id =>
-                {
-                    Some(PendingProgramHook::Pre(&operation.call))
-                }
-                ProgramOperationStage::AwaitingPostHook { hook_action_id, .. }
-                    if hook_action_id == action_id =>
-                {
-                    Some(PendingProgramHook::Post(&operation.call))
-                }
-                _ => None,
-            })
+            .find(|operation| operation.external.awaited_hook(action_id) == Some(HookSide::Post))?
+            .external
+            .post_hook_warning(hooked, turn_id)
     }
 
+    pub(super) fn pending_hook(&self, action_id: &str) -> Option<(HookSide, &ExternalToolCall)> {
+        self.pending_operations.iter().find_map(|operation| {
+            operation
+                .external
+                .awaited_hook(action_id)
+                .map(|side| (side, &operation.external.call))
+        })
+    }
+
+    /// Bytes held for replay once `call` holds `result`: whole while it awaits a
+    /// post-tool hook, otherwise only what replay keeps of it.
+    pub(super) fn held_result_bytes(
+        &self,
+        call: &ExternalToolCall,
+        result: &ToolResult,
+        awaiting_post_hook: bool,
+    ) -> usize {
+        let mut incoming = serialized_len(result);
+        let mut held = 0;
+        for operation in &self.partial_evaluation.tool_state {
+            match operation {
+                ToolState::Pending { kind, id, function }
+                    if *id == call.call_id && !awaiting_post_hook =>
+                {
+                    incoming = serialized_len(&settled_tool_state(
+                        kind.clone(),
+                        id.clone(),
+                        function.clone(),
+                        result.clone(),
+                    ));
+                }
+                ToolState::Pending { .. } => {}
+                settled => held += serialized_len(settled),
+            }
+        }
+        for operation in &self.pending_operations {
+            if let ExternalCallStage::AwaitingPostHook { result, .. } = &operation.external.stage
+                && operation.external.call.action_id != call.action_id
+            {
+                held += serialized_len(result);
+            }
+        }
+        held + incoming
+    }
+
+    /// Sends the operation as `sent_call`, which Core fit to the time budget
+    /// from the post-hook call `effective_call`.
     pub(super) fn continue_after_pre_hook(
         &mut self,
         hook_action_id: &str,
-        effective_call: ExternalToolCall,
-    ) -> Result<(), CoreError> {
+        effective_call: &ExternalToolCall,
+        sent_call: ExternalToolCall,
+        turn_id: &str,
+    ) -> Result<Action, CoreError> {
         let operation = self.awaiting_pre_hook_operation_mut(hook_action_id)?;
-        operation.call = effective_call;
-        operation.stage = ProgramOperationStage::Pending;
-        Ok(())
+        operation.requested_sleep_seconds = sleep_seconds(effective_call);
+        Ok(operation.external.send(sent_call, turn_id))
     }
 
     pub(super) fn await_approval_after_pre_hook(
         &mut self,
         hook_action_id: &str,
         effective_call: ExternalToolCall,
-        approval_action_id: String,
         grant_key: GrantKey,
         programmatic_name: ProgrammaticName,
-    ) -> Result<(), CoreError> {
+        turn_id: &str,
+    ) -> Result<Action, CoreError> {
         let operation = self.awaiting_pre_hook_operation_mut(hook_action_id)?;
-        operation.call = effective_call;
-        operation.stage = ProgramOperationStage::AwaitingApproval {
-            approval_action_id,
+        Ok(operation.external.await_approval(
+            effective_call,
             grant_key,
-            programmatic_name,
-        };
-        Ok(())
+            ApprovalName::Programmatic(programmatic_name),
+            turn_id,
+        ))
     }
 
     fn awaiting_pre_hook_operation_mut(
@@ -394,154 +470,89 @@ impl ProgramExecution {
         self.pending_operations
             .iter_mut()
             .find(|operation| {
-                matches!(
-                    &operation.stage,
-                    ProgramOperationStage::AwaitingPreHook {
-                        hook_action_id: pending_hook_action_id,
-                        ..
-                    } if pending_hook_action_id == hook_action_id
-                )
+                operation.external.awaited_hook(hook_action_id) == Some(HookSide::Pre)
             })
             .ok_or_else(|| CoreError::invariant("program pre-hook operation was not found"))
     }
 
     pub(crate) fn pending_approval(&self, approval_action_id: &str) -> Option<&ExternalToolCall> {
         let operation_index = self.pending_approval_index(approval_action_id)?;
-        Some(&self.pending_operations[operation_index].call)
+        Some(&self.pending_operations[operation_index].external.call)
     }
 
+    /// Starts an approved operation, fitting a wait to the remaining time
+    /// budget. Returns the result instead when the operation cannot start: a
+    /// sleep after the budget is used up.
     pub(crate) fn approve_pending_approval(
         &mut self,
         approval_action_id: &str,
-    ) -> Option<&ExternalToolCall> {
+        budget_ms: u64,
+        now_unix_ms: u64,
+        turn_id: &str,
+    ) -> Option<Result<Action, ToolResult>> {
         let operation_index = self.pending_approval_index(approval_action_id)?;
         let operation = &mut self.pending_operations[operation_index];
-
-        operation.stage = ProgramOperationStage::Pending;
-        Some(&operation.call)
+        let sent_call = match self
+            .clock
+            .fit(&operation.external.call, budget_ms, now_unix_ms)
+        {
+            Ok(call) => call,
+            Err(result) => return Some(Err(*result)),
+        };
+        operation.requested_sleep_seconds = sleep_seconds(&operation.external.call);
+        let action = operation.external.send(sent_call, turn_id);
+        self.sync_clock(now_unix_ms);
+        Some(Ok(action))
     }
 
     fn pending_approval_index(&self, approval_action_id: &str) -> Option<usize> {
-        self.pending_operations.iter().position(|operation| {
-            matches!(
-                &operation.stage,
-                ProgramOperationStage::AwaitingApproval {
-                    approval_action_id: pending_action_id,
-                    ..
-                } if pending_action_id == approval_action_id
-            )
-        })
+        self.pending_operations
+            .iter()
+            .position(|operation| operation.external.awaits_approval(approval_action_id))
     }
 
     pub(super) fn await_post_hook(
         &mut self,
         action_id: &str,
-        hook_action_id: String,
         hook_binding_ids: Vec<String>,
         result: ToolResult,
-    ) -> Result<(), CoreError> {
+        turn_id: &str,
+    ) -> Result<Action, CoreError> {
         let operation = self
             .pending_operations
             .iter_mut()
-            .find(|operation| {
-                operation.call.action_id == action_id
-                    && matches!(operation.stage, ProgramOperationStage::Pending)
-            })
+            .find(|operation| operation.external.awaits_tool(action_id))
             .ok_or_else(|| CoreError::invariant("program tool operation was not found"))?;
-        operation.stage = ProgramOperationStage::AwaitingPostHook {
-            hook_action_id,
-            hook_binding_ids,
-            result,
-        };
-        Ok(())
+        Ok(operation
+            .external
+            .await_post_hook(hook_binding_ids, result, turn_id))
     }
 
-    fn take_pending_operation(
+    /// Settles the operation whose current stage waits for `action_id`, and
+    /// returns the next round once no operation is left.
+    pub(super) fn resolve_pending(
         &mut self,
         action_id: &str,
-    ) -> Result<PendingProgramOperation, CoreError> {
+        result: ToolResult,
+    ) -> Result<Option<ProgramContinuation>, CoreError> {
         let operation_index = self
             .pending_operations
             .iter()
-            .position(|operation| {
-                operation.call.action_id == action_id
-                    && matches!(operation.stage, ProgramOperationStage::Pending)
-            })
+            .position(|operation| operation.external.action_id() == action_id)
             .ok_or_else(|| CoreError::invariant("pending program operation was not found"))?;
-        Ok(self.pending_operations.remove(operation_index))
-    }
-
-    fn take_hook_operation(
-        &mut self,
-        hook_action_id: &str,
-    ) -> Result<PendingProgramOperation, CoreError> {
-        let operation_index =
-            self.pending_operations
-                .iter()
-                .position(|operation| match &operation.stage {
-                    ProgramOperationStage::AwaitingPreHook {
-                        hook_action_id: pending_hook_action_id,
-                        ..
-                    }
-                    | ProgramOperationStage::AwaitingPostHook {
-                        hook_action_id: pending_hook_action_id,
-                        ..
-                    } => pending_hook_action_id == hook_action_id,
-                    ProgramOperationStage::AwaitingApproval { .. }
-                    | ProgramOperationStage::Pending => false,
-                })
-                .ok_or_else(|| CoreError::invariant("pending program hook was not found"))?;
-        Ok(self.pending_operations.remove(operation_index))
-    }
-
-    pub(super) fn resolve_pending_tool(
-        &mut self,
-        action_id: &str,
-        result: ToolResult,
-    ) -> Result<Option<ProgramContinuation>, CoreError> {
-        let operation = self.take_pending_operation(action_id)?;
-        self.resolve_operation(&operation.call.call_id, result)?;
-        self.continuation()
-    }
-
-    pub(super) fn resolve_pending_approval(
-        &mut self,
-        approval_action_id: &str,
-        result: ToolResult,
-    ) -> Result<Option<ProgramContinuation>, CoreError> {
-        let operation_index = self
-            .pending_approval_index(approval_action_id)
-            .ok_or_else(|| CoreError::invariant("pending program approval was not found"))?;
         let operation = self.pending_operations.remove(operation_index);
-        self.resolve_operation(&operation.call.call_id, result)?;
-        self.continuation()
-    }
-
-    pub(super) fn resolve_pending_hook(
-        &mut self,
-        hook_action_id: &str,
-        result: ToolResult,
-    ) -> Result<Option<ProgramContinuation>, CoreError> {
-        let operation = self.take_hook_operation(hook_action_id)?;
-        self.resolve_operation(&operation.call.call_id, result)?;
-        self.continuation()
-    }
-
-    fn resolve_operation(
-        &mut self,
-        operation_id: &str,
-        result: ToolResult,
-    ) -> Result<(), CoreError> {
-        resolve_tool_state(&mut self.partial_evaluation, operation_id, result)
-    }
-
-    fn continuation(&self) -> Result<Option<ProgramContinuation>, CoreError> {
+        resolve_tool_state(
+            &mut self.partial_evaluation,
+            &operation.external.call.call_id,
+            result,
+        )?;
         if !self.pending_operations.is_empty() {
             return Ok(None);
         }
         Ok(Some(ProgramContinuation::after_round(
             self.partial_evaluation.clone(),
             self.round,
+            self.clock,
         )?))
     }
 
@@ -583,19 +594,18 @@ impl ProgramExecution {
                     let pending = pending_operations.next().ok_or_else(|| {
                         format!("pending program operation {id:?} has no continuation")
                     })?;
-                    if pending.call.call_id != *id {
+                    if pending.external.call.call_id != *id {
                         return Err(format!(
                             "pending program operation {id:?} does not match continuation {:?}",
-                            pending.call.call_id
+                            pending.external.call.call_id
                         ));
                     }
                     let function = ProgramFunctionRecord::from(function);
-                    let pending = PendingProgramRecord::from(pending);
-                    validate_pending_program_record(id, &function, &pending)?;
+                    validate_pending_program_operation(id, &function, pending)?;
                     ProgramOperationRecord::ExternalPending {
                         id: id.clone(),
                         function,
-                        pending: Box::new(pending),
+                        pending: Box::new(pending.clone()),
                     }
                 }
                 ToolState::Resolved {
@@ -664,6 +674,7 @@ impl ProgramExecution {
             source: self.partial_evaluation.code.clone(),
             operations,
             round: self.round,
+            clock: self.clock,
         })
     }
 
@@ -671,6 +682,7 @@ impl ProgramExecution {
         source: String,
         operations: Vec<ProgramOperationRecord>,
         round: u32,
+        clock: ProgramClock,
     ) -> Result<Self, String> {
         let mut operation_ids = HashSet::new();
         let mut tool_state = Vec::with_capacity(operations.len());
@@ -704,15 +716,13 @@ impl ProgramExecution {
                 } => {
                     validate_unique_operation_id(&mut operation_ids, &id)?;
                     validate_external_function_record(&function)?;
-                    let pending = *pending;
-                    validate_pending_program_record(&id, &function, &pending)?;
-                    let pending = PendingProgramOperation::try_from((id.as_str(), pending))?;
+                    validate_pending_program_operation(&id, &function, &pending)?;
                     tool_state.push(ToolState::Pending {
                         kind: ToolKind::External,
                         id,
                         function: function.into(),
                     });
-                    pending_operations.push(pending);
+                    pending_operations.push(*pending);
                 }
                 ProgramOperationRecord::ExternalResolved {
                     id,
@@ -753,6 +763,16 @@ impl ProgramExecution {
                 "pending program execution must contain at least one operation".to_string(),
             );
         }
+        let mut clock = clock;
+        let waiting = pending_operations
+            .iter()
+            .any(|operation| !matches!(operation.external.stage, ExternalCallStage::Pending));
+        if waiting && clock.paused_since_unix_ms.is_none() {
+            // Checkpoints written before pauses were recorded do not say when
+            // the wait started; pause from the program's start so the
+            // approval or hook wait does not count.
+            clock.paused_since_unix_ms = clock.started_at_unix_ms;
+        }
         Ok(Self {
             partial_evaluation: PartialEvaluation {
                 code: source,
@@ -761,6 +781,7 @@ impl ProgramExecution {
             },
             pending_operations,
             round,
+            clock,
         })
     }
 }
@@ -842,17 +863,12 @@ fn validate_pending_call(id: &str, call: &ExternalToolCall) -> Result<(), String
     Ok(())
 }
 
-fn validate_pending_program_record(
+fn validate_pending_program_operation(
     id: &str,
     function: &ProgramFunctionRecord,
-    pending: &PendingProgramRecord,
+    pending: &PendingProgramOperation,
 ) -> Result<(), String> {
-    let call = match pending {
-        PendingProgramRecord::AwaitingPreHook { call, .. }
-        | PendingProgramRecord::AwaitingApproval { call, .. }
-        | PendingProgramRecord::Pending { call }
-        | PendingProgramRecord::AwaitingPostHook { call, .. } => call,
-    };
+    let call = &pending.external.call;
     validate_pending_call(id, call)?;
     if let ExternalTool::Provided {
         group_name,
@@ -874,11 +890,10 @@ fn validate_pending_program_record(
             function.name
         ));
     }
-    match pending {
-        PendingProgramRecord::AwaitingPreHook {
+    match &pending.external.stage {
+        ExternalCallStage::AwaitingPreHook {
             hook_action_id,
             hook_binding_ids,
-            ..
         } => {
             validate_pending_hook(
                 call,
@@ -887,7 +902,7 @@ fn validate_pending_program_record(
                 HookPoint::PreToolCall,
             )?;
         }
-        PendingProgramRecord::AwaitingApproval {
+        ExternalCallStage::AwaitingApproval {
             approval_action_id, ..
         } => {
             let expected_action_id = action_id::approval(&call.action_id);
@@ -897,8 +912,8 @@ fn validate_pending_program_record(
                 ));
             }
         }
-        PendingProgramRecord::Pending { .. } => {}
-        PendingProgramRecord::AwaitingPostHook {
+        ExternalCallStage::Pending => {}
+        ExternalCallStage::AwaitingPostHook {
             hook_action_id,
             hook_binding_ids,
             ..
@@ -988,96 +1003,6 @@ impl From<ProgramFunctionRecord> for ToolFunction {
     }
 }
 
-impl From<&PendingProgramOperation> for PendingProgramRecord {
-    fn from(operation: &PendingProgramOperation) -> Self {
-        match &operation.stage {
-            ProgramOperationStage::AwaitingPreHook {
-                hook_action_id,
-                hook_binding_ids,
-            } => Self::AwaitingPreHook {
-                call: operation.call.clone(),
-                hook_action_id: hook_action_id.clone(),
-                hook_binding_ids: hook_binding_ids.clone(),
-            },
-            ProgramOperationStage::AwaitingApproval {
-                approval_action_id,
-                grant_key,
-                programmatic_name,
-            } => Self::AwaitingApproval {
-                call: operation.call.clone(),
-                approval_action_id: approval_action_id.clone(),
-                grant_key: grant_key.clone(),
-                programmatic_name: programmatic_name.clone(),
-            },
-            ProgramOperationStage::Pending => Self::Pending {
-                call: operation.call.clone(),
-            },
-            ProgramOperationStage::AwaitingPostHook {
-                hook_action_id,
-                hook_binding_ids,
-                result,
-            } => Self::AwaitingPostHook {
-                call: operation.call.clone(),
-                hook_action_id: hook_action_id.clone(),
-                hook_binding_ids: hook_binding_ids.clone(),
-                result: result.clone(),
-            },
-        }
-    }
-}
-
-impl TryFrom<(&str, PendingProgramRecord)> for PendingProgramOperation {
-    type Error = String;
-
-    fn try_from((id, pending): (&str, PendingProgramRecord)) -> Result<Self, Self::Error> {
-        let operation = match pending {
-            PendingProgramRecord::AwaitingPreHook {
-                call,
-                hook_action_id,
-                hook_binding_ids,
-            } => Self {
-                call,
-                stage: ProgramOperationStage::AwaitingPreHook {
-                    hook_action_id,
-                    hook_binding_ids,
-                },
-            },
-            PendingProgramRecord::AwaitingApproval {
-                call,
-                approval_action_id,
-                grant_key,
-                programmatic_name,
-            } => Self {
-                call,
-                stage: ProgramOperationStage::AwaitingApproval {
-                    approval_action_id,
-                    grant_key,
-                    programmatic_name,
-                },
-            },
-            PendingProgramRecord::Pending { call } => Self {
-                call,
-                stage: ProgramOperationStage::Pending,
-            },
-            PendingProgramRecord::AwaitingPostHook {
-                call,
-                hook_action_id,
-                hook_binding_ids,
-                result,
-            } => Self {
-                call,
-                stage: ProgramOperationStage::AwaitingPostHook {
-                    hook_action_id,
-                    hook_binding_ids,
-                    result,
-                },
-            },
-        };
-        validate_pending_call(id, &operation.call)?;
-        Ok(operation)
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use serde_json::json;
@@ -1151,6 +1076,7 @@ mod tests {
                     pending: Box::new(pending),
                 }],
                 0,
+                ProgramClock::default(),
             )
             .unwrap_err()
         };
@@ -1161,7 +1087,7 @@ mod tests {
                     name: "write_file".to_string(),
                     ..function.clone()
                 },
-                PendingProgramRecord::Pending { call: call.clone() },
+                PendingProgramOperation::pending(&call, call.clone()),
             )
             .contains("targets")
         );
@@ -1171,9 +1097,7 @@ mod tests {
         assert!(
             restore(
                 function.clone(),
-                PendingProgramRecord::Pending {
-                    call: invalid_action,
-                },
+                PendingProgramOperation::pending(&invalid_action, invalid_action.clone()),
             )
             .contains("derived action ID")
         );
@@ -1186,6 +1110,7 @@ mod tests {
                     value: Value::Null,
                 }],
                 0,
+                ProgramClock::default(),
             )
             .unwrap_err()
             .contains("at least one operation")
@@ -1196,13 +1121,14 @@ mod tests {
             vec![ProgramOperationRecord::ExternalPending {
                 id: operation_id.to_string(),
                 function: function.clone(),
-                pending: Box::new(PendingProgramRecord::Pending { call: call.clone() }),
+                pending: Box::new(PendingProgramOperation::pending(&call, call.clone())),
             }],
             u32::MAX,
+            ProgramClock::default(),
         )
         .unwrap();
         let overflow = max_round
-            .resolve_pending_tool(
+            .resolve_pending(
                 &call.action_id,
                 ToolResult::Success {
                     content: Vec::new(),
@@ -1212,5 +1138,99 @@ mod tests {
             )
             .unwrap_err();
         assert!(overflow.detail().contains("round overflowed"));
+    }
+
+    /// A checkpoint written before sleeps recorded their requested length
+    /// compares the sent sleep with the length the program asked for.
+    #[test]
+    fn restored_sleep_without_a_requested_length_compares_with_the_program_arguments() {
+        let operation_id = "operation-1";
+        let sent = ExternalToolCall {
+            action_id: effect_id_for_operation(ToolOrigin::Programmatic, operation_id),
+            call_id: operation_id.to_string(),
+            origin: ToolOrigin::Programmatic,
+            call: ExternalTool::RuntimeBuiltin {
+                name: RuntimeBuiltinToolName::SelfSleep,
+                invocation_name: "sleep".to_string(),
+                arguments: json!({"seconds": 5.0}),
+            },
+        };
+        let settle = |requested_sleep_seconds| {
+            let mut execution = ProgramExecution::restore(
+                "async function main() {}".to_string(),
+                vec![ProgramOperationRecord::ExternalPending {
+                    id: operation_id.to_string(),
+                    function: ProgramFunctionRecord {
+                        name: "sleep".to_string(),
+                        arguments: json!({"seconds": 30}),
+                    },
+                    pending: Box::new(PendingProgramOperation {
+                        external: PendingExternalCall::pending(sent.clone()),
+                        requested_sleep_seconds,
+                    }),
+                }],
+                0,
+                ProgramClock::started_at(0),
+            )
+            .unwrap();
+            execution.settle_sleep_result(
+                &sent.action_id,
+                ToolResult::Success {
+                    content: Vec::new(),
+                    structured_content: StructuredContent::Absent,
+                    meta: None,
+                },
+                60_000,
+                60_000,
+            )
+        };
+
+        assert!(matches!(settle(None), ToolResult::Failure { .. }));
+        assert!(matches!(settle(Some(5.0)), ToolResult::Success { .. }));
+    }
+
+    /// A checkpoint written before pauses were recorded has a start time but
+    /// no pause; restoring it while an operation waits for a hook pauses the
+    /// clock, so the wait does not count toward the time budget.
+    #[test]
+    fn restore_without_a_recorded_pause_pauses_a_waiting_program() {
+        let operation_id = "operation-1";
+        let arguments = json!({ "path": "notes.txt" });
+        let call = ExternalToolCall {
+            action_id: effect_id_for_operation(ToolOrigin::Programmatic, operation_id),
+            call_id: operation_id.to_string(),
+            origin: ToolOrigin::Programmatic,
+            call: ExternalTool::RuntimeBuiltin {
+                name: RuntimeBuiltinToolName::FileSystemReadFile,
+                invocation_name: "read_file".to_string(),
+                arguments: arguments.clone(),
+            },
+        };
+        let restore = |pending| {
+            ProgramExecution::restore(
+                "async function main() {}".to_string(),
+                vec![ProgramOperationRecord::ExternalPending {
+                    id: operation_id.to_string(),
+                    function: ProgramFunctionRecord {
+                        name: "read_file".to_string(),
+                        arguments: arguments.clone(),
+                    },
+                    pending: Box::new(pending),
+                }],
+                0,
+                ProgramClock::started_at(1_000),
+            )
+            .unwrap()
+            .clock()
+        };
+
+        let waiting = restore(PendingProgramOperation::awaiting_pre_hook(
+            call.clone(),
+            vec!["pre-tool".to_string()],
+        ));
+        assert_eq!(waiting.used_at(120_000), 0);
+
+        let running = restore(PendingProgramOperation::pending(&call, call.clone()));
+        assert_eq!(running.used_at(120_000), 119_000);
     }
 }

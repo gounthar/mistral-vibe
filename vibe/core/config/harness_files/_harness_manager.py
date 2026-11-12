@@ -1,8 +1,9 @@
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass, field, replace
 from pathlib import Path
-from typing import Literal
+from typing import Any, Literal
 
 from vibe.core.config.harness_files._paths import (
     GLOBAL_AGENTS_DIR,
@@ -31,8 +32,16 @@ class HarnessFilesManager:
     cwd: Path | None = field(default=None)
     _additional_dirs: tuple[Path, ...] = ()
     _session_root: Path | None = None
+    # Writable without being opened as a project: no config, skills, hooks or
+    # AGENTS.md are read from them.
+    writable_roots: tuple[Path, ...] = ()
     trust_store: TrustedFoldersManager = field(
         default_factory=lambda: trusted_folders_manager, compare=False, repr=False
+    )
+    # The user config an embedding host supplies for its sessions, read in
+    # place of the user config file. Changes saved to it stay in memory.
+    user_config: Mapping[str, Any] | None = field(
+        default=None, compare=False, repr=False
     )
 
     def for_session(
@@ -55,18 +64,11 @@ class HarnessFilesManager:
             _session_root=here if here in listed else None,
         )
 
-    def moved_to(self, cwd: Path) -> HarnessFilesManager:
-        """The manager for a session that has moved to *cwd*.
-
-        Unlike :meth:`for_session`, which merges, the directory being left stops
-        being a workspace root and the arrival takes its place. A sequence of
-        moves therefore never widens the set. Roots added for other reasons,
-        such as ``--add-dir`` entries, are kept, including the one the session
-        is sitting in. Only the position a move recorded is replaced, so
-        leaving a directory cannot revoke a root the user opened.
-        """
-        arriving = cwd.resolve()
-        return replace(self, cwd=arriving, _session_root=arriving)
+    def trusting(self, root: Path) -> HarnessFilesManager:
+        """This manager with *root* trusted for this process only, never persisted."""
+        trust_store = self.trust_store.for_session()
+        trust_store.trust_for_session(root)
+        return replace(self, trust_store=trust_store)
 
     @property
     def _effective_cwd(self) -> Path:

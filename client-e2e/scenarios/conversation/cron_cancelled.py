@@ -6,21 +6,13 @@ from e2e.app_server.effect_fixtures import effect_settled, effect_started
 from e2e.app_server.events import turn_completed, turn_started, user_msg
 from e2e.app_server.scenario import Timeline
 
-env = {"VIBE_REPLAY_SETTLE_BUSY": "1"}
-settle_per_key = True
-capture_steps = {2, 3, 4}
-
-screen_contains = {
-    "rust": [
-        "Cancelled check CI",
-        "Prompt: check CI",
-        "Schedule: every 1 minute 30 seconds",
-        "ID: abc",
-    ]
-}
-screen_excludes = {
-    "rust": ["vibe.cron", "interval_seconds", "next_fire_at", "Next run:"]
-}
+screen_contains = [
+    "Cancelled check CI",
+    "Prompt: check CI",
+    "Schedule: every 1 minute 30 seconds",
+    "ID: abc",
+]
+screen_excludes = ["vibe.cron", "interval_seconds", "next_fire_at", "Next run:"]
 
 timeline: Timeline = [
     "cancel the CI check\r",

@@ -1,43 +1,62 @@
 from __future__ import annotations
 
 import asyncio
-import base64
 from collections.abc import Sequence
 from contextlib import ExitStack
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from functools import lru_cache
 import hashlib
 import json
 from pathlib import Path
 from typing import Any
 
+from vibe.app_server._cached_layers import apply_cached_layers
+from vibe.app_server._config_errors import USER_CONFIG_ERRORS, user_config_error
 from vibe.app_server._connection_protocol import ClientInfo
 from vibe.app_server._dispatch import DispatchResult, RequestFailure, method_not_found
+from vibe.app_server._experiments_service import ExperimentsService
 from vibe.app_server._history_projection import project_message_history
+from vibe.app_server._local_plugins_controller import (
+    LOCAL_PLUGIN_METHODS,
+    LocalPluginsController,
+)
+from vibe.app_server._local_projects_controller import (
+    LOCAL_PROJECT_METHODS,
+    LocalProjectsController,
+)
+from vibe.app_server._local_skills_controller import (
+    LOCAL_SKILL_METHODS,
+    LocalSkillsController,
+)
+from vibe.app_server._missing_layers import MissingLayerFetches
 from vibe.app_server._model import ProtocolModel, validate_wire
+from vibe.app_server._model_catalog_service import ModelCatalogService
+from vibe.app_server._org_config_service import OrgConfigService
 from vibe.app_server._project_links import (
-    ProjectLinksAuthError,
     ProjectLinksController,
     ProjectLinksError,
-    ProjectLinksInternalError,
     ProjectLinksInvalidRequest,
 )
 from vibe.app_server._projection import (
+    project_agent_summaries,
     project_config_view,
-    project_unified_agent_summaries,
+    project_skill_summaries,
+)
+from vibe.app_server._session_config_cache import (
+    BuiltSessionConfig,
+    SessionConfigCache,
+    SessionConfigKey,
 )
 from vibe.app_server._session_model import active_model_is_pinned
-from vibe.app_server._setup import SetupRequestHandler
+from vibe.app_server._setup import SetupRequestHandler, _launch_context
 from vibe.app_server._state import build_stored_public_state, history_page
-from vibe.app_server._utils import now_ms, optional_time_ms, time_ms
 from vibe.app_server._workspace import (
     WorkspaceTrustError,
     decide_workspace_trust,
     read_untrusted_config_dirs,
     read_workspace_trust,
 )
-from vibe.app_server._worktree_session import SessionWorktrees
-from vibe.app_server.models import ConfigIssue, IdleSessionStatus, PublicSession
+from vibe.app_server._worktree_housekeeping import WorktreeHousekeeping
 from vibe.app_server.protocol import (
     AgentsListParams,
     AgentsListResponse,
@@ -47,16 +66,10 @@ from vibe.app_server.protocol import (
     ConfigSchemaReadResponse,
     EmptyResponse,
     ProjectLinkMutationResponse,
-    ProjectLinksCreateParams,
     ProjectLinksInspectRootParams,
     ProjectLinksInspectRootResponse,
-    ProjectLinksLinkParams,
     ProjectLinksListParams,
     ProjectLinksListResponse,
-    ProjectLinksPickerLoadMoreParams,
-    ProjectLinksPickerLoadMoreResponse,
-    ProjectLinksPickerLoadParams,
-    ProjectLinksPickerLoadResponse,
     ProjectLinksResolveRootParams,
     ProjectLinksResolveRootResponse,
     ProjectLinksSaveParams,
@@ -68,14 +81,14 @@ from vibe.app_server.protocol import (
     SessionHistoryGetResponse,
     SessionHistoryListParams,
     SessionHistoryListResponse,
-    SessionListParams,
-    SessionListResponse,
     SessionReadParams,
     SessionReadResponse,
     SessionRelocateParams,
     SessionRelocateResponse,
     SessionTitleUpdateParams,
     SessionTitleUpdateResponse,
+    SkillsListParams,
+    SkillsListResponse,
     WorkspaceGitBranchChanges,
     WorkspaceGitCheckout,
     WorkspaceGitCheckoutsParams,
@@ -90,16 +103,15 @@ from vibe.app_server.protocol import (
     WorkspaceWorktreeListResponse,
     WorkspaceWorktreePruneParams,
     WorkspaceWorktreePruneResponse,
-    WorkspaceWorktreeReapCancelParams,
-    WorkspaceWorktreeReapParams,
-    WorkspaceWorktreeReapResponse,
     WorkspaceWorktreeRemoveConfirmParams,
     WorkspaceWorktreeRemoveResponse,
     WorktreeRemoveOutcome,
 )
 from vibe.core.agents.manager import AgentManager
 from vibe.core.config import VibeConfigSchema, build_default_orchestrator
+from vibe.core.config._setting_keys import config_json_schema
 from vibe.core.config.harness_files import HarnessFilesManager
+from vibe.core.config.layers.admin import enforced_keys
 from vibe.core.config.orchestrator import ConfigOrchestrator
 from vibe.core.git.errors import (
     GitError,
@@ -114,20 +126,18 @@ from vibe.core.git.worktree import (
     WorktreeRepository,
 )
 from vibe.core.hooks.config import load_hooks_from_fs
-from vibe.core.session import last_session_pointer
-from vibe.core.session.resume_sessions import (
-    ResumeSessionInfo,
-    list_local_resume_sessions,
-)
+from vibe.core.platform_auth import PlatformCredentialFactory
+from vibe.core.platform_auth._mistral import api_key_credentials
+from vibe.core.session.artifacts import sanitize_artifacts_in_raw_metadata
 from vibe.core.session.saved_sessions import (
     delete_saved_session,
     relocate_saved_session,
     update_saved_session_title,
 )
-from vibe.core.session.session_interop import resolve_legacy_session_reference
 from vibe.core.session.session_loader import SessionLoader
 from vibe.core.skills.manager import SkillManager
-from vibe.core.skills.models import SkillSource
+from vibe.core.telemetry.send import TelemetryClient
+from vibe.core.trusted_folders import TrustedFoldersManager
 from vibe.core.types import LLMMessage, SessionMetadata
 from vibe.observability.logging import logger
 
@@ -135,27 +145,26 @@ _HOST_METHODS = frozenset({
     "agents/list",
     "config/read",
     "config/schema",
-    "projectLinks/create",
     "projectLinks/inspectRoot",
-    "projectLinks/link",
     "projectLinks/list",
-    "projectLinks/picker/load",
-    "projectLinks/picker/loadMore",
     "projectLinks/resolveRoot",
     "projectLinks/save",
     "projectLinks/unlink",
+    *LOCAL_PROJECT_METHODS,
     "session/delete",
     "session/history/list",
-    "session/list",
     "session/read",
-    # Only reached with no session attached. A live one is routed to the agent
-    # loop, which moves the workspace it is holding; here there is nothing
+    # Only reached with no session attached. A live one is routed to its
+    # backend, which moves the workspace it is holding; here there is nothing
     # holding it, so the move is the record and nothing else.
     "session/relocate",
     "session/rename",
     "setup/status",
     "setup/store-credential",
     "setup/submit-choices",
+    "skills/list",
+    *LOCAL_SKILL_METHODS,
+    *LOCAL_PLUGIN_METHODS,
     "workspace/trust/decision",
     "workspace/trust/untrustedConfig",
     "workspace/trust/status",
@@ -163,8 +172,6 @@ _HOST_METHODS = frozenset({
     "workspace/git/worktrees/limit/update",
     "workspace/git/worktrees/list",
     "workspace/git/worktrees/prune",
-    "workspace/git/worktrees/reap",
-    "workspace/git/worktrees/reap/cancel",
     "workspace/git/worktrees/remove",
 })
 
@@ -173,44 +180,40 @@ class HostRequestHandler:
     def __init__(
         self,
         harness_files: HarnessFilesManager,
-        startup_issue: ConfigIssue | None = None,
-        harness_selection_source: str | None = None,
         *,
+        org_config: OrgConfigService,
+        worktrees: WorktreeHousekeeping,
+        experiments: ExperimentsService,
+        model_catalog: ModelCatalogService,
+        credentials: PlatformCredentialFactory | None = None,
         image_fallback: bool = False,
+        builtin_plugin_roots: Sequence[Path] | None = None,
     ) -> None:
         self._harness_files = harness_files
-        # Always None from this server since VIBE-4903 (a Runtime that cannot
-        # load aborts startup); kept for wire compatibility with older servers
-        # that still fall back and report a startup issue.
-        self._startup_issue = startup_issue
-        self._harness_selection_source = harness_selection_source
+        self._org_config = org_config
+        self._model_catalog = model_catalog
+        self._credentials = credentials or api_key_credentials
+        self._worktrees = worktrees
+        self._worktree_limit_configs = SessionConfigCache()
         self._image_fallback = image_fallback
+        self._builtin_plugin_roots = builtin_plugin_roots
         self._project_links = ProjectLinksController()
+        self._local_projects = LocalProjectsController()
         self._setup = SetupRequestHandler(harness_files)
+        self._local_skills = LocalSkillsController(
+            self._local_skill_files, self._load_orchestrator
+        )
+        self._local_plugins = LocalPluginsController(
+            self._local_skill_files,
+            self._load_orchestrator,
+            self._resolved_builtin_plugin_roots,
+        )
+        self._missing_layers = MissingLayerFetches(
+            org_config, experiments, model_catalog, self._credentials
+        )
 
     def handles(self, method: str) -> bool:
         return method in _HOST_METHODS
-
-    async def legacy_open_target(
-        self, session_id: str | None, cwd: str | None
-    ) -> tuple[str, str | None] | None:
-        config = await self._load_config(None if session_id is not None else cwd)
-        if session_id is not None:
-            reference = await asyncio.to_thread(
-                resolve_legacy_session_reference, session_id, config.session_logging
-            )
-            if reference is None:
-                return None
-            return reference.session_id, reference.cwd or None
-
-        sessions = await asyncio.to_thread(_continue_resume_sessions, config, cwd)
-        target_id = _continue_session_id(config, sessions)
-        if target_id is None:
-            return None
-        target = next(
-            session for session in sessions if session.session_id == target_id
-        )
-        return target.session_id, target.cwd or None
 
     async def dispatch(
         self,
@@ -218,22 +221,30 @@ class HostRequestHandler:
         raw_params: dict[str, Any],
         *,
         session_id: str | None = None,
+        worktree_trust_store: TrustedFoldersManager | None = None,
         client_info: ClientInfo | None = None,
     ) -> DispatchResult:
         try:
             response = await self._dispatch(
-                method, raw_params, session_id=session_id, client_info=client_info
+                method,
+                raw_params,
+                session_id=session_id,
+                client_info=client_info,
+                worktree_trust_store=worktree_trust_store,
             )
+        except USER_CONFIG_ERRORS as exc:
+            # The picker reads load the same config a session start does, so they
+            # report a config the user can fix the same way.
+            error = user_config_error(exc)
+            if error is None:
+                raise
+            raise RequestFailure(error.code, error.message, error.data) from exc
         except WorkspaceTrustError as exc:
             raise RequestFailure(ProtocolErrorCode.INVALID_PARAMS, str(exc)) from exc
         except GitError as exc:
             raise RequestFailure(ProtocolErrorCode.INVALID_PARAMS, str(exc)) from exc
-        except ProjectLinksAuthError as exc:
-            raise RequestFailure(ProtocolErrorCode.UNAUTHORIZED, str(exc)) from exc
         except ProjectLinksInvalidRequest as exc:
             raise RequestFailure(ProtocolErrorCode.INVALID_PARAMS, str(exc)) from exc
-        except ProjectLinksInternalError as exc:
-            raise RequestFailure(ProtocolErrorCode.INTERNAL_ERROR, str(exc)) from exc
         except ProjectLinksError as exc:
             raise RequestFailure(ProtocolErrorCode.INTERNAL_ERROR, str(exc)) from exc
         except FileNotFoundError as exc:
@@ -246,6 +257,7 @@ class HostRequestHandler:
         raw_params: dict[str, Any],
         *,
         session_id: str | None = None,
+        worktree_trust_store: TrustedFoldersManager | None = None,
         client_info: ClientInfo | None = None,
     ) -> ProtocolModel:
         match method:
@@ -254,12 +266,28 @@ class HostRequestHandler:
                 response: ProtocolModel = config_schema_response()
             case "config/read":
                 response = await self._read_config(
-                    validate_wire(ConfigReadParams, raw_params)
+                    validate_wire(ConfigReadParams, raw_params),
+                    client_info=client_info,
+                    attached_session_id=session_id,
                 )
             case "agents/list":
                 response = await self._list_agents(
-                    validate_wire(AgentsListParams, raw_params)
+                    validate_wire(AgentsListParams, raw_params),
+                    client_info=client_info,
+                    attached_session_id=session_id,
                 )
+            case "skills/list":
+                response = await self._list_skills(
+                    validate_wire(SkillsListParams, raw_params),
+                    client_info=client_info,
+                    attached_session_id=session_id,
+                )
+            case _ if method in LOCAL_SKILL_METHODS:
+                response = await self._local_skills.dispatch(method, raw_params)
+            case _ if method in LOCAL_PLUGIN_METHODS:
+                response = await self._local_plugins.dispatch(method, raw_params)
+            case _ if method in LOCAL_PROJECT_METHODS:
+                response = await self._local_projects.dispatch(method, raw_params)
             case _ if method.startswith("setup/"):
                 # The server rejects pre-initialize requests, so a live
                 # setup call always carries the handshake's client info.
@@ -271,7 +299,10 @@ class HostRequestHandler:
                 response = await self._dispatch_session(method, raw_params)
             case _ if method.startswith("workspace/"):
                 response = await self._dispatch_workspace(
-                    method, raw_params, session_id=session_id
+                    method,
+                    raw_params,
+                    session_id=session_id,
+                    worktree_trust_store=worktree_trust_store,
                 )
             case _ if method.startswith("projectLinks/"):
                 response = await self._dispatch_project_links(method, raw_params)
@@ -283,16 +314,12 @@ class HostRequestHandler:
         self, method: str, raw_params: dict[str, Any]
     ) -> ProtocolModel:
         match method:
-            case "session/list":
-                params = validate_wire(SessionListParams, raw_params)
-                config = await self._load_config(params.cwd)
-                response: ProtocolModel = await asyncio.to_thread(
-                    project_session_list, config, params
-                )
             case "session/read":
                 params = validate_wire(SessionReadParams, raw_params)
                 config = await self._load_config(None)
-                response = await asyncio.to_thread(self._read_session, params, config)
+                response: ProtocolModel = await asyncio.to_thread(
+                    self._read_session, params, config
+                )
             case "session/relocate":
                 response = await self._relocate_session(
                     validate_wire(SessionRelocateParams, raw_params),
@@ -338,28 +365,91 @@ class HostRequestHandler:
                 raise method_not_found(method)
         return response
 
-    async def _list_agents(self, params: AgentsListParams) -> AgentsListResponse:
+    async def _list_agents(
+        self,
+        params: AgentsListParams,
+        *,
+        client_info: ClientInfo | None,
+        attached_session_id: str | None,
+    ) -> AgentsListResponse:
         if params.session_id is not None:
             raise RequestFailure(
                 ProtocolErrorCode.NOT_FOUND, f"Session not found: {params.session_id}"
             )
-        orchestrator = await self._load_orchestrator(None)
-        agents = AgentManager(
-            orchestrator,
-            orchestrator.config.resolve_default_agent(),
-            harness_files=self._harness_files.for_session(self._cwd(None)),
+        orchestrator = await self._load_picker_orchestrator(
+            None, client_info=client_info, attached_session_id=attached_session_id
         )
-        active, available = project_unified_agent_summaries(
+        harness_files = self._harness_files.for_session(self._cwd(None))
+        try:
+            agents = AgentManager(orchestrator, None, harness_files=harness_files)
+        except ValueError:
+            if not enforced_keys(orchestrator):
+                raise
+            # The org config leaves no mode this checkout can start: a session
+            # start here falls back to local config, so the list does too.
+            orchestrator = await self._load_orchestrator(
+                self._session_files(None), org_config=False
+            )
+            agents = AgentManager(orchestrator, None, harness_files=harness_files)
+        active, available = project_agent_summaries(
             agents.active_profile, agents.available_agents.values()
         )
         return AgentsListResponse(active=active, agents=available)
 
-    async def _read_config(self, params: ConfigReadParams) -> ConfigReadResponse:
+    async def _list_skills(
+        self,
+        params: SkillsListParams,
+        *,
+        client_info: ClientInfo | None,
+        attached_session_id: str | None,
+    ) -> SkillsListResponse:
+        """``trust_workspace`` trusts ``cwd`` for this read only, never persisted."""
         if params.session_id is not None:
             raise RequestFailure(
                 ProtocolErrorCode.NOT_FOUND, f"Session not found: {params.session_id}"
             )
-        orchestrator = await self._load_orchestrator(params.cwd)
+        cwd = self._cwd(params.cwd)
+        session_files = self._session_files(params.cwd)
+        if params.trust_workspace:
+            session_files = session_files.trusting(cwd)
+        orchestrator = await self._load_picker_orchestrator(
+            params.cwd,
+            client_info=client_info,
+            attached_session_id=attached_session_id,
+            session_files=session_files,
+        )
+        from vibe.app_server._plugins import resolve_plugin_skills
+        from vibe.app_server._skills import discover_session_skills
+
+        plugin_skills, plugin_contexts = await resolve_plugin_skills(
+            session_files,
+            config_orchestrator=orchestrator,
+            builtin_plugin_roots=self._builtin_plugin_roots,
+        )
+        _issues, projection = await asyncio.to_thread(
+            discover_session_skills,
+            lambda: orchestrator.config,
+            harness_files=session_files,
+            plugin_skills=plugin_skills,
+            plugin_contexts=plugin_contexts,
+            skill_tool_available=True,
+        )
+        return SkillsListResponse(skills=project_skill_summaries(projection.catalogue))
+
+    async def _read_config(
+        self,
+        params: ConfigReadParams,
+        *,
+        client_info: ClientInfo | None,
+        attached_session_id: str | None,
+    ) -> ConfigReadResponse:
+        if params.session_id is not None:
+            raise RequestFailure(
+                ProtocolErrorCode.NOT_FOUND, f"Session not found: {params.session_id}"
+            )
+        orchestrator = await self._load_picker_orchestrator(
+            params.cwd, client_info=client_info, attached_session_id=attached_session_id
+        )
         config = orchestrator.config
         view = project_config_view(
             config,
@@ -371,11 +461,7 @@ class HostRequestHandler:
         skill_mgr = SkillManager(
             config_getter=lambda: config, harness_files=session_files
         )
-        skills_count = sum(
-            1
-            for skill in skill_mgr.available_skills.values()
-            if skill.source is not SkillSource.BUILTIN
-        )
+        skills_count = len(skill_mgr.available_skills)
         hooks_count = len(load_hooks_from_fs(harness_files=session_files).hooks)
         mcp_servers_total = len(config.mcp_servers)
         mcp_servers_enabled = sum(
@@ -384,12 +470,10 @@ class HostRequestHandler:
 
         return ConfigReadResponse(
             config=view,
-            startup_issue=self._startup_issue,
             skills_count=skills_count,
             hooks_count=hooks_count,
             mcp_servers_total=mcp_servers_total,
             mcp_servers_enabled=mcp_servers_enabled,
-            harness_selection_source=self._harness_selection_source,
         )
 
     async def _dispatch_project_links(
@@ -411,32 +495,6 @@ class HostRequestHandler:
                 response = ProjectLinksInspectRootResponse.model_validate(
                     await self._project_links.inspect_root(params.root_path)
                 )
-            case "projectLinks/picker/load":
-                params = validate_wire(ProjectLinksPickerLoadParams, raw_params)
-                response = ProjectLinksPickerLoadResponse.model_validate(
-                    await self._project_links.picker_load(params.root_path)
-                )
-            case "projectLinks/picker/loadMore":
-                params = validate_wire(ProjectLinksPickerLoadMoreParams, raw_params)
-                response = ProjectLinksPickerLoadMoreResponse.model_validate(
-                    await self._project_links.picker_load_more(
-                        params.root_path, params.cursor
-                    )
-                )
-            case "projectLinks/create":
-                params = validate_wire(ProjectLinksCreateParams, raw_params)
-                response = ProjectLinkMutationResponse.model_validate(
-                    await self._project_links.create(
-                        params.root_path, params.name, params.default_branch
-                    )
-                )
-            case "projectLinks/link":
-                params = validate_wire(ProjectLinksLinkParams, raw_params)
-                response = ProjectLinkMutationResponse.model_validate(
-                    await self._project_links.link(
-                        params.root_path, params.project_id, params.project_name
-                    )
-                )
             case "projectLinks/save":
                 params = validate_wire(ProjectLinksSaveParams, raw_params)
                 response = ProjectLinkMutationResponse.model_validate(
@@ -457,7 +515,12 @@ class HostRequestHandler:
         return response
 
     async def _dispatch_workspace(
-        self, method: str, raw_params: dict[str, Any], *, session_id: str | None = None
+        self,
+        method: str,
+        raw_params: dict[str, Any],
+        *,
+        session_id: str | None = None,
+        worktree_trust_store: TrustedFoldersManager | None = None,
     ) -> ProtocolModel:
         match method:
             case "workspace/trust/status":
@@ -496,7 +559,7 @@ class HostRequestHandler:
                 )
             case "workspace/git/worktrees/limit/update":
                 params = validate_wire(WorkspaceWorktreeLimitUpdateParams, raw_params)
-                orchestrator = await self._load_orchestrator(None)
+                orchestrator = await self._load_orchestrator(self._session_files(None))
                 failures = await orchestrator.set_field(
                     "/worktree_limit",
                     params.limit,
@@ -508,28 +571,12 @@ class HostRequestHandler:
                 )
             case "workspace/git/worktrees/prune":
                 validate_wire(WorkspaceWorktreePruneParams, raw_params)
-                orchestrator = await self._load_orchestrator(None)
-                removed = await asyncio.to_thread(
-                    ManagedWorktree.prune, orchestrator.config.worktree_limit
+                trust_store = self._harness_files.trust_store
+                self._worktrees.sweep(trust_store=trust_store)
+                removed = await self._worktrees.prune(
+                    await self._worktree_limit(), trust_store=trust_store
                 )
                 response = WorkspaceWorktreePruneResponse(removed=removed)
-            case "workspace/git/worktrees/reap":
-                params = validate_wire(WorkspaceWorktreeReapParams, raw_params)
-                response = await asyncio.to_thread(
-                    worktree_reap_response,
-                    self._cwd(params.cwd),
-                    params.requester_id,
-                    params.request_id,
-                )
-            case "workspace/git/worktrees/reap/cancel":
-                params = validate_wire(WorkspaceWorktreeReapCancelParams, raw_params)
-                await asyncio.to_thread(
-                    SessionWorktrees.cancel_reap,
-                    self._cwd(params.cwd),
-                    params.requester_id,
-                    params.request_id,
-                )
-                response = EmptyResponse()
             case "workspace/git/checkouts":
                 checkouts = validate_wire(WorkspaceGitCheckoutsParams, raw_params)
                 response = await asyncio.to_thread(
@@ -546,6 +593,7 @@ class HostRequestHandler:
                     delete_branch=params.delete_branch,
                     session_id=session_id,
                     inspect=params.inspect,
+                    trust_store=worktree_trust_store or self._harness_files.trust_store,
                 )
             case _:
                 raise method_not_found(method)
@@ -655,22 +703,104 @@ class HostRequestHandler:
         if session_path is None:
             raise FileNotFoundError(f"Session not found: {session_id}")
         messages, raw_metadata = SessionLoader.load_session(session_path)
-        return messages, SessionMetadata.model_validate(raw_metadata)
+        return messages, SessionMetadata.model_validate(
+            sanitize_artifacts_in_raw_metadata(raw_metadata, session_dir=session_path)
+        )
+
+    async def setup_telemetry(self, client_info: ClientInfo) -> TelemetryClient:
+        config = await self._load_config(None)
+        return TelemetryClient(
+            config_getter=lambda: config,
+            launch_context=_launch_context(client_info),
+            credentials=self._credentials,
+        )
 
     async def _load_config(self, cwd: str | None) -> VibeConfigSchema:
-        return (await self._load_orchestrator(cwd)).config
+        return (await self._load_orchestrator(self._session_files(cwd))).config
+
+    async def _worktree_limit(self) -> int:
+        # Desktop prunes on every session start: rebuilt only when the config
+        # it reads changed, not built whole each time on the event loop.
+        files = self._session_files(None)
+
+        async def build() -> BuiltSessionConfig:
+            orchestrator = await build_default_orchestrator(harness_files=files)
+            pre_org_config = orchestrator.config
+            key, tried, failure = await apply_cached_layers(
+                orchestrator,
+                self._org_config,
+                self._credentials,
+                model_catalog=self._model_catalog,
+            )
+            return BuiltSessionConfig(
+                orchestrator,
+                pre_org_config=pre_org_config,
+                org_config_key=key,
+                org_config_tried=tried,
+                org_config_failure=failure,
+            )
+
+        config = await self._worktree_limit_configs.config(
+            SessionConfigKey.of(self._cwd(None), {}, org_config=True),
+            files,
+            self._org_config,
+            build,
+            self._credentials,
+        )
+        return config.worktree_limit
+
+    def _session_files(self, cwd: str | None) -> HarnessFilesManager:
+        return self._harness_files.for_session(self._cwd(cwd))
+
+    def _local_skill_files(self, project_root: Path | None) -> HarnessFilesManager:
+        # The user's own skills follow the user's config, wherever this server runs.
+        if project_root is None:
+            return replace(self._session_files(None), sources=("user",))
+        return self._session_files(str(project_root))
+
+    def _resolved_builtin_plugin_roots(self) -> list[Path]:
+        from vibe.app_server._plugins import packaged_builtin_plugin_roots
+
+        if self._builtin_plugin_roots is None:
+            return packaged_builtin_plugin_roots()
+        return list(self._builtin_plugin_roots)
+
+    async def telemetry_enabled(self) -> bool:
+        """The telemetry gate from local and cached config, never fetched."""
+        orchestrator = await self._load_orchestrator(self._session_files(None))
+        return orchestrator.config.enable_telemetry
 
     async def _load_orchestrator(
-        self, cwd: str | None
+        self, session_files: HarnessFilesManager, *, org_config: bool = True
     ) -> ConfigOrchestrator[VibeConfigSchema]:
-        session_files = self._harness_files.for_session(self._cwd(cwd))
         orchestrator = await build_default_orchestrator(harness_files=session_files)
         # Match the session path so host reads (agents/list) see rollout flags
-        # like smart_approve_available. Lazy import: _runtime imports _host.
-        from vibe.app_server._runtime import _apply_cached_experiment_variants
-
-        await _apply_cached_experiment_variants(orchestrator)
+        # like smart_approve_available and the enforced default agent.
+        await apply_cached_layers(
+            orchestrator,
+            self._org_config if org_config else None,
+            self._credentials,
+            model_catalog=self._model_catalog,
+        )
         return orchestrator
+
+    async def _load_picker_orchestrator(
+        self,
+        cwd: str | None,
+        *,
+        client_info: ClientInfo | None,
+        attached_session_id: str | None,
+        session_files: HarnessFilesManager | None = None,
+    ) -> ConfigOrchestrator[VibeConfigSchema]:
+        files = session_files or self._session_files(cwd)
+        if attached_session_id is not None:
+            # Not the new-session picker: the connection's own session is
+            # fetching the same config, and a second fetch would only race it.
+            return await self._load_orchestrator(files)
+        # The server rejects pre-initialize requests, so a live picker read
+        # always carries the handshake's client info.
+        assert client_info is not None
+        return await self._missing_layers.load(files, client_info)
 
     @staticmethod
     def _cwd(value: str | None) -> Path:
@@ -679,163 +809,13 @@ class HostRequestHandler:
 
 @lru_cache(maxsize=1)
 def config_schema_response() -> ConfigSchemaReadResponse:
-    schema = VibeConfigSchema.model_json_schema(mode="serialization", by_alias=True)
+    schema = config_json_schema(VibeConfigSchema)
     encoded = json.dumps(schema, sort_keys=True, separators=(",", ":")).encode()
     version = hashlib.sha256(encoded, usedforsecurity=False).hexdigest()
     return ConfigSchemaReadResponse.model_validate({
         "config_schema_version": f"sha256:{version}",
         "config_schema": schema,
     })
-
-
-def project_session_list(
-    config: VibeConfigSchema, params: SessionListParams
-) -> SessionListResponse:
-    # `cwds` is the union of what `cwd` matches for each entry, so an explicit
-    # empty list matches nothing and an absent one keeps the single-cwd search.
-    requested = params.cwds if params.cwds is not None else [params.cwd]
-    sessions = list(
-        {
-            session.session_id: session
-            for cwd in requested
-            for session in _continue_resume_sessions(config, cwd)
-        }.values()
-    )
-    roots = _session_roots(sessions)
-    filtered = [
-        session
-        for session in sessions
-        if (
-            params.root_session_id is None
-            or roots[session.session_id] == params.root_session_id
-        )
-        and (
-            params.parent_session_id is None
-            or session.parent_session_id == params.parent_session_id
-        )
-    ]
-    filtered.sort(
-        key=lambda session: (session.updated_at, session.session_id), reverse=True
-    )
-    start = _session_cursor_index(filtered, params.cursor)
-    page = filtered[start : start + params.limit]
-    return SessionListResponse(
-        items=[
-            PublicSession(
-                id=session.session_id,
-                root_session_id=roots[session.session_id],
-                parent_session_id=session.parent_session_id,
-                title=session.title,
-                preview=SessionLoader.get_first_user_message(
-                    session.session_id, config.session_logging
-                ),
-                status=IdleSessionStatus(),
-                created_at=time_ms(
-                    session.start_time or session.updated_at, fallback=now_ms
-                ),
-                updated_at=time_ms(session.updated_at, fallback=now_ms),
-                bumped_at=optional_time_ms(session.bumped_at),
-                cwd=session.cwd or None,
-            )
-            for session in page
-        ],
-        next_cursor=(
-            _encode_session_cursor(page[-1])
-            if start + len(page) < len(filtered) and page
-            else None
-        ),
-        continue_session_id=_continue_session_id(config, filtered),
-    )
-
-
-def _continue_session_id(
-    config: VibeConfigSchema, filtered: list[ResumeSessionInfo]
-) -> str | None:
-    """The session ``--continue`` resumes: pointer-first, else most recent."""
-    if not filtered:
-        return None
-    candidate_ids = {session.session_id for session in filtered}
-    pointer_id = last_session_pointer.load(config.session_logging)
-    if pointer_id is not None and pointer_id in candidate_ids:
-        return pointer_id
-    return filtered[0].session_id
-
-
-def _continue_resume_sessions(
-    config: VibeConfigSchema, cwd: str | None
-) -> list[ResumeSessionInfo]:
-    sessions = list_local_resume_sessions(config, cwd)
-    if cwd is None:
-        return sessions
-
-    requested = Path(cwd).expanduser().resolve()
-    listed_ids = {session.session_id for session in sessions}
-    sessions.extend(
-        session
-        for session in list_local_resume_sessions(config, None)
-        if session.session_id not in listed_ids
-        and _resume_session_cwd_matches(session.cwd, requested)
-    )
-    sessions.sort(
-        key=lambda session: (session.updated_at, session.session_id), reverse=True
-    )
-    return sessions
-
-
-def _resume_session_cwd_matches(session_cwd: str, requested_cwd: Path) -> bool:
-    cwd = Path(session_cwd).expanduser().resolve()
-    if cwd == requested_cwd:
-        return True
-    managed = ManagedWorktree.at(cwd)
-    if managed is None:
-        return False
-    mapping = managed.retained_repository_mapping(cwd)
-    return (
-        mapping is not None
-        and requested_cwd.is_relative_to(mapping.root)
-        and mapping.cwd.is_relative_to(requested_cwd)
-    )
-
-
-def _session_roots(sessions: list[ResumeSessionInfo]) -> dict[str, str]:
-    parents = {session.session_id: session.parent_session_id for session in sessions}
-    roots: dict[str, str] = {}
-    for session_id in parents:
-        seen: set[str] = set()
-        current = session_id
-        while (parent := parents.get(current)) is not None and parent in parents:
-            if parent in seen:
-                current = session_id
-                break
-            seen.add(current)
-            current = parent
-        roots[session_id] = current
-    return roots
-
-
-def _encode_session_cursor(session: ResumeSessionInfo) -> str:
-    payload = f"{session.updated_at}\0{session.session_id}".encode()
-    return base64.urlsafe_b64encode(payload).decode().rstrip("=")
-
-
-def _session_cursor_index(sessions: list[ResumeSessionInfo], cursor: str | None) -> int:
-    if cursor is None:
-        return 0
-    padded = cursor + "=" * (-len(cursor) % 4)
-    try:
-        updated_at, session_id = (
-            base64.urlsafe_b64decode(padded).decode().split("\0", 1)
-        )
-    except (ValueError, UnicodeDecodeError):
-        return len(sessions)
-    return next(
-        (
-            index + 1
-            for index, session in enumerate(sessions)
-            if (session.updated_at, session.session_id) == (updated_at, session_id)
-        ),
-        len(sessions),
-    )
 
 
 def worktree_list_response(
@@ -964,6 +944,8 @@ def worktree_remove_response(
     delete_branch: bool | None = None,
     session_id: str | None = None,
     inspect: bool = False,
+    *,
+    trust_store: TrustedFoldersManager | None = None,
 ) -> WorkspaceWorktreeRemoveResponse:
     managed = ManagedWorktree.at(cwd)
     if managed is None:
@@ -989,14 +971,16 @@ def worktree_remove_response(
         if inspect:
             # The exit prompt's progress line: what a removal would do, asked
             # before anything commits. The probe never mutates the claim.
-            release = managed.probe_release(session_id)
+            release = managed.probe_release(session_id, trust_store=trust_store)
         elif force:
-            release = managed.force_release(session_id, delete_branch)
+            release = managed.force_release(
+                session_id, delete_branch, trust_store=trust_store
+            )
         else:
             # The plain call keeps its historical contract: snapshot-then-remove,
             # no holder discount. Desktop removes a deleted session's worktree
             # this way, and the caller's own session was never passed before.
-            release = managed.release()
+            release = managed.release(trust_store=trust_store)
     except (GitError, OSError) as e:
         logger.warning(
             "Failed to %s worktree cwd=%s: %s", "probe" if inspect else "remove", cwd, e
@@ -1015,31 +999,6 @@ def worktree_remove_response(
         reasons=list(release.reasons),
         branch_created=branch_created,
         holders=holders,
-    )
-
-
-def worktree_reap_response(
-    cwd: Path, requester_id: str | None = None, request_id: str | None = None
-) -> WorkspaceWorktreeReapResponse:
-    managed = ManagedWorktree.at(cwd)
-    if managed is None:
-        return WorkspaceWorktreeReapResponse(outcome="kept_unmanaged")
-    try:
-        release = managed.reap(requester_id=requester_id, request_id=request_id)
-    except (GitError, OSError) as exc:
-        logger.warning("Failed to reap worktree cwd=%s: %s", cwd, exc)
-        return WorkspaceWorktreeReapResponse(outcome="kept_error", reasons=[str(exc)])
-
-    return WorkspaceWorktreeReapResponse(
-        outcome=(
-            "kept_cancelled"
-            if release.outcome is WorktreeReleaseOutcome.KEPT_CANCELLED
-            else _WORKTREE_REMOVE_OUTCOMES[release.outcome]
-        ),
-        root=None if release.root is None else str(release.root),
-        branch=release.branch,
-        branch_deleted=release.branch_deleted,
-        reasons=list(release.reasons),
     )
 
 

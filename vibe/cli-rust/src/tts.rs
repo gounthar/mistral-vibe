@@ -1,4 +1,4 @@
-//! Text-to-speech over the Mistral speech API (Python `MistralTTSClient`).
+//! Text-to-speech over the Mistral speech API.
 
 use std::time::Duration;
 
@@ -10,7 +10,7 @@ use crate::audio_player::AudioError;
 const TIMEOUT: Duration = Duration::from_secs(60);
 const SDK_ERROR: &str = "SDKError";
 
-/// Python `SpeechConfigView`, flattened to the fields the client sends.
+/// The server's `SpeechConfigView`, flattened to the fields the client sends.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SpeechConfig {
     pub name: String,
@@ -23,19 +23,16 @@ pub struct SpeechConfig {
 impl SpeechConfig {
     /// The `speech` projection of a `runtime` value; `None` when the server sends none.
     pub fn from_runtime(runtime: &Value) -> Option<Self> {
-        let speech = runtime.pointer("/runtime/config/speech")?;
-        let field = |pointer: &str| {
-            speech
-                .pointer(pointer)
-                .and_then(Value::as_str)
-                .map(str::to_owned)
-        };
+        let speech = crate::server::RuntimeSnapshot::config(runtime)?.speech?;
         Some(Self {
-            name: field("/model/name")?,
-            voice: field("/model/voice")?,
-            response_format: field("/model/responseFormat").unwrap_or_else(|| "wav".to_owned()),
-            api_base: field("/provider/apiBase")?,
-            api_key_env_var: field("/provider/apiKeyEnvVar").unwrap_or_default(),
+            name: speech.model.name?,
+            voice: speech.model.voice?,
+            response_format: speech
+                .model
+                .response_format
+                .unwrap_or_else(|| "wav".to_owned()),
+            api_base: speech.provider.api_base?,
+            api_key_env_var: speech.provider.api_key_env_var,
         })
     }
 
@@ -44,7 +41,7 @@ impl SpeechConfig {
         format!("{}/v1/audio/speech", self.api_base.trim_end_matches('/'))
     }
 
-    /// The `SpeechRequest` body Python's `audio.speech.complete_async` sends.
+    /// The `SpeechRequest` body the Mistral SDK's `audio.speech.complete_async` sends.
     pub fn request_body(&self, text: &str, metadata: Value) -> Value {
         json!({
             "model": self.name,
@@ -57,7 +54,7 @@ impl SpeechConfig {
     }
 }
 
-/// Python `build_audio_request_metadata`, minus the fields the Rust client does not track.
+/// Audio request metadata, minus the fields this client does not track.
 pub fn audio_request_metadata(session_id: &str) -> Value {
     let os = match std::env::consts::OS {
         "macos" => "darwin",
@@ -72,21 +69,28 @@ pub fn audio_request_metadata(session_id: &str) -> Value {
     })
 }
 
-/// Python `MistralTTSClient.speak`: the decoded audio bytes.
+/// Synthesize `text`: the decoded audio bytes.
 pub async fn speak(
     cfg: &SpeechConfig,
+    credential_client: Option<&crate::server::Client>,
     api_key: &str,
     text: &str,
     metadata: Value,
 ) -> Result<Vec<u8>, AudioError> {
-    let client = build_http_client().map_err(|e| AudioError::new(SDK_ERROR, e))?;
+    let oidc = api_key == crate::credentials::oidc::API_KEY_MARKER;
+    let client = build_http_client(oidc).map_err(|e| AudioError::new(SDK_ERROR, e))?;
     let user_agent = concat!(
         "mistral-client-python/Mistral-Vibe/",
         env!("CARGO_PKG_VERSION")
     );
-    let response = client
-        .post(cfg.url())
-        .bearer_auth(api_key)
+    let headers = crate::credentials::oidc::headers(credential_client, &cfg.url(), api_key)
+        .await
+        .map_err(AudioError::backend)?;
+    let mut request = client.post(cfg.url());
+    for (name, value) in headers {
+        request = request.header(name, value);
+    }
+    let response = request
         .header(reqwest::header::USER_AGENT, user_agent)
         .json(&cfg.request_body(text, metadata))
         .send()
@@ -106,7 +110,7 @@ pub async fn speak(
     decode_audio(&body)
 }
 
-/// The httpx exception Python's SDK lets through for a failed request.
+/// The error type for a failed request, named after the Mistral SDK's httpx exceptions.
 fn request_error_type(error: &reqwest::Error) -> &'static str {
     if error.is_timeout() {
         "ReadTimeout"
@@ -117,7 +121,7 @@ fn request_error_type(error: &reqwest::Error) -> &'static str {
     }
 }
 
-/// Python's SDK raises `HTTPValidationError` on 422 and `SDKError` otherwise.
+/// The Mistral SDK error names: `HTTPValidationError` on 422 and `SDKError` otherwise.
 pub fn status_error_type(status: u16) -> &'static str {
     if status == 422 {
         "HTTPValidationError"
@@ -126,15 +130,20 @@ pub fn status_error_type(status: u16) -> &'static str {
     }
 }
 
-/// ADR 0015: the speech client verifies against the effective trust policy.
-pub fn build_http_client() -> Result<reqwest::Client, String> {
-    let builder = reqwest::Client::builder().timeout(TIMEOUT);
+/// ADR 0015: the speech client verifies against the effective trust policy,
+/// with the same proxy handling as the shared builder; OIDC tokens never follow redirects.
+pub fn build_http_client(oidc: bool) -> Result<reqwest::Client, String> {
+    let mut builder =
+        crate::utils::system_proxy::apply(reqwest::Client::builder().timeout(TIMEOUT));
+    if oidc {
+        builder = builder.redirect(reqwest::redirect::Policy::none());
+    }
     crate::utils::tls::apply_tls_trust(builder)
         .build()
         .map_err(|e| format!("TTS client failed to build: {e}"))
 }
 
-/// The `SpeechResponse.audio_data` payload, base64-decoded (`binascii.Error` in Python).
+/// The `SpeechResponse.audio_data` payload, base64-decoded.
 pub fn decode_audio(body: &Value) -> Result<Vec<u8>, AudioError> {
     let data = body
         .get("audio_data")

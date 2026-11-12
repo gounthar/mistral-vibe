@@ -21,7 +21,6 @@ pub(super) fn finish_resume(app: &mut App) -> bool {
     if !std::mem::take(&mut app.resume_picker.resuming) {
         return false;
     }
-    app.commit_finished();
     true
 }
 
@@ -43,6 +42,31 @@ pub(crate) fn load_history(app: &mut App, state: &PublicSessionState) {
     app.expand_rebuilt_tools();
 }
 
+const PREVIEW_ERROR_ID: &str = "rs-resume-preview-error";
+
+/// The picker stays open on a failed preview; the error replaces the last preview.
+pub(super) fn preview_failed(app: &mut App) {
+    scroll_to_bottom(app);
+    app.view.transcript.remove(PREVIEW_ERROR_ID);
+    let notices = local::preserve(&app.view.transcript);
+    app.view.transcript.clear();
+    local::restore(&mut app.view.transcript, notices);
+    app.view
+        .transcript_cache
+        .start_history(app.view.transcript.entry_count());
+    local::add_command_error(
+        &mut app.view.transcript,
+        PREVIEW_ERROR_ID,
+        "Failed to load session preview.",
+    );
+}
+
+/// Show a loaded preview, dropping the failure notice a previous one left.
+pub(super) fn show_preview(app: &mut App, state: &PublicSessionState) {
+    app.view.transcript.remove(PREVIEW_ERROR_ID);
+    load_history(app, state);
+}
+
 pub(super) fn close(app: &mut App) {
     finish_resume(app);
     app.resume_picker.open = false;
@@ -50,8 +74,8 @@ pub(super) fn close(app: &mut App) {
     let previewing = app.resume_picker.previewing;
     if let Some(transcript) = app.resume_picker.transcript.take() {
         if previewing {
-            // Python rebuilds the transcript from the current session on cancel,
-            // dropping notices (e.g. a delete confirmation) mounted over the preview.
+            // Cancel rebuilds the transcript from the current session, dropping
+            // notices (e.g. a delete confirmation) mounted over the preview.
             app.view.transcript.restore(transcript);
         } else {
             // No preview replaced the log, so keep notices mounted while open.
@@ -59,39 +83,15 @@ pub(super) fn close(app: &mut App) {
             app.view.transcript.restore(transcript);
             local::restore(&mut app.view.transcript, notices);
         }
+        crate::notices::sync(app);
         app.view
             .transcript_cache
             .start_history(app.view.transcript.entry_count());
-        // Exiting the preview is Python's transcript rebuild: re-decide the
-        // custom-tools deprecation on the session restored underneath.
-        crate::startup::banners::rebuild_custom_tools_deprecation(app);
     }
 }
 
-/// Mount a notice on the transcript Esc restores rather than on the preview
-/// covering it: Python mounts into the live log, which the preview hides.
-pub(super) fn behind(app: &mut App, mount: impl FnOnce(&mut App)) {
-    let Some(saved) = app.resume_picker.transcript.take() else {
-        mount(app);
-        return;
-    };
-    let preview = app.view.transcript.snapshot();
-    app.view.transcript.restore(saved);
-    mount(app);
-    app.resume_picker.transcript = Some(app.view.transcript.snapshot());
-    app.view.transcript.restore(preview);
-}
-
 pub(super) fn result(app: &mut App, text: &str) {
-    local::add_command_result(
-        &mut app.view.transcript,
-        &submission::new_message_id(),
-        text,
-    );
-}
-
-pub(super) fn error(app: &mut App, text: &str) {
-    local::add_command_error(
+    local::add_command_status(
         &mut app.view.transcript,
         &submission::new_message_id(),
         text,

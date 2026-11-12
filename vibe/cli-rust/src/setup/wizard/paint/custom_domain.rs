@@ -1,4 +1,4 @@
-//! The custom-domain screen (Python `CustomDomainScreen`): the domain plus the
+//! The custom-domain screen: the domain plus the
 //! optional split-horizon browser-auth API base.
 
 use ratatui::layout::Rect;
@@ -16,10 +16,42 @@ pub(super) fn draw(
     area: Rect,
     chat_frame: &str,
 ) {
+    // An administrator-pinned console renders as one locked card: no API
+    // base, no caret, the submit hint under it.
+    if wizard.context.pinned_console_url.is_some() {
+        let rows = vec![
+            Row::Blank(2),
+            Row::InputCard {
+                input: wizard.custom_domain.clone(),
+                focused: false,
+                title: "Console URL",
+                placeholder: "console.mistral.ai",
+                secure: false,
+                card: InputCard::Domain,
+            },
+            Row::Blank(1),
+            Row::Feedback(ValidationState::Valid),
+            Row::Blank(2),
+            Row::Hint(Hint::Keys(&[crate::hints::BACK])),
+        ];
+        render(
+            app,
+            wizard,
+            f,
+            area,
+            chat_frame,
+            "Sign in to your console",
+            Subtitle::Text(
+                "Your administrator has configured Vibe to sign in to this console.".into(),
+            ),
+            &rows,
+        );
+        return;
+    }
     let domain = wizard.custom_domain.clone();
     let api = wizard.custom_domain_api.clone();
     let focus = wizard.custom_domain_focus;
-    // Python's feedback is change-driven: the row describes the last edited
+    // Feedback is change-driven: the row describes the last edited
     // input, not the focused one, so Tab never clears it.
     let validation = if wizard.custom_domain_feedback == 0 {
         domain.validation.clone()
@@ -27,9 +59,8 @@ pub(super) fn draw(
         api.validation.clone()
     };
     // The first card sits two blank rows under the subtitle — the gap the
-    // option screens keep (options.rs). Python's subtitles differ per screen
-    // (`margin-bottom: 2` for the option screens, `1` here), and the wizard
-    // holds one gap. The validation row only exists while it carries text —
+    // option screens keep (options.rs). The validation row only exists
+    // while it carries text —
     // no content means no reserved padding — and the hint keeps the two
     // blank rows every panel screen uses before it.
     let has_feedback = !matches!(validation, ValidationState::None);

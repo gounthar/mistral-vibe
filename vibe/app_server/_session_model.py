@@ -1,27 +1,17 @@
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
-from typing import Any
-
-from pydantic import JsonValue
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 
 from vibe.app_server._config_paths import ACTIVE_MODEL_PATH, model_thinking_path
 from vibe.app_server._config_write import config_write_ops_to_patches
 from vibe.app_server.protocol import ConfigWriteOpWire
+from vibe.core.config.layer import RawConfig
 from vibe.core.config.layers.admin import AdminConfigLayer
 from vibe.core.config.layers.agent_profile import AgentProfileLayer
 from vibe.core.config.layers.overrides import OverridesLayer
 from vibe.core.config.orchestrator import ConfigOrchestrator
 from vibe.core.config.patch import AddOperationPatch, RemoveOperationPatch
 from vibe.core.config.vibe_schema import VibeConfigSchema
-
-
-def stored_session_active_model(config: Mapping[str, JsonValue] | None) -> str | None:
-    """Return a concrete model alias from a session config snapshot."""
-    if config is None:
-        return None
-    active_model = config.get("active_model")
-    return active_model if isinstance(active_model, str) and active_model else None
 
 
 def active_model_override_write_requested(ops: Sequence[ConfigWriteOpWire]) -> bool:
@@ -74,6 +64,7 @@ async def set_session_active_model_override(
     active_model: str,
     *,
     reason: str,
+    preflight: Callable[[VibeConfigSchema], Awaitable[None]] | None = None,
 ) -> list[BaseException]:
     if override_active_model(orchestrator) == active_model:
         return []
@@ -86,6 +77,7 @@ async def set_session_active_model_override(
             )
         ],
         reason=reason,
+        preflight=preflight,
     )
 
 
@@ -104,21 +96,12 @@ async def clear_session_active_model_override(
     )
 
 
-def _sets_thinking(data: object, alias: str) -> bool:
-    models = getattr(data, "models", None)
-    if isinstance(models, Mapping):
-        entry = models.get(alias)
-    elif isinstance(models, Sequence) and not isinstance(models, str | bytes):
-        entry = next(
-            (
-                candidate
-                for candidate in models
-                if isinstance(candidate, Mapping) and candidate.get("alias") == alias
-            ),
-            None,
-        )
-    else:
+def _sets_thinking(
+    config: VibeConfigSchema, data: RawConfig | None, alias: str
+) -> bool:
+    if data is None:
         return False
+    entry = config.layer_models(data.model_dump()).get(alias)
     return isinstance(entry, Mapping) and isinstance(entry.get("thinking"), str)
 
 
@@ -140,7 +123,7 @@ def model_thinking_is_session_writable(
     """
     return not any(
         layer.name in _LAYERS_OUTRANKING_THE_SESSION
-        and _sets_thinking(layer.cached_data, alias)
+        and _sets_thinking(orchestrator.config, layer.cached_data, alias)
         for layer in orchestrator.layers
     )
 
@@ -153,9 +136,10 @@ async def set_session_reasoning_effort_override(
 ) -> list[BaseException]:
     """Scope the active model's level to the session.
 
-    Through the same translation a ``config/write`` uses, so a model that no
-    durable layer declares is materialized with its identity fields rather than
-    left as an entry holding one field, which is not a valid model on its own.
+    Through the same translation a ``config/write`` uses: a model that no
+    durable layer declares is materialized with its identity fields, except
+    one the catalog or GrowthBook layer defines, which keeps a settings-only
+    entry.
     """
     alias = orchestrator.config.get_active_model().alias
     if not model_thinking_is_session_writable(orchestrator, alias):
@@ -171,13 +155,6 @@ async def set_session_reasoning_effort_override(
     operations = config_write_ops_to_patches(
         orchestrator.config,
         ops,
-        durable_model_aliases=await orchestrator.durable_model_aliases(),
+        sparse_override_model_aliases=await orchestrator.sparse_override_model_aliases(),
     )
     return await orchestrator.apply_patch(operations, reason=reason)
-
-
-def config_active_model(metadata: Mapping[str, Any]) -> str | None:
-    raw_config = metadata.get("config")
-    if not isinstance(raw_config, dict):
-        return None
-    return stored_session_active_model(raw_config)

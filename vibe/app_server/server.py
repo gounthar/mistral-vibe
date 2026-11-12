@@ -1,22 +1,41 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import AsyncIterator, Callable
-from contextlib import AbstractAsyncContextManager, asynccontextmanager, suppress
+from collections.abc import AsyncIterator, Awaitable, Callable
+from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass
 from enum import StrEnum, auto
 import os
 from typing import TYPE_CHECKING, Any, cast
 
-from pydantic import JsonValue, ValidationError
+from pydantic import JsonValue, TypeAdapter, ValidationError
 
 from vibe import __version__
 from vibe.app_server._account import AccountGateway
+from vibe.app_server._client_provided_tools import (
+    ClientToolCall,
+    ClientToolError,
+    ClientToolResult,
+    ClientToolRunner,
+)
+from vibe.app_server._connection_protocol import (
+    AgentPlugin,
+    ClientToolCallerParams,
+    ClientToolCallParams,
+    ClientToolCallResponse,
+    ClientToolDefinitionParams,
+)
+from vibe.app_server._credential_selection import (
+    ConnectionCredentialSelection,
+    select_platform_credentials,
+)
 from vibe.app_server._dispatch import DispatchResult, RequestFailure, method_not_found
 from vibe.app_server._execution import cancel_tasks
 from vibe.app_server._host import HostRequestHandler
 from vibe.app_server._identity import IdentityGateway
+from vibe.app_server._imports import ImportsService
 from vibe.app_server._model import ProtocolModel, validate_wire
+from vibe.app_server._platform_credentials import ConnectionPlatformCredentialProvider
 from vibe.app_server._session_backend_port import (
     SessionBackend,
     SessionBackendCallbackSink,
@@ -28,23 +47,33 @@ from vibe.app_server._session_backend_port import (
     SessionBackendHistoryClearHost,
     SessionBackendHost,
     SessionBackendHostArchive,
+    SessionBackendHostArtifacts,
     SessionBackendHostBackgroundTasks,
+    SessionBackendHostClientLoss,
     SessionBackendHostConfigRead,
     SessionBackendHostDelete,
     SessionBackendHostHistoryList,
     SessionBackendHostLeaseWatch,
+    SessionBackendHostMove,
     SessionBackendHostPin,
+    SessionBackendHostRelocate,
     SessionBackendHostSeenState,
     SessionBackendNotificationSink,
     SessionBackendOpenCallbacks,
+    SessionBackendQueuedTurnEditing,
     SessionBackendQueuedTurnSteering,
     SessionBackendResult,
     SessionBackendRewindForkHost,
+    SessionBackendRunningTurnAnnouncement,
     SessionBackendRuntimeView,
+    SessionBackendWorktreeTrust,
     SessionEventSubscription,
 )
 from vibe.app_server._session_backend_services import SessionBackendServices
 from vibe.app_server._session_lease_subscription import SessionLeaseSubscription
+from vibe.app_server._session_peers import SessionPeerError
+from vibe.app_server._session_spawn import SessionSpawnError
+from vibe.app_server._setup_oidc import SetupOidcHandler
 from vibe.app_server.connector_catalog import ConnectorCatalogService
 from vibe.app_server.events import (
     CallbackRequested,
@@ -54,9 +83,18 @@ from vibe.app_server.events import (
 from vibe.app_server.models import OpenCallbackState, PublicCallbackEntry
 from vibe.app_server.protocol import (
     SERVER_METHODS,
+    SESSION_PEER_ARCHIVE_METHOD,
+    SESSION_PEER_LIST_METHOD,
+    SESSION_PEER_MARK_SEEN_METHOD,
+    SESSION_PEER_READ_METHOD,
+    SESSION_PEER_RESTORE_METHOD,
+    SESSION_PEER_SEND_METHOD,
+    SESSION_SPAWN_METHOD,
     AgentInstallParams,
     AgentSwitchParams,
-    AppServerResponseError,
+    ArtifactsListParams,
+    ArtifactsMarkViewedParams,
+    ArtifactsSyncParams,
     CallbackCallParams,
     CallbackCallResponse,
     CallbackResultError,
@@ -67,9 +105,14 @@ from vibe.app_server.protocol import (
     ConfigReloadParams,
     ConfigWriteParams,
     ContextInjectParams,
+    EmptyResponse,
     EventBatch,
     EventNotificationParams,
     EventsReadParams,
+    ImportDiscoveryParams,
+    ImportJobReadParams,
+    ImportJobStartParams,
+    ImportJobUpdatedParams,
     InitializeParams,
     InitializeResponse,
     InvalidParamsData,
@@ -81,6 +124,9 @@ from vibe.app_server.protocol import (
     ModelConfigWriteParams,
     Notification,
     PageRequest,
+    PlatformCredentialsInvalidatedParams,
+    PlatformCredentialsResolveParams,
+    PlatformCredentialsResolveResponse,
     ProtocolError,
     ProtocolErrorCode,
     ServerInfo,
@@ -97,34 +143,62 @@ from vibe.app_server.protocol import (
     SessionHistoryListParams,
     SessionListParams,
     SessionMarkAsSeenParams,
+    SessionMoveParams,
+    SessionPeerArchiveParams,
+    SessionPeerArchiveResponse,
+    SessionPeerListParams,
+    SessionPeerListResponse,
+    SessionPeerMarkSeenParams,
+    SessionPeerMarkSeenResponse,
+    SessionPeerReadParams,
+    SessionPeerReadResponse,
+    SessionPeerRestoreParams,
+    SessionPeerRestoreResponse,
+    SessionPeerSendParams,
+    SessionPeerSendResponse,
     SessionPinParams,
     SessionReadParams,
     SessionReadResponse,
+    SessionRelocateParams,
     SessionResumeParams,
     SessionResumeResponse,
     SessionRewindParams,
     SessionSettingsUpdateParams,
     SessionSnapshotParams,
+    SessionSpawnParams,
+    SessionSpawnResponse,
     SessionStartParams,
     SessionStartResponse,
     SessionTitleUpdateParams,
     TransportKind,
     TurnEnqueueParams,
     TurnInterruptParams,
+    TurnQueueEditAbandonParams,
+    TurnQueueEditCancelParams,
+    TurnQueueEditSaveParams,
+    TurnQueueEditStartParams,
     TurnQueueReadParams,
     TurnQueueRemoveParams,
     TurnQueueReplaceParams,
     TurnQueueResumeParams,
     TurnQueueSteerParams,
     TurnStartParams,
+    TurnStartResponse,
     TurnSteerParams,
     format_invalid_params_issues,
     validate_callback_acknowledgement,
     validate_json_rpc_envelope,
 )
-from vibe.app_server.transport import JsonRpcTransport
-from vibe.core.config.harness_files import HarnessFilesManager
+from vibe.app_server.transport import ClientLossAwareTransport, JsonRpcTransport
+from vibe.core.platform_auth import PlatformCredentialProvider
 from vibe.observability.logging import logger
+from vibe.observability.sentry import (
+    capture_sentry_exception,
+    cli_crash_reporting_available,
+    init_cli_sentry,
+    report_unhandled_asyncio_errors,
+)
+from vibe.setup.auth._oidc_tenant import OidcTenantResolver
 
 if TYPE_CHECKING:
     from vibe.app_server.mcp_catalog import MCPCatalogService
@@ -153,6 +227,13 @@ _SESSION_ATTACHMENT_CANDIDATES = frozenset({
     "session/history/clear",
 })
 
+# Requests that reopen a session another connection or process may have left
+# mid-turn. The client never saw that turn's `turn/started`, so it is announced
+# again, before that turn's live events are forwarded. A new session's first
+# turn announces itself, and announcing it twice would reset what the client
+# tracks for it.
+_RUNNING_TURN_ANNOUNCEMENT_METHODS = frozenset({"session/resume", "session/continue"})
+
 _SESSION_BACKEND_HOST_LIFECYCLE_METHODS = frozenset({
     "session/start",
     "session/resume",
@@ -162,6 +243,7 @@ _SESSION_BACKEND_HOST_LIFECYCLE_METHODS = frozenset({
 _SESSION_OPTIONAL_METHODS = frozenset({
     "agents/list",
     "config/read",
+    "skills/list",
     "workspace/trust/decision",
 })
 
@@ -177,6 +259,10 @@ _SESSION_BACKEND_METHODS = frozenset({
     "session/context/inject",
     "session/settings/update",
     "session/turn/enqueue",
+    "session/turn/queue/edit/abandon",
+    "session/turn/queue/edit/cancel",
+    "session/turn/queue/edit/save",
+    "session/turn/queue/edit/start",
     "session/turn/queue/read",
     "session/turn/queue/remove",
     "session/turn/queue/replace",
@@ -195,21 +281,10 @@ class CallbackDelivery:
     answered: bool = False
 
 
-@dataclass(slots=True)
-class PendingClientRequest:
-    response_type: type[ProtocolModel]
-    future: asyncio.Future[ProtocolModel]
-
-
 @dataclass(frozen=True, slots=True)
 class PendingNotification:
     method: str
     params: ProtocolModel
-
-
-def _consume_task_result(task: asyncio.Task[object]) -> None:
-    if not task.cancelled():
-        task.exception()
 
 
 @dataclass(frozen=True, slots=True)
@@ -220,35 +295,49 @@ class _ErrorDispatch:
 
 
 class AppServer:
-    def __init__(
+    def __init__(  # noqa: PLR0913 - one collaborator per concern, all keyword-only
         self,
         transport: JsonRpcTransport,
         *,
         session_backend_host_factory: SessionBackendHostFactory,
+        host_handler: HostRequestHandler,
+        oidc_tenants: OidcTenantResolver,
         transport_kind: TransportKind = "in_process",
         account_gateway: AccountGateway | None = None,
         identity_gateway: IdentityGateway | None = None,
-        host_handler: HostRequestHandler | None = None,
         mcp_catalog_service: MCPCatalogService | None = None,
         connector_catalog_service: ConnectorCatalogService | None = None,
         plugin_catalog_service: PluginCatalogService | None = None,
+        imports_service: ImportsService | None = None,
+        configure_agent_plugins: Callable[
+            [list[AgentPlugin], list[ClientToolDefinitionParams], ClientToolRunner],
+            None,
+        ]
+        | None = None,
     ) -> None:
         self._root: SessionBackend | None = None
-        self._host_handler = host_handler or HostRequestHandler(
-            HarnessFilesManager(sources=("user", "project"))
-        )
+        self._host_handler = host_handler
+        self._setup_oidc = SetupOidcHandler(self._host_handler.setup_telemetry)
         self._transport: JsonRpcTransport | None = transport
-        self._transport_kind: TransportKind = transport_kind
         self._initialization = InitializationState.UNINITIALIZED
         self._client_info: ClientInfo | None = None
         self._client_capabilities = ClientCapabilities()
         self._next_request_id = 1
         self._event_watermarks: dict[str, int] = {}
         self._callback_requests: dict[int, CallbackDelivery] = {}
-        self._client_requests: dict[int, PendingClientRequest] = {}
-        self._abandoned_client_request_ids: set[int] = set()
+        self._platform_credential_requests: dict[
+            int, asyncio.Future[PlatformCredentialsResolveResponse]
+        ] = {}
+        self._abandoned_platform_credential_requests: set[int] = set()
+        self._client_requests: dict[int, _ClientRequest] = {}
+        # Given up on our side; the client may still answer.
+        self._unanswered_client_requests: dict[int, str] = {}
         self._request_tasks: set[asyncio.Task[None]] = set()
+        self._crash_reporting_task: asyncio.Task[None] | None = None
+        self._crash_reporting_tasks: set[asyncio.Task[None]] = set()
         self._leases = SessionLeaseSubscription(self._send_notification)
+        # The connection's artifacts/subscribe, until it ends.
+        self._unsubscribe_artifacts: Callable[[], None] | None = None
         self._backend_event_task: asyncio.Task[None] | None = None
         self._backend_event_backend: SessionBackend | None = None
         self._serve_task: asyncio.Task[None] | None = None
@@ -265,9 +354,16 @@ class AppServer:
         self._shutdown_complete = False
         self._account_gateway = account_gateway
         self._identity_gateway = identity_gateway
+        self._platform_credentials: ConnectionPlatformCredentialProvider | None = None
+        # This connection's providers, built at ``initialize`` once the client
+        # is known, and kept for the connection's lifetime.
+        self._credential_selection: ConnectionCredentialSelection | None = None
         self._mcp_catalog_service = mcp_catalog_service
         self._connector_catalog_service = connector_catalog_service
         self._plugin_catalog_service = plugin_catalog_service
+        self._imports_service = imports_service
+        self._oidc_tenants = oidc_tenants
+        self._configure_agent_plugins = configure_agent_plugins
         self._session_backend_host = session_backend_host_factory(self)
         if self._session_backend_host is None:
             raise TypeError(
@@ -279,8 +375,70 @@ class AppServer:
             raise RuntimeError("No app-server session runtime is active")
         return self._root
 
+    def _require_imports(self) -> ImportsService:
+        if self._imports_service is None:
+            raise RequestFailure(
+                ProtocolErrorCode.NOT_IMPLEMENTED, "Imports are not configured"
+            )
+        return self._imports_service
+
+    def _crash_reporting_client(self) -> ClientInfo | None:
+        # Only the terminal UI hands a DSN: Desktop, run servers and vibe-acp never do.
+        return self._client_info if cli_crash_reporting_available() else None
+
+    def _gate_crash_reporting(self, read_gate: Callable[[], Awaitable[bool]]) -> None:
+        """Applies the telemetry gate off the request path, in the order asked."""
+        client = self._crash_reporting_client()
+        if client is None:
+            return
+        previous = self._crash_reporting_task
+
+        async def gate() -> None:
+            if previous is not None:
+                await asyncio.wait({previous})
+            try:
+                enabled = await read_gate()
+                await asyncio.to_thread(_init_crash_reporting, client, enabled=enabled)
+                if enabled:
+                    report_unhandled_asyncio_errors(asyncio.get_running_loop())
+            except Exception:
+                logger.warning("Could not configure crash reporting", exc_info=True)
+
+        task = asyncio.create_task(gate())
+        self._crash_reporting_task = task
+        # Every gate, not only the last: shutdown must stop an earlier opt-in too.
+        self._crash_reporting_tasks.add(task)
+        task.add_done_callback(self._crash_reporting_tasks.discard)
+
+    def _configure_crash_reporting(self, backend: SessionBackend) -> None:
+        """The attached session's config gates reporting, as the TUI's at Ready."""
+        if not isinstance(backend, SessionBackendRuntimeView):
+            return
+        try:
+            enabled = backend.runtime_updated_params().runtime.config.enable_telemetry
+        except Exception:
+            logger.warning("Could not read the telemetry gate", exc_info=True)
+            return
+        self._gate_crash_reporting(lambda: _resolved(enabled))
+
+    def _report_dispatch_error(self, method: str, exc: Exception) -> None:
+        # vibe-acp reports its own failures, including the ones it gets from here.
+        if self._crash_reporting_client() is None:
+            return
+        tags = {"vibe_boundary": "app_server_dispatch", "app_server_method": method}
+        fingerprint = None
+        if isinstance(exc, SessionBackendError) and (code := _harness_code(exc)):
+            tags["harness_code"] = code
+            # One harness code is one bug, whatever session or path its message names.
+            fingerprint = ["app-server-harness-error", method, code]
+        capture_sentry_exception(exc, fatal=False, tags=tags, fingerprint=fingerprint)
+
     async def _activate_backend(
-        self, backend: SessionBackend, history_limit: int
+        self,
+        backend: SessionBackend,
+        history_limit: int,
+        *,
+        announce_running_turn: bool = False,
     ) -> SessionReadResponse:
         params = SessionReadParams(
             session_id=backend.session_id, history=PageRequest(limit=history_limit)
@@ -290,6 +448,12 @@ class AppServer:
         subscription = await backend.subscribe(params)
         previous = self._root
         self._root = backend
+        self._configure_crash_reporting(backend)
+        # The client treats a turn as running only after `turn/started`. Queue
+        # that announcement before the forwarder, so recovered history updates
+        # and token deltas cannot reach the client first and be discarded.
+        if announce_running_turn:
+            await self._announce_running_turn()
         await self._replace_backend_event_task(backend, subscription)
         if previous is not None and previous is not backend:
             try:
@@ -443,6 +607,8 @@ class AppServer:
             self._initialization = InitializationState.UNINITIALIZED
             self._client_info = None
             self._client_capabilities = ClientCapabilities()
+            self._platform_credentials = None
+            self._credential_selection = None
             self._connection_attached = False
             self._attaching = False
             self._pending_notifications.clear()
@@ -465,9 +631,26 @@ class AppServer:
                     task = asyncio.create_task(self._handle_response(message))
                     self._request_tasks.add(task)
                     task.add_done_callback(self._request_finished)
+                # The stream ended without a session/stop: the client is gone.
+                if (
+                    close_on_disconnect
+                    and not self._closed
+                    and (
+                        not isinstance(transport, ClientLossAwareTransport)
+                        or transport.client_lost
+                    )
+                    and isinstance(
+                        self._session_backend_host, SessionBackendHostClientLoss
+                    )
+                ):
+                    self._session_backend_host.mark_client_disconnected()
             except asyncio.CancelledError:
                 if self._request_error is not None:
                     raise self._request_error
+                # close() (e.g. on session/stop) cancels serving: a clean end.
+                current = asyncio.current_task()
+                if self._closed and current is not None and current.uncancel() == 0:
+                    return
                 raise
             finally:
                 if close_on_disconnect:
@@ -486,14 +669,19 @@ class AppServer:
                 serve_task.cancel()
             errors = await self._stop_background_tasks(current)
             try:
+                await self._setup_oidc.close()
+            except BaseException as exc:
+                errors.append(exc)
+            try:
                 await self._close_root()
             except BaseException as exc:
                 errors.append(exc)
             self._callback_requests.clear()
+            self._abandon_client_requests("The app server closed")
+            self._abandon_platform_credential_requests("The app server closed")
             self._pending_notifications.clear()
             self._connection_attached = False
             self._attaching = False
-            self._reject_pending_client_requests(RuntimeError("App server closed"))
             transport = self._transport
             if transport is not None:
                 try:
@@ -522,8 +710,18 @@ class AppServer:
         if self._closed:
             return
         errors = await self._stop_request_tasks(asyncio.current_task())
-        self._reject_pending_client_requests(RuntimeError("Client disconnected"))
+        try:
+            await self._setup_oidc.close()
+        except BaseException as exc:
+            errors.append(exc)
+        if isinstance(self._root, SessionBackendQueuedTurnEditing):
+            try:
+                await self._root.abandon_active_queued_turn_edit()
+            except BaseException as exc:
+                errors.append(exc)
         self._callback_requests.clear()
+        self._abandon_client_requests("The client disconnected")
+        self._abandon_platform_credential_requests("The client disconnected")
         self._pending_notifications.clear()
         self._connection_attached = False
         self._attaching = False
@@ -532,6 +730,8 @@ class AppServer:
         self._initialization = InitializationState.UNINITIALIZED
         self._client_info = None
         self._client_capabilities = ClientCapabilities()
+        self._platform_credentials = None
+        self._credential_selection = None
         try:
             await transport.close()
         except BaseException as exc:
@@ -546,11 +746,13 @@ class AppServer:
     ) -> list[BaseException]:
         tasks = [task for task in self._request_tasks if task is not current]
         tasks.extend(self._leases.take())
+        self._stop_artifact_subscription()
         backend_events = self._backend_event_task
         self._backend_event_task = None
         self._backend_event_backend = None
         if backend_events is not None and backend_events is not current:
             tasks.append(backend_events)
+        tasks.extend(self._crash_reporting_tasks)
         errors = await cancel_tasks(tasks, label="app-server background")
         if isinstance(self._session_backend_host, SessionBackendHostBackgroundTasks):
             errors.extend(
@@ -563,19 +765,13 @@ class AppServer:
     ) -> list[BaseException]:
         tasks = [task for task in self._request_tasks if task is not current]
         tasks.extend(self._leases.take())
+        self._stop_artifact_subscription()
         backend_events = self._backend_event_task
         self._backend_event_task = None
         self._backend_event_backend = None
         if backend_events is not None and backend_events is not current:
             tasks.append(backend_events)
         return await cancel_tasks(tasks, label="app-server request")
-
-    def _reject_pending_client_requests(self, error: Exception) -> None:
-        for pending in self._client_requests.values():
-            if not pending.future.done():
-                pending.future.set_exception(error)
-        self._client_requests.clear()
-        self._abandoned_client_request_ids.clear()
 
     def _request_finished(self, task: asyncio.Task[None]) -> None:
         self._request_tasks.discard(task)
@@ -668,6 +864,8 @@ class AppServer:
                 self._validate_open_callback_capabilities()
             return dispatched
         except (RequestFailure, SessionBackendError) as exc:
+            if isinstance(exc, SessionBackendError) and _is_unexpected(exc):
+                self._report_dispatch_error(request.method, exc)
             return _ErrorDispatch(
                 ProtocolError(code=exc.code, message=str(exc), data=exc.data),
                 after_response=(
@@ -701,6 +899,7 @@ class AppServer:
             )
         except Exception as exc:
             logger.exception("Unhandled error dispatching %s", request.method)
+            self._report_dispatch_error(request.method, exc)
             return _ErrorDispatch(
                 ProtocolError(code=ProtocolErrorCode.INTERNAL_ERROR, message=str(exc))
             )
@@ -726,13 +925,45 @@ class AppServer:
         if request.method == "session/stop":
             await self.close()
 
-    async def _dispatch_request(  # noqa: PLR0911 - explicit route ownership
+    async def _dispatch_request(  # noqa: PLR0911, PLR0912 - explicit route ownership
         self, method: str, raw_params: dict[str, Any]
     ) -> DispatchResult:
         if method not in SERVER_METHODS:
             raise method_not_found(method)
+        if method.startswith("setup/oidc-"):
+            return DispatchResult(
+                await self._setup_oidc.dispatch(
+                    method, raw_params, client_info=self._initialized_client_info()
+                )
+            )
+        if method == "platformCredentials/headers":
+            from vibe.app_server._platform_credential_headers import (
+                platform_credential_headers,
+            )
+
+            return DispatchResult(
+                await platform_credential_headers(
+                    raw_params,
+                    client=self._client_info,
+                    desktop_credentials=self._platform_credentials is not None,
+                    credentials=self.platform_credentials,
+                )
+            )
         if method == "events/read":
             return self._events_read(raw_params)
+        if method == "imports/discover":
+            validate_wire(ImportDiscoveryParams, raw_params)
+            return await self._require_imports().discover()
+        if method == "imports/start":
+            params = validate_wire(ImportJobStartParams, raw_params)
+            return await self._require_imports().start(
+                params.harnesses, notify=self._route_notification
+            )
+        if method == "imports/read":
+            params = validate_wire(ImportJobReadParams, raw_params)
+            return await self._require_imports().read(
+                params.after_event_id, params.wait_ms
+            )
         if self._mcp_catalog_service is not None and self._mcp_catalog_service.handles(
             method
         ):
@@ -755,16 +986,25 @@ class AppServer:
             )
         if method in {
             "config/schema",
+            "plugins/local/list",
+            "plugins/local/setEnabled",
+            "projects/create",
+            "projects/list",
+            "projects/remove",
+            "projects/rename",
             "session/history/get",
             "setup/status",
             "setup/store-credential",
             "setup/submit-choices",
+            "skills/local/delete",
+            "skills/local/list",
+            "skills/local/read",
+            "skills/local/setEnabled",
+            "skills/local/write",
             "workspace/git/checkouts",
             "workspace/git/worktrees/limit/update",
             "workspace/git/worktrees/list",
             "workspace/git/worktrees/prune",
-            "workspace/git/worktrees/reap",
-            "workspace/git/worktrees/reap/cancel",
             "workspace/git/worktrees/remove",
             "workspace/trust/status",
             "workspace/trust/untrustedConfig",
@@ -777,17 +1017,27 @@ class AppServer:
                 method,
                 raw_params,
                 session_id=self._root.session_id if self._root is not None else None,
+                worktree_trust_store=(
+                    self._root.worktree_trust_store
+                    if method == "workspace/git/worktrees/remove"
+                    and isinstance(self._root, SessionBackendWorktreeTrust)
+                    else None
+                ),
                 client_info=self._initialized_client_info(),
             )
         if method == "session/delete":
             return await self._delete_session(raw_params)
-        if method == "session/lease/subscribe":
-            host = self._session_backend_host
-            if not isinstance(host, SessionBackendHostLeaseWatch):
-                raise method_not_found(method)
-            return await self._leases.subscribe(host)
+        if method in {"session/lease/subscribe", "artifacts/subscribe"}:
+            return await self._subscribe(method)
         if _omits_session_id(method, raw_params):
-            return await self._host_handler.dispatch(method, raw_params)
+            # The attached session, if any, tells the config reads the
+            # connection's own session is already fetching what they would.
+            return await self._host_handler.dispatch(
+                method,
+                raw_params,
+                session_id=self._root.session_id if self._root is not None else None,
+                client_info=self._client_info,
+            )
         if self._root is None:
             return await self._dispatch_without_root(method, raw_params)
         result = await self._dispatch_to_root(method, raw_params)
@@ -852,7 +1102,9 @@ class AppServer:
         if method == "session/history/list":
             return await self._dispatch_stored_session(method, raw_params)
         if self._host_handler.handles(method):
-            return await self._host_handler.dispatch(method, raw_params)
+            return await self._host_handler.dispatch(
+                method, raw_params, client_info=self._client_info
+            )
         return await self._open_initial_session(method, raw_params)
 
     async def _dispatch_to_root(
@@ -919,17 +1171,42 @@ class AppServer:
                     raise
         return await self._host_handler.dispatch(method, raw_params)
 
-    async def _dispatch_backend_host_operation(
+    async def _dispatch_backend_host_operation(  # noqa: PLR0911 - explicit route ownership
         self, method: str, raw_params: dict[str, Any]
     ) -> DispatchResult | None:
         if method in {"session/list", "session/read", "config/read"}:
             return await self._dispatch_backend_host_read(method, raw_params)
-        if method == "session/rename":
-            params = validate_wire(SessionTitleUpdateParams, raw_params)
-            response = await self._session_backend_host.rename(params)
-            if self._root is not None and self._root.session_id == params.session_id:
-                await self._flush_backend_events(self._root)
-            return DispatchResult(response)
+        # The artifacts namespace is session-scoped but answers without a
+        # runtime: a stored session reads, marks viewed and syncs its persisted
+        # metadata, so a connection with no session attached — Desktop's
+        # catalogue channel — can serve it.
+        host = self._session_backend_host
+        if method == "artifacts/list" and isinstance(host, SessionBackendHostArtifacts):
+            return DispatchResult(
+                await host.list_artifacts(
+                    validate_wire(ArtifactsListParams, raw_params)
+                )
+            )
+        if method == "artifacts/markViewed" and isinstance(
+            host, SessionBackendHostArtifacts
+        ):
+            return DispatchResult(
+                await host.mark_artifacts_viewed(
+                    validate_wire(ArtifactsMarkViewedParams, raw_params)
+                )
+            )
+        if method == "artifacts/sync" and isinstance(host, SessionBackendHostArtifacts):
+            return DispatchResult(
+                await host.sync_artifacts(
+                    validate_wire(ArtifactsSyncParams, raw_params)
+                )
+            )
+        if method in {"session/rename", "session/relocate", "session/move"}:
+            result = await self._dispatch_backend_host_session_update(
+                method, raw_params
+            )
+            if result is not None:
+                return result
         if method in {"session/pin", "session/archive", "session/markAsSeen"}:
             return await self._dispatch_backend_host_metadata(method, raw_params)
         if method == "session/fork":
@@ -954,6 +1231,36 @@ class AppServer:
         if handoff := await self._dispatch_backend_host_handoff(method, raw_params):
             return handoff
         return await self._dispatch_backend_host_lifecycle(method, raw_params)
+
+    async def _dispatch_backend_host_session_update(
+        self, method: str, raw_params: dict[str, Any]
+    ) -> DispatchResult | None:
+        if method == "session/rename":
+            params = validate_wire(SessionTitleUpdateParams, raw_params)
+            response = await self._session_backend_host.rename(params)
+            if self._root is not None and self._root.session_id == params.session_id:
+                await self._flush_backend_events(self._root)
+            return DispatchResult(response)
+        if method == "session/move":
+            if not isinstance(self._session_backend_host, SessionBackendHostMove):
+                return None
+            params = validate_wire(SessionMoveParams, raw_params)
+            attached = self._attached_root(params.session_id)
+            response = await self._session_backend_host.move(params, attached)
+        else:
+            if not isinstance(self._session_backend_host, SessionBackendHostRelocate):
+                return None
+            params = validate_wire(SessionRelocateParams, raw_params)
+            attached = self._attached_root(params.session_id)
+            response = await self._session_backend_host.relocate(params, attached)
+        if attached is not None:
+            await self._flush_backend_events(attached)
+        return DispatchResult(response)
+
+    def _attached_root(self, session_id: str) -> SessionBackend | None:
+        if self._root is not None and self._root.session_id == session_id:
+            return self._root
+        return None
 
     async def _read_stored_session_config(
         self, raw_params: dict[str, Any]
@@ -1033,7 +1340,12 @@ class AppServer:
         params = validate_wire(SessionHistoryClearParams, raw_params)
         async with self._lifecycle_transition():
             result = await self._session_backend_host.clear_history(root, params)
-            await self._activate_backend(result.backend, 200)
+            try:
+                await self._activate_backend(result.backend, 200)
+            except BaseException:
+                if result.on_failure is not None:
+                    result.on_failure()
+                raise
         return DispatchResult(
             SessionHistoryClearResponse(
                 state=result.state, session_log=result.session_log
@@ -1087,22 +1399,33 @@ class AppServer:
         if method == "session/start":
             params = validate_wire(SessionStartParams, raw_params)
             lifecycle = await self._session_backend_host.start(params)
+            try:
+                first_turn = await self._apply_start_choices(lifecycle.backend, params)
+            except BaseException:
+                await self._discard_started(lifecycle.backend)
+                raise
             self._record_session_created(lifecycle.backend)
-            response = await self._activate_backend(
-                lifecycle.backend, params.history_limit
+            response = await self._activate_lifecycle_backend(
+                method, lifecycle.backend, params.history_limit
             )
             return DispatchResult(
                 SessionStartResponse(
                     state=response.state, last_event_id=response.last_event_id
                 ),
-                after_response=lifecycle.after_response,
+                after_response=_in_order(
+                    lifecycle.after_response,
+                    first_turn.after_response if first_turn else None,
+                ),
+                on_response_abandoned=(
+                    first_turn.on_response_abandoned if first_turn else None
+                ),
                 session_attached=True,
             )
         if method == "session/resume":
             params = validate_wire(SessionResumeParams, raw_params)
             lifecycle = await self._session_backend_host.resume(params)
-            response = await self._activate_backend(
-                lifecycle.backend, params.history_limit
+            response = await self._activate_lifecycle_backend(
+                method, lifecycle.backend, params.history_limit
             )
             return DispatchResult(
                 SessionResumeResponse(
@@ -1115,8 +1438,8 @@ class AppServer:
         if method == "session/continue":
             params = validate_wire(SessionContinueParams, raw_params)
             lifecycle = await self._session_backend_host.continue_latest(params)
-            response = await self._activate_backend(
-                lifecycle.backend, params.history_limit
+            response = await self._activate_lifecycle_backend(
+                method, lifecycle.backend, params.history_limit
             )
             return DispatchResult(
                 SessionContinueResponse(
@@ -1127,6 +1450,55 @@ class AppServer:
                 runtime_updated=True,
             )
         raise RuntimeError(f"Unsupported session lifecycle method: {method}")
+
+    async def _discard_started(self, backend: SessionBackend) -> None:
+        """A first turn that failed may already have saved the session, and the
+        client never gets its id to delete it.
+        """
+        host = self._session_backend_host
+        if not isinstance(host, SessionBackendHostDelete):
+            await backend.shutdown()
+            return
+        await host.delete(SessionDeleteParams(session_id=backend.session_id))
+
+    async def _apply_start_choices(
+        self, backend: SessionBackend, params: SessionStartParams
+    ) -> SessionBackendResult[TurnStartResponse] | None:
+        """Everything but the first turn applies while the session is unsaved, so
+        a rejected choice leaves no session behind. The model goes last: unless
+        `session_only`, it also writes the user's default, which a choice
+        rejected after it would leave changed. The host already applied and
+        pinned `agent_config.agent`.
+        """
+        session_id = backend.session_id
+        if params.title is not None:
+            await self._session_backend_host.rename(
+                SessionTitleUpdateParams(session_id=session_id, title=params.title)
+            )
+        if params.model is not None or params.reasoning_effort is not None:
+            written = await backend.write_model_config(
+                ModelConfigWriteParams(
+                    session_id=session_id,
+                    model_alias=params.model,
+                    reasoning_effort=params.reasoning_effort,
+                    session_only=params.session_only,
+                )
+            )
+            if written.response.rejected or written.response.failures:
+                raise RequestFailure(
+                    ProtocolErrorCode.INVALID_PARAMS,
+                    "; ".join(written.response.failures)
+                    or "The configuration rejected the model choice",
+                )
+        if params.first_turn is None:
+            return None
+        return await backend.start_turn(
+            TurnStartParams(
+                session_id=session_id,
+                message=params.first_turn.message,
+                client_user_message_id=params.first_turn.client_user_message_id,
+            )
+        )
 
     def _record_session_created(self, backend: SessionBackend) -> None:
         logger.debug(
@@ -1223,6 +1595,15 @@ class AppServer:
             result = await root.replace_queued_turn(
                 validate_wire(TurnQueueReplaceParams, raw_params)
             )
+        elif method in {
+            "session/turn/queue/edit/start",
+            "session/turn/queue/edit/save",
+            "session/turn/queue/edit/cancel",
+            "session/turn/queue/edit/abandon",
+        }:
+            result = await AppServer._dispatch_backend_queued_edit(
+                root, method, raw_params
+            )
         elif method == "session/turn/queue/steer":
             if not isinstance(root, SessionBackendQueuedTurnSteering):
                 raise RequestFailure(
@@ -1253,6 +1634,31 @@ class AppServer:
             runtime_updated=result.runtime_updated,
         )
 
+    @staticmethod
+    async def _dispatch_backend_queued_edit(
+        root: SessionBackend, method: str, raw_params: dict[str, Any]
+    ) -> SessionBackendResult[Any]:
+        if not isinstance(root, SessionBackendQueuedTurnEditing):
+            raise RequestFailure(
+                ProtocolErrorCode.NOT_IMPLEMENTED,
+                "The selected session backend does not support queued editing",
+            )
+        if method == "session/turn/queue/edit/start":
+            return await root.start_queued_turn_edit(
+                validate_wire(TurnQueueEditStartParams, raw_params)
+            )
+        if method == "session/turn/queue/edit/save":
+            return await root.save_queued_turn_edit(
+                validate_wire(TurnQueueEditSaveParams, raw_params)
+            )
+        if method == "session/turn/queue/edit/abandon":
+            return await root.abandon_queued_turn_edit(
+                validate_wire(TurnQueueEditAbandonParams, raw_params)
+            )
+        return await root.cancel_queued_turn_edit(
+            validate_wire(TurnQueueEditCancelParams, raw_params)
+        )
+
     async def _dispatch_backend_config(
         self, root: SessionBackend, method: str, raw_params: dict[str, Any]
     ) -> DispatchResult | None:
@@ -1267,31 +1673,9 @@ class AppServer:
             )
             runtime_updated = result.response.applied
         elif method == "config/reload":
-            plan = (
-                await self._mcp_catalog_service.prepare_config_reload(root)
-                if self._mcp_catalog_service is not None
-                else None
+            result = await root.reload_config(
+                validate_wire(ConfigReloadParams, raw_params)
             )
-            try:
-                result = await root.reload_config(
-                    validate_wire(ConfigReloadParams, raw_params)
-                )
-                mcp_runtime = (
-                    await self._mcp_catalog_service.finish_config_reload(root, plan)
-                    if self._mcp_catalog_service is not None
-                    else None
-                )
-            except Exception:
-                if self._mcp_catalog_service is not None:
-                    await self._mcp_catalog_service.fail_config_reload(root, plan)
-                raise
-            if mcp_runtime is not None:
-                result = SessionBackendResult(
-                    response=result.response.model_copy(
-                        update={"runtime": mcp_runtime}
-                    ),
-                    after_response=result.after_response,
-                )
             runtime_updated = True
         else:
             return None
@@ -1351,8 +1735,40 @@ class AppServer:
                 ProtocolErrorCode.INVALID_REQUEST, "initialize may only be called once"
             )
         params = validate_wire(InitializeParams, raw_params)
+        plugins = params.capabilities.agent_plugins
+        definitions = params.capabilities.client_tool_definitions
+        if (
+            plugins or definitions
+        ) and "tools/call" not in params.capabilities.client_tools:
+            raise RequestFailure(
+                ProtocolErrorCode.INVALID_PARAMS, "Client plugins require tools/call"
+            )
+        if (plugins or definitions) and self._configure_agent_plugins is None:
+            raise RequestFailure(
+                ProtocolErrorCode.NOT_IMPLEMENTED, "Client tools are unavailable"
+            )
+        if self._configure_agent_plugins is not None:
+            try:
+                self._configure_agent_plugins(
+                    plugins, definitions, _ConnectionClientToolRunner(self)
+                )
+            except ValueError as exc:
+                raise RequestFailure(
+                    ProtocolErrorCode.INVALID_PARAMS, str(exc)
+                ) from exc
         self._client_info = params.client_info
         self._client_capabilities = params.capabilities
+        if params.capabilities.platform_credentials is not None:
+            self._platform_credentials = ConnectionPlatformCredentialProvider(
+                self._resolve_platform_credentials,
+                kind=params.capabilities.platform_credentials.kind,
+                tenants=self._oidc_tenants,
+            )
+        self._credential_selection = ConnectionCredentialSelection(
+            client=self._client_info,
+            connection=self._platform_credentials,
+            tenants=self._oidc_tenants,
+        )
         self._initialization = InitializationState.INITIALIZE_RECEIVED
         return InitializeResponse(
             server_info=ServerInfo(name="vibe-app-server", version=__version__),
@@ -1370,23 +1786,46 @@ class AppServer:
             and self._initialization is InitializationState.INITIALIZE_RECEIVED
         ):
             self._initialization = InitializationState.INITIALIZED
+            self._gate_crash_reporting(self._host_handler.telemetry_enabled)
+            return
+        if (
+            notification.method == "platformCredentials/invalidated"
+            and self._initialization is InitializationState.INITIALIZED
+            and self._platform_credentials is not None
+        ):
+            validate_wire(PlatformCredentialsInvalidatedParams, notification.params)
+            self._platform_credentials.invalidate()
             return
         raise JsonRpcProtocolError(
             f"Unknown or unexpected client notification: {notification.method}"
         )
 
-    async def _handle_response(
+    async def _handle_response(  # noqa: PLR0911 - explicit pending-request routing
         self, response: JsonRpcErrorResponse | JsonRpcSuccessResponse
     ) -> None:
         request_id = response.id
         if not isinstance(request_id, int):
             raise JsonRpcProtocolError("Server request responses require integer IDs")
+        platform_credentials = self._platform_credential_requests.pop(request_id, None)
+        if platform_credentials is not None:
+            _settle_platform_credentials(platform_credentials, response)
+            return
+        if request_id in self._abandoned_platform_credential_requests:
+            self._abandoned_platform_credential_requests.discard(request_id)
+            return
         pending = self._client_requests.pop(request_id, None)
         if pending is not None:
-            self._resolve_client_request(request_id, pending, response)
+            if not pending.answer.done():
+                pending.answer.set_result(response)
             return
-        if request_id in self._abandoned_client_request_ids:
-            self._abandoned_client_request_ids.remove(request_id)
+        method = self._unanswered_client_requests.pop(request_id, None)
+        if method is not None:
+            logger.info(
+                "%s %s answered after the tool gave up on it: %s",
+                method,
+                request_id,
+                "refused" if isinstance(response, JsonRpcErrorResponse) else "answered",
+            )
             return
         callback_route = self._callback_requests.pop(request_id, None)
         if callback_route is None:
@@ -1409,25 +1848,6 @@ class AppServer:
                 session_id, callback_id, "Client did not accept callback delivery"
             )
 
-    def _resolve_client_request(
-        self,
-        request_id: int,
-        pending: PendingClientRequest,
-        response: JsonRpcErrorResponse | JsonRpcSuccessResponse,
-    ) -> None:
-        if pending.future.cancelled():
-            self._abandoned_client_request_ids.discard(request_id)
-            return
-        if isinstance(response, JsonRpcErrorResponse):
-            pending.future.set_exception(AppServerResponseError(response.error))
-            return
-        try:
-            result = validate_wire(pending.response_type, response.result)
-        except Exception as exc:
-            pending.future.set_exception(exc)
-        else:
-            pending.future.set_result(result)
-
     async def _notify(self, method: str, params: ProtocolModel) -> None:
         params = self._sequence_notification(params)
         root = self._root
@@ -1445,14 +1865,42 @@ class AppServer:
         if self._attaching:
             self._pending_notifications.append(PendingNotification(method, params))
             return
-        sessionless_auth_url = (
+        sessionless_notification = (
             self._root is None
             and self._initialization is InitializationState.INITIALIZED
-            and isinstance(params, MCPAuthUrlParams)
+            and isinstance(params, MCPAuthUrlParams | ImportJobUpdatedParams)
         )
-        if not self._connection_attached and not sessionless_auth_url:
+        if not self._connection_attached and not sessionless_notification:
             return
         await self._send_notification(method, params)
+
+    async def _subscribe(self, method: str) -> DispatchResult:
+        """The connection's subscriptions to changes of stored sessions."""
+        host = self._session_backend_host
+        if method == "session/lease/subscribe" and isinstance(
+            host, SessionBackendHostLeaseWatch
+        ):
+            return await self._leases.subscribe(host)
+        if method == "artifacts/subscribe" and isinstance(
+            host, SessionBackendHostArtifacts
+        ):
+            self._stop_artifact_subscription()
+            self._unsubscribe_artifacts = host.subscribe_artifacts(
+                self._send_artifact_update
+            )
+            return DispatchResult(EmptyResponse())
+        raise method_not_found(method)
+
+    def _stop_artifact_subscription(self) -> None:
+        unsubscribe = self._unsubscribe_artifacts
+        self._unsubscribe_artifacts = None
+        if unsubscribe is not None:
+            unsubscribe()
+
+    def _send_artifact_update(self, method: str, params: ProtocolModel) -> None:
+        task = asyncio.create_task(self._send_notification(method, params))
+        self._request_tasks.add(task)
+        task.add_done_callback(self._request_tasks.discard)
 
     async def _send_notification(self, method: str, params: ProtocolModel) -> None:
         transport = self._transport
@@ -1498,45 +1946,26 @@ class AppServer:
                 return
         await self._deliver_callback(callback)
 
-    async def _request_client_result[ResultT: ProtocolModel](
-        self, method: str, params: ProtocolModel, response_type: type[ResultT]
-    ) -> ResultT:
-        request_id = self._next_request_id
-        self._next_request_id += 1
-        future: asyncio.Future[ProtocolModel] = (
-            asyncio.get_running_loop().create_future()
-        )
-        self._client_requests[request_id] = PendingClientRequest(
-            response_type=response_type, future=future
-        )
-        transport = self._transport
-        if transport is None or not self._connection_attached or self._attaching:
-            self._client_requests.pop(request_id, None)
-            raise RuntimeError("No app-server client is attached")
-        sent = False
-        try:
-            await transport.send({
-                "jsonrpc": "2.0",
-                "id": request_id,
-                "method": method,
-                "params": params.model_dump(mode="json", by_alias=True),
-            })
-            sent = True
-            return cast(ResultT, await future)
-        except asyncio.CancelledError:
-            if sent and self._client_requests.pop(request_id, None) is not None:
-                self._abandoned_client_request_ids.add(request_id)
-            raise
-        except Exception:
-            self._disconnect_current_client()
-            raise
-        finally:
-            self._client_requests.pop(request_id, None)
-
     def _mark_callback_answered(self, callback_id: str) -> None:
         for delivery in self._callback_requests.values():
             if delivery.callback_id == callback_id:
                 delivery.answered = True
+
+    async def _activate_lifecycle_backend(
+        self, method: str, backend: SessionBackend, history_limit: int
+    ) -> SessionReadResponse:
+        return await self._activate_backend(
+            backend,
+            history_limit,
+            announce_running_turn=method in _RUNNING_TURN_ANNOUNCEMENT_METHODS,
+        )
+
+    async def _announce_running_turn(self) -> None:
+        root = self._root
+        if not isinstance(root, SessionBackendRunningTurnAnnouncement):
+            return
+        await root.announce_running_turn()
+        await self._flush_backend_events(root)
 
     async def _redeliver_open_callbacks(self) -> None:
         root = self._root
@@ -1565,12 +1994,6 @@ class AppServer:
             data=cast(JsonValue, {"missingCallbackKinds": missing}),
         )
 
-    async def _record_child_notification(
-        self, method: str, params: ProtocolModel
-    ) -> None:
-        del method
-        self._sequence_notification(params)
-
     def client_info(self) -> ClientInfo:
         return self._initialized_client_info()
 
@@ -1580,17 +2003,22 @@ class AppServer:
     def current_session_id(self) -> str:
         return self._require_root().session_id
 
-    def event_watermark(self, session_id: str) -> int:
-        return self._event_watermark(session_id)
-
     def account_gateway(self) -> AccountGateway | None:
         return self._account_gateway
 
     def identity_gateway(self) -> IdentityGateway | None:
         return self._identity_gateway
 
-    def lifecycle_transition(self) -> AbstractAsyncContextManager[None]:
-        return self._lifecycle_transition()
+    def platform_credentials(self, api_key_env_var: str) -> PlatformCredentialProvider:
+        if self._credential_selection is not None:
+            return self._credential_selection(api_key_env_var)
+        # Before ``initialize``: no client yet, so nothing to keep.
+        return select_platform_credentials(
+            client=self._client_info,
+            connection=self._platform_credentials,
+            tenants=self._oidc_tenants,
+            api_key_env_var=api_key_env_var,
+        )
 
     def task_finished(self, task: asyncio.Task[None]) -> None:
         self._request_finished(task)
@@ -1601,15 +2029,195 @@ class AppServer:
     async def publish_callback(self, callback: PublicCallbackEntry) -> None:
         await self._publish_callback(callback)
 
-    async def record_child_notification(
-        self, method: str, params: ProtocolModel
-    ) -> None:
-        await self._record_child_notification(method, params)
+    async def spawn_session(self, params: SessionSpawnParams) -> SessionSpawnResponse:
+        if not self._client_capabilities.session_spawn:
+            raise SessionSpawnError("The attached client cannot start sessions")
+        try:
+            return await self._request_client(
+                SESSION_SPAWN_METHOD, params, SessionSpawnResponse
+            )
+        except _ClientUnreachable as exc:
+            raise SessionSpawnError(
+                f"Could not reach the client to start the session: {exc}"
+            ) from exc
+        except _ClientRequestLost as exc:
+            raise SessionSpawnError(
+                f"{exc} before confirming the session, so it may or may not have "
+                "started. Do not start it again before the user has checked their "
+                "sessions."
+            ) from exc
+        except _ClientRequestFailed as exc:
+            raise SessionSpawnError(str(exc)) from exc
 
-    async def request_client_result[ResultT: ProtocolModel](
-        self, method: str, params: ProtocolModel, response_type: type[ResultT]
-    ) -> ResultT:
-        return await self._request_client_result(method, params, response_type)
+    async def list_peer_sessions(
+        self, params: SessionPeerListParams
+    ) -> SessionPeerListResponse:
+        return await self._request_peers(
+            SESSION_PEER_LIST_METHOD, params, SessionPeerListResponse
+        )
+
+    async def read_peer_session(
+        self, params: SessionPeerReadParams
+    ) -> SessionPeerReadResponse:
+        return await self._request_peers(
+            SESSION_PEER_READ_METHOD, params, SessionPeerReadResponse
+        )
+
+    async def send_to_peer_session(
+        self, params: SessionPeerSendParams
+    ) -> SessionPeerSendResponse:
+        return await self._request_peers(
+            SESSION_PEER_SEND_METHOD,
+            params,
+            SessionPeerSendResponse,
+            lost=(
+                "before confirming the message, so it may or may not have been "
+                "sent. Read the session before sending it again."
+            ),
+        )
+
+    async def archive_peer_sessions(
+        self, params: SessionPeerArchiveParams
+    ) -> SessionPeerArchiveResponse:
+        return await self._request_peers(
+            SESSION_PEER_ARCHIVE_METHOD,
+            params,
+            SessionPeerArchiveResponse,
+            lost=(
+                "before confirming, so some sessions may have been archived. "
+                "List them before archiving again."
+            ),
+        )
+
+    async def restore_peer_sessions(
+        self, params: SessionPeerRestoreParams
+    ) -> SessionPeerRestoreResponse:
+        if not self._client_capabilities.session_peer_restore:
+            raise SessionPeerError("The attached client cannot restore sessions")
+        return await self._request_peers(
+            SESSION_PEER_RESTORE_METHOD,
+            params,
+            SessionPeerRestoreResponse,
+            lost=(
+                "before confirming, so some sessions may have been restored. "
+                "List them before restoring again."
+            ),
+        )
+
+    async def mark_peer_sessions_seen(
+        self, params: SessionPeerMarkSeenParams
+    ) -> SessionPeerMarkSeenResponse:
+        if not self._client_capabilities.session_peer_mark_seen:
+            raise SessionPeerError("The attached client cannot mark sessions as seen")
+        return await self._request_peers(
+            SESSION_PEER_MARK_SEEN_METHOD,
+            params,
+            SessionPeerMarkSeenResponse,
+            lost=(
+                "before confirming, so some sessions may have been marked seen. "
+                "List them before marking them again."
+            ),
+        )
+
+    async def _request_peers[ResponseT: ProtocolModel](
+        self,
+        method: str,
+        params: ProtocolModel,
+        response_type: type[ResponseT],
+        *,
+        lost: str = "before answering. Try again.",
+    ) -> ResponseT:
+        if not self._client_capabilities.session_peers:
+            raise SessionPeerError("The attached client cannot reach other sessions")
+        try:
+            return await self._request_client(method, params, response_type)
+        except _ClientRequestLost as exc:
+            raise SessionPeerError(f"{exc} {lost}") from exc
+        except _ClientRequestFailed as exc:
+            raise SessionPeerError(str(exc)) from exc
+
+    async def _request_client[ResponseT: ProtocolModel](
+        self, method: str, params: ProtocolModel, response_type: type[ResponseT]
+    ) -> ResponseT:
+        """A refusal or a malformed answer fails this request, not the
+        connection.
+        """
+        transport = self._transport
+        if transport is None or not self._connection_attached:
+            raise _ClientRequestFailed("No client is attached")
+        request_id = self._next_request_id
+        self._next_request_id += 1
+        pending = _ClientRequest(
+            method=method, answer=asyncio.get_running_loop().create_future()
+        )
+        self._client_requests[request_id] = pending
+        try:
+            try:
+                await transport.send({
+                    "jsonrpc": "2.0",
+                    "id": request_id,
+                    "method": method,
+                    # An option left out is absent rather than null.
+                    "params": params.model_dump(
+                        mode="json", by_alias=True, exclude_none=True
+                    ),
+                })
+            except Exception as exc:
+                raise _ClientUnreachable(str(exc)) from exc
+            response = await pending.answer
+        finally:
+            self._client_requests.pop(request_id, None)
+            if pending.answer.cancelled() or not pending.answer.done():
+                self._unanswered_client_requests[request_id] = method
+        if isinstance(response, JsonRpcErrorResponse):
+            raise _ClientRequestFailed(response.error.message)
+        try:
+            return validate_wire(response_type, response.result)
+        except ValidationError as exc:
+            raise _ClientRequestFailed(
+                f"The client answered {method} invalidly: {exc}"
+            ) from exc
+
+    async def _resolve_platform_credentials(
+        self, params: PlatformCredentialsResolveParams
+    ) -> PlatformCredentialsResolveResponse:
+        transport = self._transport
+        if transport is None or self._platform_credentials is None:
+            raise RuntimeError("Desktop platform credentials are unavailable")
+        request_id = self._next_request_id
+        self._next_request_id += 1
+        pending: asyncio.Future[PlatformCredentialsResolveResponse] = (
+            asyncio.get_running_loop().create_future()
+        )
+        self._platform_credential_requests[request_id] = pending
+        try:
+            await transport.send({
+                "jsonrpc": "2.0",
+                "id": request_id,
+                "method": "platformCredentials/resolve",
+                "params": params.model_dump(
+                    mode="json", by_alias=True, exclude_none=True
+                ),
+            })
+            return await pending
+        finally:
+            self._platform_credential_requests.pop(request_id, None)
+            if pending.cancelled() or not pending.done():
+                self._abandoned_platform_credential_requests.add(request_id)
+
+    def _abandon_platform_credential_requests(self, reason: str) -> None:
+        for pending in self._platform_credential_requests.values():
+            if not pending.done():
+                pending.set_exception(RuntimeError(reason))
+        self._platform_credential_requests.clear()
+        self._abandoned_platform_credential_requests.clear()
+
+    def _abandon_client_requests(self, reason: str) -> None:
+        for pending in self._client_requests.values():
+            if not pending.answer.done():
+                pending.answer.set_exception(_ClientRequestLost(reason))
+        self._client_requests.clear()
+        self._unanswered_client_requests.clear()
 
     def _sequence_notification(self, params: ProtocolModel) -> ProtocolModel:
         if not isinstance(params, EventNotificationParams):
@@ -1654,6 +2262,89 @@ class AppServer:
         return self._event_watermarks.get(session_id, 0)
 
 
+def _init_crash_reporting(client: ClientInfo, *, enabled: bool) -> None:
+    init_cli_sentry(
+        enabled=enabled,
+        headless=client.entrypoint == "programmatic",
+        tags={
+            "entrypoint": client.entrypoint,
+            "client_name": client.name,
+            "client_version": client.version,
+        },
+    )
+
+
+async def _resolved(value: bool) -> bool:
+    return value
+
+
+def _harness_code(exc: SessionBackendError) -> str | None:
+    code = exc.data.get("harnessCode") if isinstance(exc.data, dict) else None
+    return code if isinstance(code, str) else None
+
+
+def _is_unexpected(exc: SessionBackendError) -> bool:
+    """Only internal errors are bugs; other codes are refusals the client explains."""
+    return exc.code is ProtocolErrorCode.INTERNAL_ERROR and not exc.expected
+
+
+def _in_order(*callbacks: Callable[[], None] | None) -> Callable[[], None] | None:
+    present = [callback for callback in callbacks if callback is not None]
+    if not present:
+        return None
+
+    def run() -> None:
+        for callback in present:
+            callback()
+
+    return run
+
+
+@dataclass(frozen=True, slots=True)
+class _ClientRequest:
+    method: str
+    answer: asyncio.Future[JsonRpcErrorResponse | JsonRpcSuccessResponse]
+
+
+class _ClientRequestFailed(Exception):
+    pass
+
+
+class _ClientUnreachable(_ClientRequestFailed):
+    pass
+
+
+class _ClientRequestLost(_ClientRequestFailed):
+    """The client went away after the request was sent, so it may have acted."""
+
+
+def _settle_platform_credentials(
+    pending: asyncio.Future[PlatformCredentialsResolveResponse],
+    response: JsonRpcErrorResponse | JsonRpcSuccessResponse,
+) -> None:
+    """Settle a credential request without turning a broker failure into a
+    connection failure. No response detail is copied into the exception so a
+    misbehaving host cannot reflect credential material into logs.
+    """
+    if pending.done():
+        return
+    if isinstance(response, JsonRpcErrorResponse):
+        pending.set_exception(
+            RuntimeError("Desktop platform credential request failed")
+        )
+        return
+    try:
+        pending.set_result(
+            TypeAdapter(PlatformCredentialsResolveResponse).validate_python(
+                response.result, by_alias=True, by_name=False
+            )
+        )
+    except ValidationError:
+        pending.set_exception(
+            RuntimeError("Desktop returned an invalid platform credential response")
+        )
+
+
 def _omits_session_id(method: str, raw_params: dict[str, Any]) -> bool:
     """Whether a method that can answer from either scope named no session.
 
@@ -1668,3 +2359,57 @@ def _omits_session_id(method: str, raw_params: dict[str, Any]) -> bool:
 
 def _notification_session_id(params: EventNotificationParams) -> str:
     return params.session_id
+
+
+class _ConnectionClientToolRunner:
+    def __init__(self, server: AppServer) -> None:
+        self._server = server
+
+    async def call_tool(self, call: ClientToolCall) -> ClientToolResult:
+        caller = call.caller
+        if caller is None:
+            return ClientToolResult(
+                error=ClientToolError("Client tool caller is unavailable")
+            )
+        params = ClientToolCallParams(
+            call_id=call.call_id,
+            name=call.name,
+            input=call.input,
+            tool_call_id=call.tool_call_id,
+            caller=ClientToolCallerParams(
+                session_id=caller.session_id,
+                root_session_id=caller.root_session_id,
+                parent_session_id=caller.parent_session_id,
+                name=caller.name,
+                agent_type=caller.agent_type,
+            ),
+        )
+        try:
+            result = await self._server._request_client(
+                "tools/call", params, ClientToolCallResponse
+            )
+        except asyncio.CancelledError:
+            transport = self._server._transport
+            if transport is not None and self._server._connection_attached:
+                try:
+                    await transport.send({
+                        "jsonrpc": "2.0",
+                        "method": "tools/cancel",
+                        "params": {"callId": call.call_id},
+                    })
+                except Exception:
+                    pass
+            raise
+        except _ClientRequestFailed as exc:
+            return ClientToolResult(
+                error=ClientToolError(str(exc), code="client_tool_unavailable")
+            )
+        return ClientToolResult(
+            output=result.output,
+            annotations=result.annotations,
+            error=ClientToolError(
+                result.error.message, result.error.code, result.error.details
+            )
+            if result.error is not None
+            else None,
+        )

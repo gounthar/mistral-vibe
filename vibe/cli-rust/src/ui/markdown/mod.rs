@@ -1,6 +1,7 @@
-//! Assistant markdown, rendered to match Textual's `Markdown` widget cell-for-cell.
+//! Assistant markdown rendering: block layout, wrapping, and styles.
 
 mod autolink;
+mod banner;
 mod cache;
 mod fence;
 mod heading;
@@ -20,6 +21,7 @@ use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 
 pub use autolink::split;
+pub use banner::{framed, guttered};
 pub use cache::{MarkdownCache, MAX_MARKDOWN_CACHE_BYTES, MAX_MARKDOWN_CACHE_ENTRIES};
 pub use fence::{lang as fence_lang, lines as fence_lines};
 pub use links::{screen_links, Link, LinkKind, LinkedLines};
@@ -30,7 +32,7 @@ const PAD: usize = 2;
 
 /// How a markdown body is framed. The assistant widget pads its Markdown two
 /// columns either side and centers top-level headings; the guttered startup
-/// banners (Python `.whats-new-message` &c) pad none and left-align them.
+/// banners (what's-new and friends) pad none and left-align them.
 #[derive(Clone, Copy)]
 pub(crate) struct Frame {
     pad: usize,
@@ -47,8 +49,8 @@ pub(crate) const BANNER: Frame = Frame {
     center_h1: false,
     profile: Profile::Assistant,
 };
-/// A standalone Textual `Markdown` widget (onboarding preview): the widget's
-/// default styles, without vibe's `app.tcss` overrides.
+/// A standalone markdown body (onboarding preview): the default styles,
+/// without the chat overrides.
 pub(crate) const WIDGET: Frame = Frame {
     pad: PAD,
     center_h1: true,
@@ -58,9 +60,9 @@ pub(crate) const WIDGET: Frame = Frame {
 /// The style set a body renders with.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Profile {
-    /// Chat assistant messages — vibe's `Markdown` overrides in `app.tcss`.
+    /// Chat assistant messages, with the chat style overrides.
     Assistant,
-    /// A plain `Markdown` widget — Textual's own defaults.
+    /// A plain markdown body with the default styles.
     Widget,
 }
 
@@ -150,8 +152,8 @@ impl PreparedMarkdown {
 pub enum Block {
     Heading(u8, Vec<Sc>),
     Paragraph(Vec<Sc>),
-    /// Fence body, already syntax-highlighted: one span run per source line.
-    Code(Vec<Vec<Span<'static>>>),
+    /// Fence language (may be empty) and body, already syntax-highlighted: one span run per source line.
+    Code(String, Vec<Vec<Span<'static>>>),
     List {
         start: Option<u64>,
         items: Vec<Item>,
@@ -171,18 +173,18 @@ pub struct Item {
     pub children: Vec<Block>,
 }
 
-/// Render an assistant message body, including the block margins Textual inserts.
+/// Render an assistant message body, including the block margins.
 pub fn render(text: &str, width: u16) -> Vec<Line<'static>> {
     prepare_uncached(text, width).lines.into_lines()
 }
 
-/// Render a standalone `Markdown` widget body (Textual's default styles).
+/// Render a standalone markdown body with the default styles.
 pub fn render_widget(text: &str, width: u16) -> Vec<Line<'static>> {
     prepare(text, width, WIDGET, false).lines.into_lines()
 }
 
-/// Render a command-result body (Python `.user-command-content`): its tcss
-/// strips the first block's margins and every heading's, so the first block
+/// Render a command-result body: the first block's margins and every
+/// heading's are stripped, so the first block
 /// and every heading follow their content directly and a gap is only the
 /// previous block's bottom margin.
 pub fn command_result(text: &str, width: u16) -> Vec<Line<'static>> {
@@ -194,32 +196,9 @@ pub fn command_result_linked(text: &str, width: u16) -> LinkedLines {
     prepare(text, width, ASSISTANT, true).lines
 }
 
-/// A markdown body under a heavy left border (Python `.whats-new-message`,
-/// `.vscode-extension-promo-message`, `.custom-tools-deprecation-message`): the
-/// markdown is padded one column and the gutter bar paints the border on the
-/// left of every row. First/last block margins are zeroed by their tcss, so the
-/// leading and trailing blank rows the plain renderer inserts are dropped.
-pub fn guttered(text: &str, width: u16, color: ratatui::style::Color) -> LinkedLines {
-    let mut body = prepare(text, width.saturating_sub(2), BANNER, false).lines;
-    let first = body
-        .lines()
-        .iter()
-        .position(|line| !is_blank_line(line))
-        .unwrap_or(body.len());
-    let end = body
-        .lines()
-        .iter()
-        .rposition(|line| !is_blank_line(line))
-        .map_or(first, |last| last + 1);
-    let gap = body
-        .lines()
-        .get(first + 1)
-        .is_some_and(is_blank_line)
-        .then_some(first + 1);
-    body.retain(|index, _| index >= first && index < end && Some(index) != gap);
-    let gutter = Style::default().fg(color);
-    body.prefix(|_| Span::styled("┃ ", gutter));
-    body
+/// A status row's body: the command layout, unpadded so the row's marker supplies the indent.
+pub fn status_linked(text: &str, width: u16) -> LinkedLines {
+    prepare(text, width, BANNER, true).lines
 }
 
 /// Render untrusted code as literal highlighted lines without Markdown parsing.
@@ -238,7 +217,7 @@ pub(crate) struct Out {
     pub(super) table: usize,
 }
 
-fn prepare(text: &str, width: u16, frame: Frame, command: bool) -> PreparedMarkdown {
+pub(super) fn prepare(text: &str, width: u16, frame: Frame, command: bool) -> PreparedMarkdown {
     let parsed = parse::parse_with_links(text, frame.profile);
     let mut out = Out {
         lines: LinkedLines::default(),
@@ -250,17 +229,15 @@ fn prepare(text: &str, width: u16, frame: Frame, command: bool) -> PreparedMarkd
     }
     let mut prev_bottom: Option<usize> = None;
     for block in &parsed.blocks {
-        // Command results (Python `.user-command-content`): a tcss rule that
-        // touches one margin edge replaces the whole margin, so the
-        // first-child rule strips the first block's margins entirely and the
-        // MarkdownHeader rule strips every heading's.
+        // Command results strip the first block's margins entirely and
+        // every heading's.
         let (top, bottom) = match (command, prev_bottom.is_none()) {
             (true, true) => (0, 0),
             _ => margins(block, frame, command),
         };
         // A marginless ANSI chat fence still stands one row apart from a neighbouring block.
         let apart = usize::from(
-            matches!(block, Block::Code(_))
+            matches!(block, Block::Code(..))
                 && frame.profile == Profile::Assistant
                 && super::theme::is_ansi(),
         );
@@ -301,20 +278,17 @@ fn prepare(text: &str, width: u16, frame: Frame, command: bool) -> PreparedMarkd
     }
 }
 
-/// (top, bottom) margin in blank rows from each block's Textual `margin`.
-/// ``command`` strips heading margins entirely, mirroring the
-/// `.user-command-content` tcss: a Textual rule that touches one margin edge
-/// replaces the whole margin, so its `MarkdownHeader` rule zeroes top and
-/// bottom together and every command-message heading sits directly against
-/// its content.
+/// (top, bottom) margin in blank rows for each block. ``command`` strips
+/// heading margins entirely, so every command-message heading sits directly
+/// against its content.
 fn margins(b: &Block, frame: Frame, command: bool) -> (usize, usize) {
     match b {
         Block::Heading(..) if command => (0, 0),
         Block::Heading(1 | 2, _) => (2, 1),
         Block::Heading(_, _) => (1, 1),
         // `MarkdownFence:ansi` sets `margin: 0`; truecolor themes keep `margin: 1 0`.
-        Block::Code(_) if super::theme::is_ansi() => (0, 0),
-        Block::Code(_) | Block::Quote(_) => (1, 1),
+        Block::Code(..) if super::theme::is_ansi() => (0, 0),
+        Block::Code(..) | Block::Quote(_) => (1, 1),
         // `MarkdownHorizontalRule`: `padding-top: 1; margin-bottom: 1`. The
         // assistant frame leaves the padding to this margin row; a bare
         // widget renders it inside the block, so its top margin is 0.

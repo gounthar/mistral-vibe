@@ -61,6 +61,7 @@ impl HarnessEngine {
         self.create_with_history(config, Vec::new())
     }
 
+    #[cfg(any(test, feature = "benchmark"))]
     pub(crate) fn create_with_history(
         &self,
         config: HarnessConfig,
@@ -70,13 +71,39 @@ impl HarnessEngine {
         self.insert(session)
     }
 
+    pub(crate) fn create_with_conversation(
+        &self,
+        config: HarnessConfig,
+        initial_history: Vec<crate::core::Message>,
+        conversation: Option<crate::core::ConversationSeed>,
+    ) -> Result<SessionHandle, String> {
+        let session =
+            HarnessSession::create_with_conversation(config, initial_history, conversation)?;
+        self.insert(session)
+    }
+
+    pub(crate) fn export_conversation(
+        &self,
+        handle: SessionHandle,
+        context: &str,
+    ) -> Result<crate::core::ConversationSeed, String> {
+        let context = crate::core::SpawnContext::from_json(context)?;
+        self.with_session(handle, |session| session.export_conversation(context))?
+    }
+
     pub(crate) fn restore(
         &self,
         config: HarnessConfig,
         checkpoint: Checkpoint,
         resume_input_id: u64,
+        moved_from: Option<HarnessConfig>,
     ) -> Result<SessionHandle, String> {
-        let session = HarnessSession::restore(config, checkpoint, resume_input_id)?;
+        let session = HarnessSession::restore_moved_from(
+            config,
+            checkpoint,
+            resume_input_id,
+            moved_from.as_ref(),
+        )?;
         self.insert(session)
     }
 
@@ -180,7 +207,6 @@ mod tests {
     use serde_json::json;
 
     use super::*;
-    use crate::core::ImageDeliverySettings;
 
     fn config(task_id: &str) -> HarnessConfig {
         HarnessConfig {
@@ -189,22 +215,39 @@ mod tests {
             settings: HarnessSettings {
                 turn: TurnSettings {
                     max_iterations: Some(8),
+                    output_limit_recovery: Default::default(),
                 },
                 context: ContextSettings {
                     compaction: CompactionPolicy::Disabled,
-                    image_delivery: ImageDeliverySettings::default(),
+                    notifications: crate::core::config::NotificationSettings {
+                        pending_count: 1000,
+                        pending_bytes: 1024 * 1024,
+                        recent_ids: 1000,
+                    },
+                    model_facts: crate::core::testing::test_model_facts(),
+                    compaction_model_input_modalities: None,
                 },
                 tools: ToolSettings {
+                    max_wait_ms: 3_600_000,
+                    model_wait: Default::default(),
                     programmatic: ProgrammaticToolSettings {
+                        mode: Default::default(),
+                        sleep: Default::default(),
                         max_effects: 128,
                         max_operations: 1024,
+                        max_elapsed_ms: 60_000,
+                        max_sleep_ms: 30_000,
                     },
                     large_output: crate::core::LargeOutputPolicy::Disabled,
-                    subagents: SubagentMode::Enabled,
+                    subagents: SubagentMode::enabled(),
                     background_processes: BackgroundProcessMode::Disabled,
+                    file_system: Default::default(),
+                    skills: Default::default(),
                     command_environment: CommandEnvironment::Unix,
+                    bash_timeout: None,
                     permissions: None,
                 },
+                prompts: Default::default(),
             },
             capabilities: Default::default(),
             skill_catalog_fingerprint: None,
@@ -251,7 +294,9 @@ mod tests {
         engine.apply(original, input("turn-original")).unwrap();
         let checkpoint = engine.checkpoint(original).unwrap();
 
-        let restored = engine.restore(config("original"), checkpoint, 0).unwrap();
+        let restored = engine
+            .restore(config("original"), checkpoint, 0, None)
+            .unwrap();
 
         assert_ne!(restored, original);
         assert_eq!(inspection_value(&engine, restored)["last_input_id"], 0);
@@ -264,7 +309,9 @@ mod tests {
         engine.apply(original, input("turn-original")).unwrap();
         let checkpoint = engine.checkpoint(original).unwrap();
 
-        let restored = engine.restore(config("original"), checkpoint, 1).unwrap();
+        let restored = engine
+            .restore(config("original"), checkpoint, 1, None)
+            .unwrap();
 
         assert_eq!(inspection_value(&engine, restored)["last_input_id"], 1);
     }

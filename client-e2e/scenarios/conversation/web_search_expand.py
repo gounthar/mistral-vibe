@@ -8,7 +8,7 @@ from e2e.app_server.events import (
     web_search_completed,
     web_search_started,
 )
-from e2e.app_server.scenario import Timeline
+from e2e.app_server.scenario import Timeline, take_snapshot
 
 _PROMPT = "who is paul vezia? search web"
 _ANSWER = (
@@ -22,8 +22,8 @@ _SOURCES = [
     }
 ]
 
-# The settled web-search disclosure header lands on SGR row 15.
-_CLICK = "\x1b[<0;1;15M\x1b[<0;1;15m"
+# The settled web-search disclosure header lands on SGR row 11.
+_CLICK = "\x1b[<0;1;11M\x1b[<0;1;11m"
 
 timeline: Timeline = [
     f"{_PROMPT}\r",
@@ -34,4 +34,5 @@ timeline: Timeline = [
     assistant_msg(_ANSWER),
     turn_completed(),
     _CLICK,
+    take_snapshot(),
 ]

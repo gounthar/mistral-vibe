@@ -3,12 +3,13 @@
 from __future__ import annotations
 
 import atexit
+import os
 from pathlib import Path
 import shutil
 import tempfile
 
-from e2e.app_server.config import MINIMAL_HOME_CONFIG, REPLAY_NOW_MS
-from e2e.app_server.scenario import Timeline
+from e2e.app_server.config import MINIMAL_HOME_CONFIG, REPLAY_NOW_MS, WHATS_NEW_FIXTURE
+from e2e.app_server.scenario import Timeline, take_snapshot
 
 # The startup prompt is cache-driven: seed a pending newer version in a pinned
 # VIBE_HOME, fresh enough that the pending-update query returns it. The dialog
@@ -21,19 +22,21 @@ Path(_home, "cache.toml").write_text(
     "[update_cache]\n"
     'latest_version = "99.0.0"\n'
     f"stored_at_timestamp = {REPLAY_NOW_MS // 1000}\n"
-    # The what's-new gate reads this section too; a seen version equal to the
-    # client's keeps its banner out of this scenario's TUI frame. Bump this
-    # with cli-rust's Cargo.toml version, or the gate reopens and the golden
-    # gains the what's-new banner.
-    'seen_whats_new_version = "2.25.8"\n'
+    # The what's-new gate reads this section too; a permanently stale seen
+    # version keeps the banner without a per-release pin.
+    'seen_whats_new_version = "0.0.0"\n'
 )
 
-env = {"VIBE_HOME": _home}
+env = {
+    "VIBE_HOME": _home,
+    # The shipped release notes change every release; render the frozen fixture
+    # history instead (see startup/whats_new.py).
+    "VIBE_WHATS_NEW_DIR": os.fspath(WHATS_NEW_FIXTURE),
+}
 
 # The harness's startup settle lands on the dialog's first frame. Right moves
-# to Continue, Enter dismisses the dialog (the settle then lands on the TUI's
-# own first marker), and "x" proves the session input is live.
-capture_startup = False
-timeline: Timeline = ["\x1b[C", "\r", "x"]
+# to Continue, Enter dismisses the dialog (the TUI acks its fence once
+# settled), and "x" proves the session input is live.
+timeline: Timeline = ["\x1b[C", "\r", "x", take_snapshot()]
 
-screen_excludes = {"rust": ("A new Vibe release is available",)}
+screen_excludes = ("A new Vibe release is available",)

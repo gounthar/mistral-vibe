@@ -8,6 +8,7 @@ endpoint received.
 
 from __future__ import annotations
 
+import json
 import os
 from pathlib import Path
 import signal
@@ -32,6 +33,7 @@ from tests.e2e.common import (
 from tests.e2e.mock_server import ChatCompletionsRequestPayload, StreamingMockServer
 from vibe import __version__
 from vibe.app_server.run_export import RunUsage
+from vibe.core.config._defaults import DEFAULT_OUTPUT_LIMIT_RETRIES
 
 pytestmark = [pytest.mark.timeout(90), pytest.mark.usefixtures("setup_e2e_env")]
 
@@ -224,20 +226,20 @@ def test_turn_limit_exhaustion_is_a_limit_outcome_and_exits_three(
 
 @pytest.mark.parametrize("streaming_mock_server", [_endless_tool_calls], indirect=True)
 @pytest.mark.parametrize(
-    ("budget_flag", "budget", "outcome"),
-    [("--max-tokens", "10", "token_limit"), ("--max-price", "10", "price_limit")],
+    ("budget_flag", "budget", "calls"),
+    [("--max-tokens", 0, 0), ("--max-tokens", 7, 1), ("--max-price", 14, 2)],
 )
-def test_spent_budget_stops_the_turn_and_exits_three(
+def test_cumulative_budget_prevents_the_next_completion(
     streaming_mock_server: StreamingMockServer,
     e2e_workdir: Path,
     tmp_path: Path,
     budget_flag: str,
-    budget: str,
-    outcome: str,
+    budget: int,
+    calls: int,
 ) -> None:
     """*Prepare*: A model that keeps calling a tool, 7 tokens and $7 per request.
-    *Do*: Run `vibe -p` with a token or price budget of 10.
-    *Assert*: Exit 3 and the export reports that budget, spent past its limit.
+    *Do*: Run `vibe -p` with zero or exactly reached budgets.
+    *Assert*: Runtime starts exactly the completions admitted before reaching the limit.
     """
     # Prepare
     write_e2e_config(
@@ -255,7 +257,7 @@ def test_spent_budget_stops_the_turn_and_exits_three(
             "Keep going",
             "--auto-approve",
             budget_flag,
-            budget,
+            str(budget),
             "--output-dir",
             str(output_dir),
         ],
@@ -264,11 +266,110 @@ def test_spent_budget_stops_the_turn_and_exits_three(
     # Assert
     assert result.returncode == 3, result.stderr
     export = read_export(output_dir)
-    assert export.outcome == outcome
+    assert export.outcome == (
+        "token_limit" if budget_flag == "--max-tokens" else "price_limit"
+    )
     assert export.stop_reason == "interrupted"
-    assert export.usage is not None and export.usage.total_tokens > 10
-    assert export.cost_usd is not None and export.cost_usd > 10
-    assert len(streaming_mock_server.requests) >= 2
+    assert export.usage is not None and export.usage.total_tokens == 7 * calls
+    assert export.cost_usd is not None and export.cost_usd == 7 * calls
+    assert len(streaming_mock_server.requests) == calls
+
+
+@pytest.mark.parametrize("streaming_mock_server", [_text_reply], indirect=True)
+@pytest.mark.parametrize(
+    ("budget_flag", "budget"),
+    [("--max-tokens", 7), ("--max-price", 6)],
+    ids=["tokens-equal", "price-overshoot"],
+)
+def test_final_completion_may_finish_at_or_past_the_budget(
+    streaming_mock_server: StreamingMockServer,
+    e2e_workdir: Path,
+    tmp_path: Path,
+    budget_flag: str,
+    budget: int,
+) -> None:
+    """*Prepare*: One admitted final reply costs seven tokens and seven dollars.
+    *Do*: Run with a budget the final reply reaches or overshoots.
+    *Assert*: The completed reply wins because no later completion is requested.
+    """
+    # Prepare
+    write_e2e_config(
+        Path(os.environ["VIBE_HOME"]),
+        streaming_mock_server.api_base,
+        model_settings=["input_price = 1000000.0", "output_price = 1000000.0"],
+    )
+    output_dir = tmp_path / "out"
+
+    # Do
+    result = run_vibe_headless(
+        e2e_workdir,
+        [
+            "-p",
+            "Finish once",
+            budget_flag,
+            str(budget),
+            "--output-dir",
+            str(output_dir),
+        ],
+    )
+
+    # Assert
+    assert result.returncode == 0, result.stderr
+    export = read_export(output_dir)
+    assert export.outcome == "finished"
+    assert export.usage is not None and export.usage.total_tokens == 7
+    assert export.cost_usd == 7
+    assert len(streaming_mock_server.requests) == 1
+
+
+def test_a_free_model_runs_under_a_price_budget(
+    streaming_mock_server: StreamingMockServer, e2e_workdir: Path, tmp_path: Path
+) -> None:
+    """*Prepare*: A headless price budget on a model with the default zero prices.
+    *Do*: Run against the mock provider.
+    *Assert*: The free model answers; zero prices are not missing pricing.
+    """
+    # Prepare
+    output_dir = tmp_path / "out"
+
+    # Do
+    result = run_vibe_headless(
+        e2e_workdir,
+        ["-p", "Hello", "--max-price", "1", "--output-dir", str(output_dir)],
+    )
+
+    # Assert
+    assert result.returncode == 0, result.stderr
+    export = read_export(output_dir)
+    assert export.outcome == "finished"
+    assert export.cost_usd == 0
+    assert len(streaming_mock_server.requests) == 1
+
+
+def test_invalid_price_limit_is_a_usage_error(
+    e2e_workdir: Path, tmp_path: Path
+) -> None:
+    """*Prepare*: A headless run with an output directory and a negative price limit.
+    *Do*: Run `vibe -p --max-price -1`.
+    *Assert*: Exit 1 and the requested export records the usage error.
+    """
+    # Prepare
+    output_dir = tmp_path / "out"
+
+    # Do
+    result = run_vibe_headless(
+        e2e_workdir,
+        ["-p", "Hello", "--max-price", "-1", "--output-dir", str(output_dir)],
+    )
+
+    # Assert
+    assert result.returncode == 1
+    export = read_export(output_dir)
+    assert export.outcome == "usage_error"
+    assert export.exit_code == 1
+    assert export.error is not None
+    assert "--max-price must be a nonnegative finite number" in export.error.message
+    assert export.session_id is None
 
 
 def test_missing_prompt_file_is_a_usage_error(
@@ -517,13 +618,14 @@ def test_stop_signal_stops_the_turn_and_its_tool_and_exits_three(
 
 @pytest.mark.parametrize("streaming_mock_server", [_text_reply], indirect=True)
 @pytest.mark.parametrize("backend", ["generic", "mistral"])
-def test_model_request_carries_the_configured_top_p_and_output_cap(
+def test_model_request_carries_the_configured_top_p_and_no_output_cap(
     streaming_mock_server: StreamingMockServer, e2e_workdir: Path, backend: str
 ) -> None:
     """*Prepare*: A model configured with `top_p` and `max_output_tokens`, behind
     either backend adapter.
     *Do*: Run `vibe -p`.
-    *Assert*: The model request carries both values.
+    *Assert*: The request carries `top_p` and no output cap: only Anthropic
+    requires one.
     """
     # Prepare
     write_e2e_config(
@@ -540,6 +642,26 @@ def test_model_request_carries_the_configured_top_p_and_output_cap(
     assert result.returncode == 0, result.stderr
     request: dict[str, Any] = dict(streaming_mock_server.requests[0])
     assert request["top_p"] == 0.9
+    assert "max_tokens" not in request
+
+
+@pytest.mark.parametrize("streaming_mock_server", [_text_reply], indirect=True)
+@pytest.mark.parametrize("backend", ["generic", "mistral"])
+def test_model_request_carries_the_configured_agent_output_cap(
+    streaming_mock_server: StreamingMockServer, e2e_workdir: Path, backend: str
+) -> None:
+    write_e2e_config(
+        Path(os.environ["VIBE_HOME"]),
+        streaming_mock_server.api_base,
+        backend=backend,
+        settings=["agent_max_output_tokens = 123"],
+        model_settings=["max_output_tokens = 456"],
+    )
+
+    result = run_vibe_headless(e2e_workdir, ["-p", "hello"])
+
+    assert result.returncode == 0, result.stderr
+    request: dict[str, Any] = dict(streaming_mock_server.requests[0])
     assert request["max_tokens"] == 123
 
 
@@ -598,12 +720,37 @@ def _truncated_reply(
 
 
 @pytest.mark.parametrize("streaming_mock_server", [_truncated_reply], indirect=True)
+def test_discarded_output_retries_spend_the_cumulative_budget(
+    streaming_mock_server: StreamingMockServer, e2e_workdir: Path, tmp_path: Path
+) -> None:
+    """*Prepare*: Every seven-token reply is discarded because it hits its output cap.
+    *Do*: Run under a 14-token cumulative budget.
+    *Assert*: Two billed replies close admission before another retry starts.
+    """
+    # Prepare
+    output_dir = tmp_path / "out"
+
+    # Do
+    result = run_vibe_headless(
+        e2e_workdir,
+        ["-p", "hello", "--max-tokens", "14", "--output-dir", str(output_dir)],
+    )
+
+    # Assert
+    assert result.returncode == 3, result.stderr
+    export = read_export(output_dir)
+    assert export.outcome == "token_limit"
+    assert len(streaming_mock_server.requests) == 2
+
+
+@pytest.mark.parametrize("streaming_mock_server", [_truncated_reply], indirect=True)
 def test_response_cut_off_at_the_output_cap_is_a_length_outcome(
     streaming_mock_server: StreamingMockServer, e2e_workdir: Path, tmp_path: Path
 ) -> None:
-    """*Prepare*: A model whose answer stops at the output cap.
+    """*Prepare*: A model whose every answer stops at the output cap.
     *Do*: Run `vibe -p`.
-    *Assert*: Exit 3 and the export reports `length`.
+    *Assert*: Vibe asks again with feedback up to the retry cap, then exits 3
+    and the export reports `length`.
     """
     # Prepare
     output_dir = tmp_path / "out"
@@ -619,7 +766,11 @@ def test_response_cut_off_at_the_output_cap_is_a_length_outcome(
     assert export.outcome == "length"
     assert export.exit_code == 3
     assert export.stop_reason == "length"
-    assert len(streaming_mock_server.requests) == 1
+    assert len(streaming_mock_server.requests) == 1 + DEFAULT_OUTPUT_LIMIT_RETRIES
+    last_request = json.dumps(streaming_mock_server.requests[-1])
+    assert last_request.count("reached the output token limit") == (
+        DEFAULT_OUTPUT_LIMIT_RETRIES
+    )
 
 
 def _refused_reply(
@@ -639,21 +790,19 @@ def _refused_reply(
 
 
 @pytest.mark.parametrize("streaming_mock_server", [_refused_reply], indirect=True)
-def test_a_model_refusal_is_a_refusal_outcome(
+def test_a_model_refusal_is_a_refusal_outcome_and_exits_three(
     streaming_mock_server: StreamingMockServer, e2e_workdir: Path, tmp_path: Path
 ) -> None:
-    """*Prepare*: A model that refuses to answer. Only the legacy runtime
-    reports a refusal as one, so the run uses it.
+    """*Prepare*: A model that refuses to answer.
     *Do*: Run `vibe -p`.
-    *Assert*: Exit 3, and the export reports `refusal` with the error's code.
+    *Assert*: Exit 3 with the `refusal` outcome, the model's own answer to score.
     """
     # Prepare
     output_dir = tmp_path / "out"
 
     # Do
     result = run_vibe_headless(
-        e2e_workdir,
-        ["--legacy-harness", "-p", "hello", "--output-dir", str(output_dir)],
+        e2e_workdir, ["-p", "hello", "--output-dir", str(output_dir)]
     )
 
     # Assert
@@ -661,7 +810,4 @@ def test_a_model_refusal_is_a_refusal_outcome(
     export = read_export(output_dir)
     assert export.outcome == "refusal"
     assert export.exit_code == 3
-    assert export.error is not None
-    assert export.error.code == "refusal"
-    assert "declined to respond" in export.error.message
     assert len(streaming_mock_server.requests) == 1

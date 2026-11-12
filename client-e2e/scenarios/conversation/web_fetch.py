@@ -10,13 +10,13 @@ from e2e.app_server.events import (
     web_fetch,
     web_fetch_without_output,
 )
-from e2e.app_server.scenario import Timeline
+from e2e.app_server.scenario import Timeline, take_snapshot
 
 _PROMPT = "fetch the articles"
 
 # The settled tool group header, then its first web-fetch entry on the next row once unfolded.
-_EXPAND = "\x1b[<0;1;15M\x1b[<0;1;15m"
-_EXPAND_ENTRY = "\x1b[<0;8;16M\x1b[<0;8;16m"
+_EXPAND = "\x1b[<0;1;11M\x1b[<0;1;11m"
+_EXPAND_ENTRY = "\x1b[<0;8;12M\x1b[<0;8;12m"
 
 timeline: Timeline = [
     f"{_PROMPT}\r",
@@ -33,4 +33,5 @@ timeline: Timeline = [
     turn_completed(),
     _EXPAND,
     _EXPAND_ENTRY,
+    take_snapshot(),
 ]

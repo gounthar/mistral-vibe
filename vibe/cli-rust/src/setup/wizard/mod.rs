@@ -1,6 +1,5 @@
-//! The onboarding wizard's state and screen routing (Python
-//! `vibe/setup/onboarding`). Owned by the wizard flow, never by the chat
-//! app: the TUI runs only after the wizard closed.
+//! The onboarding wizard's state and screen routing. Owned by the wizard
+//! flow, never by the chat app: the TUI runs only after the wizard closed.
 
 pub mod actions;
 pub mod boot;
@@ -9,20 +8,22 @@ mod domain;
 pub mod flow;
 pub mod mouse;
 pub mod paint;
+pub mod provider_choice;
 pub mod screens;
 pub mod sign_in;
 pub mod submit;
 
+pub use self::provider_choice::ProviderChoice;
 pub use self::sign_in::{BrowserSignInState, SignInStep, SignInVariant};
 
-use std::time::Instant;
+use crate::clock::UiInstant;
 
 use crossterm::event::{KeyCode, KeyEvent};
 
 use self::context::OnboardingContext;
 use crate::setup::auth::rpc::SetupStatus;
 
-/// The welcome screen's typing-animation text (Python's onboarding welcome).
+/// The welcome screen's typing-animation text.
 pub const WELCOME_TEXT: &str = "Welcome to Mistral Vibe - Let's get you started!";
 
 /// Which wizard screen is active.
@@ -30,6 +31,7 @@ pub const WELCOME_TEXT: &str = "Welcome to Mistral Vibe - Let's get you started!
 pub enum Screen {
     Welcome,
     ThemeSelection,
+    ProviderChoice,
     AuthMethod,
     SignInTarget,
     CustomDomain,
@@ -71,13 +73,17 @@ pub struct OnboardingState {
     pub open: bool,
     pub screen: Screen,
     pub context: OnboardingContext,
-    /// The launch snapshot (Python `self._config`): what the server resolved
+    /// The launch snapshot: what the server resolved
     /// before the wizard opened. The live `context` mutates with the user's
     /// choices; backing out of a browser sign-in restores from it, and the
     /// configured-domain reads and the tenant-resolution skip compare
     /// against it.
     pub config: OnboardingContext,
     pub theme_index: usize,
+    /// Set by `--setup`: a non-Mistral provider also gets the Mistral setup.
+    pub offers_provider_choice: bool,
+    pub provider_choice: Option<ProviderChoice>,
+    pub provider_selected: usize,
     pub auth_method_selected: usize,
     pub sign_in_target_selected: usize,
     pub custom_domain: OnboardingInput,
@@ -86,26 +92,25 @@ pub struct OnboardingState {
     /// Which custom-domain input is focused: 0 the domain, 1 the API base.
     pub custom_domain_focus: usize,
     /// Which custom-domain input the feedback row describes; set on every
-    /// edit and by Enter's validation, never by focus changes (Python's
-    /// feedback is change-driven).
+    /// edit and by Enter's validation, never by focus changes (the feedback
+    /// is change-driven).
     pub custom_domain_feedback: usize,
     pub api_key_input: OnboardingInput,
     pub browser_sign_in: BrowserSignInState,
     pub welcome_char_index: usize,
     pub welcome_done: bool,
-    pub welcome_timer: Option<Instant>,
+    pub welcome_timer: Option<UiInstant>,
     /// The app-server boot is still converging: the welcome screen says so
     /// instead of inviting an Enter the gate holds (the boot can take a
-    /// first-run venv sync; Python's wizard has no server to wait for).
+    /// first-run venv sync).
     pub boot_pending: bool,
     /// Armed by the first Enter on "Mistral AI" when a custom domain is
-    /// configured; the second Enter applies the default (Python's override
-    /// confirm).
+    /// configured; the second Enter applies the default.
     pub override_confirm_armed: bool,
     /// The configured domain the override warning names.
     pub override_confirm_domain: String,
-    /// Whether the user selected a theme: Python persists `/theme` on
-    /// every completed onboarding that selected one, selected value or not.
+    /// Whether the user selected a theme: a completed onboarding that selected
+    /// one persists `/theme`, selected value or not.
     pub theme_selected: bool,
     /// Top row of the theme preview's window (dragged by its scrollbar).
     pub preview_scroll: usize,
@@ -113,7 +118,7 @@ pub struct OnboardingState {
     /// selectable theme row.
     pub theme_rows: Vec<(ratatui::layout::Rect, usize)>,
     /// Paint-time hit targets, rebuilt every frame: the card rect of every
-    /// text input, for click-to-focus (Textual `Input` click behavior).
+    /// text input, for click-to-focus.
     pub input_rows: Vec<(ratatui::layout::Rect, InputCard)>,
 }
 
@@ -138,6 +143,9 @@ impl Default for OnboardingState {
             config: context.clone(),
             context,
             theme_index,
+            offers_provider_choice: false,
+            provider_choice: None,
+            provider_selected: 0,
             auth_method_selected: 0,
             sign_in_target_selected: 0,
             custom_domain: OnboardingInput::default(),
@@ -168,10 +176,11 @@ pub enum Action {
     Cancel,
     SelectTheme(usize),
     SubmitApiKey(String),
+    CompleteOidc,
     StartBrowserSignIn,
     RetrySignIn,
     /// Switch to the API key screen, cancelling any in-flight sign-in flow
-    /// first (Python `action_manual`'s `_cancel_current_attempt`).
+    /// first.
     AbortSignIn,
     CopySignInUrl,
 }
@@ -195,6 +204,15 @@ impl OnboardingState {
             &mut self.custom_domain_api
         }
     }
+
+    /// The screen before the auth choices: the provider choice when offered.
+    pub fn before_auth(&self) -> Screen {
+        if self.provider_choice.is_some() {
+            Screen::ProviderChoice
+        } else {
+            Screen::ThemeSelection
+        }
+    }
 }
 
 /// Seed the effective wizard context from the server's resolved view
@@ -203,6 +221,7 @@ impl OnboardingState {
 pub fn seed(state: &mut OnboardingState, status: &SetupStatus) {
     state.context = OnboardingContext::from_status(status);
     state.config = state.context.clone();
+    state.provider_choice = provider_choice::from_status(state, status);
     state.theme_index = resolve_initial_theme_index(&state.context.theme);
 }
 
@@ -214,15 +233,15 @@ pub fn open(state: &mut OnboardingState) {
     state.screen = Screen::Welcome;
     state.welcome_char_index = 0;
     state.welcome_done = false;
-    state.welcome_timer = Some(Instant::now());
+    state.welcome_timer = Some(crate::clock::now());
     // Replay captures settle mid-animation otherwise; show the full text.
     if crate::utils::is_replaying() {
         settle_welcome_typing(state);
     }
 }
 
-/// One 40ms step of the welcome typing animation (Python's `onboarding`
-/// welcome screen). Replay settles instantly so captures stay stable.
+/// One 40ms step of the welcome typing animation. Replay settles instantly
+/// so captures stay stable.
 pub fn advance_welcome_typing(state: &mut OnboardingState, replaying: bool) {
     if replaying {
         settle_welcome_typing(state);
@@ -246,7 +265,7 @@ pub fn close(state: &mut OnboardingState) {
 }
 
 /// The initial theme index: the wizard context's theme, which is config.toml
-/// overridden by VIBE_THEME, defaulting to auto (Python `resolve_theme_name`).
+/// overridden by VIBE_THEME, defaulting to auto.
 fn resolve_initial_theme_index(theme: &str) -> usize {
     let opts = crate::theme_picker::options();
     opts.iter().position(|t| *t == theme).unwrap_or(0)

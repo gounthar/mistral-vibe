@@ -107,10 +107,23 @@ class HarnessTurnConflictError(HarnessSessionError):
         )
 
 
+class HarnessConfigurationRejectedError(HarnessSessionError):
+    """Core refused a configuration; the Session keeps the one it was running.
+
+    The refusal is deterministic: Core refuses the same configuration again
+    until the context changes, so a caller drops it rather than retrying it.
+    """
+
+    def __init__(self, message: str) -> None:
+        super().__init__("configuration_rejected", message)
+
+
 class HarnessForkEntryRequiredError(HarnessSessionError):
     def __init__(self) -> None:
         super().__init__(
-            "fork_entry_required", "entry_id is required to fork a running session"
+            "fork_entry_required",
+            "Cannot find where the active Turn starts: fork at an entry_id or "
+            "once the Turn finishes",
         )
 
 
@@ -155,6 +168,15 @@ class HarnessTurnQueueItemNotFoundError(HarnessSessionError):
         super().__init__(
             "turn_queue_item_not_found",
             f"Queued turn not found: {queue_item_id}",
+            details={"queue_item_id": queue_item_id},
+        )
+
+
+class HarnessTurnQueueEditConflictError(HarnessSessionError):
+    def __init__(self, queue_item_id: str) -> None:
+        super().__init__(
+            "turn_queue_edit_conflict",
+            f"Queued turn cannot change while an edit is active: {queue_item_id}",
             details={"queue_item_id": queue_item_id},
         )
 
@@ -291,6 +313,7 @@ __all__ = [
     "HarnessSessionNotFoundError",
     "HarnessStaleTurnError",
     "HarnessTurnConflictError",
+    "HarnessTurnQueueEditConflictError",
     "HarnessTurnQueueFullError",
     "HarnessTurnQueueIdempotencyConflictError",
     "HarnessTurnQueueItemNotFoundError",

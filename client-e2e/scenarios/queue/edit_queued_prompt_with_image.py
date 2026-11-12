@@ -5,8 +5,6 @@ from __future__ import annotations
 from e2e.app_server.events import assistant_msg, turn_started, user_msg
 from e2e.app_server.scenario import Timeline
 
-env = {"VIBE_REPLAY_SETTLE_BUSY": "1"}
-
 _PROMPT = "@/vibe-test/diagram.png describe this image"
 _IMAGE = {
     "source": {"kind": "file", "path": "/vibe-test/diagram.png"},
@@ -30,15 +28,8 @@ handshake = {
         }
     }
 }
-settle_per_key = True
-screen_contains = {
-    "python": ("describe this image edited", "attached image: diagram.png"),
-    "rust": ("describe this image edited", "attached image: diagram.png"),
-}
-screen_excludes = {
-    "python": ("queue/replace failed",),
-    "rust": ("queue/replace failed",),
-}
+screen_contains = ("describe this image edited", "attached image: diagram.png")
+screen_excludes = ("queue/replace failed",)
 
 timeline: Timeline = [
     "first\r",

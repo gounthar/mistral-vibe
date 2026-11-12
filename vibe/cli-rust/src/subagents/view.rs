@@ -1,4 +1,4 @@
-//! Child-view lifecycle: scroll memory, fetch scheduling, reset (Python `app.py`).
+//! Child-view lifecycle: scroll memory, fetch scheduling, reset.
 
 use crate::app::App;
 use crate::subagents::list::update_sessions;
@@ -24,8 +24,8 @@ pub fn active_transcript(
     }
 }
 
-/// Python `_refresh_context_progress`: while a child is viewed the context
-/// progress shows the child's own context usage; on main it shows the session's.
+/// While a child is viewed the context progress shows the child's own
+/// context usage; on main it shows the session's.
 pub fn refresh_context_progress(app: &mut App) {
     match app.subagents.viewed_child() {
         Some(child) => app.session.tokens.0 = child.context_tokens(),
@@ -35,8 +35,8 @@ pub fn refresh_context_progress(app: &mut App) {
     }
 }
 
-/// Python `_remember_transcript_scroll`: park the current offset under the
-/// session being left (`None` is the main conversation).
+/// Park the current offset under the session being left (`None` is the
+/// main conversation).
 pub(super) fn remember_scroll(app: &mut App) {
     let key = app.subagents.viewed_subagent_id.clone();
     app.subagents
@@ -45,8 +45,8 @@ pub(super) fn remember_scroll(app: &mut App) {
         .insert(key, app.view.scroll);
 }
 
-/// Python `_restore_transcript_scroll`: resume the session's stored offset, or
-/// anchor at the newest content when it has none.
+/// Resume the session's stored offset, or anchor at the newest content when
+/// it has none.
 pub(super) fn restore_scroll(app: &mut App, key: Option<&str>) {
     let stored = app
         .subagents
@@ -59,38 +59,35 @@ pub(super) fn restore_scroll(app: &mut App, key: Option<&str>) {
     app.view.scroll_target = stored;
 }
 
-/// Anchor the viewed transcript to the newest content (Python `chat_widget.anchor`).
+/// Anchor the viewed transcript to the newest content.
 pub fn anchor(app: &mut App) {
     app.view.scroll = 0;
     app.view.scroll_target = 0;
 }
 
-/// Python `_remember_subagent_instruction`: synthesize the parent's spawn
-/// task as a `parent-instruction:<child>` turn-start user message.
+/// Synthesize the parent's spawn task as a `parent-instruction:<child>`
+/// turn-start user message.
 pub fn remember_parent_instruction_from_entry(app: &mut App, entry: &serde_json::Value) {
-    let Some(detail) = entry.get("detail") else {
-        return;
-    };
-    let is_spawn = detail.get("kind").and_then(serde_json::Value::as_str) == Some("subagent")
-        && detail.get("toolName").and_then(serde_json::Value::as_str) == Some("subagent.spawn");
-    if !is_spawn {
-        return;
-    }
-    let (Some(child_session_id), Some(task)) = (
-        detail
-            .get("childSessionId")
-            .and_then(serde_json::Value::as_str),
-        detail
-            .pointer("/input/task")
-            .and_then(serde_json::Value::as_str),
+    let detail = &entry["detail"];
+    // Deprecated: `subagent.spawn` is the pre-rename spelling of `agents.spawn`,
+    // kept only so persisted sessions still show the parent instruction.
+    let is_spawn = detail["kind"] == "subagent"
+        && matches!(
+            detail["toolName"].as_str(),
+            Some("agents.spawn" | "subagent.spawn")
+        );
+    let (true, Some(child_session_id), Some(task)) = (
+        is_spawn,
+        detail["childSessionId"].as_str(),
+        detail["input"]["task"].as_str(),
     ) else {
         return;
     };
     let instruction = serde_json::json!({
         "id": format!("parent-instruction:{child_session_id}"),
         "sessionId": child_session_id,
-        "createdAt": entry.get("createdAt").cloned().unwrap_or(serde_json::Value::Null),
-        "updatedAt": entry.get("updatedAt").cloned().unwrap_or(serde_json::Value::Null),
+        "createdAt": entry["createdAt"],
+        "updatedAt": entry["updatedAt"],
         "generationStatus": "completed",
         "type": "message",
         "role": "user",
@@ -100,8 +97,8 @@ pub fn remember_parent_instruction_from_entry(app: &mut App, entry: &serde_json:
     app.subagents.transcripts.remember_instruction(instruction);
 }
 
-/// Python `_schedule_subagent_transcript_refresh`: mark the drain dirty and
-/// start the 50ms sleep when one is not already running.
+/// Mark the drain dirty and start the 50ms sleep when one is not already
+/// running.
 pub fn schedule_refresh(app: &mut App) {
     app.subagents.refresh_requested = true;
     arm_refresh(app);
@@ -117,9 +114,9 @@ fn arm_refresh(app: &mut App) {
         app.subagents.refresh_requested = false;
         return;
     }
-    // Python clears the dirty bit, sleeps 50ms, then fetches.
+    // Clear the dirty bit, sleep 50ms, then fetch.
     app.subagents.refresh_requested = false;
-    app.subagents.refresh_at = Some(std::time::Instant::now() + super::REFRESH_DEBOUNCE);
+    app.subagents.refresh_at = Some(crate::clock::real_now() + super::REFRESH_DEBOUNCE);
 }
 
 /// The debounce elapsed. Fetch once; requests from the wait stay dirty and
@@ -131,8 +128,8 @@ pub fn start_refresh(app: &mut App, client: &std::sync::Arc<crate::server::Clien
     }
 }
 
-/// One history read at a time (Python awaits the refresh), so a slower older
-/// `session/read` cannot finish later and replace a newer transcript.
+/// One history read at a time, so a slower older `session/read` cannot
+/// finish later and replace a newer transcript.
 fn spawn_refresh(app: &mut App, client: &std::sync::Arc<crate::server::Client>) -> bool {
     if app.subagents.refresh_in_flight {
         return false;
@@ -141,7 +138,7 @@ fn spawn_refresh(app: &mut App, client: &std::sync::Arc<crate::server::Client>) 
         return false;
     };
     // No answer channel: skipping keeps the drain from waiting on a lost event.
-    let Some(tx) = app.subagents.tx.clone() else {
+    let Some(tx) = app.events.clone() else {
         return false;
     };
     let (known_ids, cached_complete) = match app.subagents.transcripts.child(&session_id) {
@@ -159,20 +156,17 @@ fn spawn_refresh(app: &mut App, client: &std::sync::Arc<crate::server::Client>) 
         None => (std::collections::HashSet::new(), false),
     };
     app.subagents.refresh_in_flight = true;
-    // Count the fetch as in-flight work so the idle marker waits for it.
-    let pending = app.commit_started();
     super::fetch::fetch_history(
         client.clone(),
         session_id,
         Some(tx),
         known_ids,
         cached_complete,
-        pending,
     );
     true
 }
 
-/// Apply a fetch answer on the main thread (Python `_refresh_subagent_transcript`).
+/// Apply a fetch answer on the main thread.
 pub fn apply_event(app: &mut App, event: super::Event) {
     // This read has landed. A request that arrived during it arms the next window.
     app.subagents.refresh_in_flight = false;
@@ -184,7 +178,7 @@ pub fn apply_event(app: &mut App, event: super::Event) {
         } => {
             if app.subagents.viewed_subagent_id.as_deref() == Some(session_id.as_str()) {
                 // The viewport keeps its offset across the content change; an
-                // anchored view stays anchored (Python anchors or restores).
+                // anchored view stays anchored.
                 let show_thinking = crate::startup::read_show_thinking_nodes(&app.session.runtime);
                 let changed = app.subagents.transcripts.replace_history(
                     &session_id,
@@ -206,8 +200,8 @@ pub fn apply_event(app: &mut App, event: super::Event) {
     arm_refresh(app);
 }
 
-/// Python `build_history_widgets(tools_collapsed=...)`: with the bulk fold
-/// open, a rebuilt child expands its groups and reasoning rows.
+/// With the bulk fold open, a rebuilt child expands its groups and
+/// reasoning rows.
 fn expand_rebuilt_tools(app: &mut App, session_id: &str) {
     if app.view.tools_collapsed {
         return;
@@ -219,23 +213,28 @@ fn expand_rebuilt_tools(app: &mut App, session_id: &str) {
     app.view.expanded.extend(ids);
 }
 
-/// Python `_reset_subagent_views`: drop every child view on a session reset.
-/// Every Python reset flow re-anchors the chat afterwards (`scroll_home` on
-/// clear and context-cleared, `anchor` on the compact rebuild), so the child's
-/// transcript scroll must not leak into the rebuilt main conversation.
+/// Drop every child view on a session reset. Every reset flow re-anchors
+/// the chat afterwards (`scroll_home` on clear and context-cleared, `anchor`
+/// on the compact rebuild), so the child's transcript scroll must not leak
+/// into the rebuilt main conversation.
 pub fn reset_views(app: &mut App) {
     app.subagents.refresh_at = None;
     app.subagents.refresh_requested = false;
     // Leave `refresh_in_flight` set so the outstanding answer, not a new read, releases the drain.
     app.subagents.viewed_subagent_id = None;
     app.subagents.transcripts.clear();
+    // Another session: its list shows again only once it has a child, with waiting ones hidden.
+    app.subagents.list.shown = false;
+    app.subagents.list.show_waiting = false;
+    if app.subagents.list.focused {
+        super::list::leave_list(app);
+    }
     anchor(app);
     refresh_context_progress(app);
     update_sessions(app);
 }
 
-/// Python `_append_subagent_read_only_message`: a local row scolding the
-/// Ctrl+C, then anchor the viewed transcript.
+/// A local row scolding the Ctrl+C, then anchor the viewed transcript.
 pub fn append_read_only_message(app: &mut App, session_id: &str) {
     app.subagents.transcripts.append_local_user_message(
         session_id,

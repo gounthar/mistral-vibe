@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
 from enum import StrEnum, auto
 from pathlib import Path
 from typing import Any
@@ -57,7 +58,6 @@ class SkillMetadata(BaseModel):
     )
     compatibility: str | None = Field(
         default=None,
-        max_length=500,
         description="Environment requirements (intended product, system packages, etc.).",
     )
     metadata: dict[str, str] = Field(
@@ -155,12 +155,16 @@ class SkillInfo(BaseModel):
         )
 
 
+@dataclass(frozen=True, slots=True)
+class InstalledSkill:
+    """``active`` says whether the skill's name loads this one, not whether it is
+    enabled.
+    """
+
+    info: SkillInfo
+    active: bool
+
+
 class SkillConfigIssue(BaseModel):
     file: Path
     message: str
-
-
-class ParsedSkillCommand(BaseModel):
-    name: str
-    content: str
-    extra_instructions: str | None = None

@@ -10,9 +10,13 @@ from __future__ import annotations
 from collections.abc import Mapping
 import logging
 from pathlib import Path
+import sys
+import tempfile
+import tomllib
 from typing import Any
 
 import pytest
+import tomli_w
 
 from tests.conftest import build_test_vibe_config
 from tests.stubs.fake_config_orchestrator import FakeConfigOrchestrator
@@ -35,7 +39,12 @@ from vibe.app_server._provided_tools import (
 )
 from vibe.app_server._unified_permissions import (
     RUST_BUILTIN_TOOL_SOURCES,
+    CommandEnvironment,
+    ShellWrites,
     UnifiedPermissionResolver,
+    git_bash_windows_path,
+    shell_writes,
+    windows_drive_path,
 )
 
 
@@ -60,6 +69,24 @@ def _resolver(
     if routes:
         resolver.provided_names.register("mcp", routes)
     return resolver, orchestrator
+
+
+def _shell_resolver(
+    tmp_path: Path, command_environment: CommandEnvironment
+) -> UnifiedPermissionResolver:
+    """The bridge over the default catalogue for a session in one shell."""
+    orchestrator = FakeConfigOrchestrator(build_test_vibe_config())
+    store = PermissionStore()
+    manager = ToolManager(
+        lambda: orchestrator.config,
+        defer_mcp=True,
+        cwd=tmp_path,
+        harness_files=HarnessFilesManager().for_session(tmp_path),
+        permission_getter=store.get_tool_permission,
+    )
+    return UnifiedPermissionResolver(
+        manager, store, orchestrator, command_environment=command_environment
+    )
 
 
 # The ids the harness mints: ``process-<hex>-<hex>`` over session and call ids.
@@ -582,6 +609,86 @@ async def test_a_permanent_grant_writes_the_pattern_to_the_allowlist(
 
 
 @pytest.mark.asyncio
+async def test_a_permanent_grant_keeps_allowlist_entries_another_session_saved(
+    tmp_path: Path, config_dir: Path
+) -> None:
+    # Prepare
+    resolver, _ = _resolver(tmp_path, bash={"allowlist": ["ls"]})
+    outcome = await resolver.resolve("file_system.bash", {"command": "npm test"})
+    config_file = config_dir / "config.toml"
+    saved = tomllib.loads(config_file.read_text())
+    saved.setdefault("tools", {})["bash"] = {"allowlist": ["ls", "make"]}
+    config_file.write_text(tomli_w.dumps(saved))
+
+    # Do
+    await resolver.grant("file_system.bash", _granted(outcome), permanent=True)
+
+    # Assert
+    persisted = tomllib.loads(config_file.read_text())
+    assert persisted["tools"]["bash"]["allowlist"] == ["ls", "make", "npm test"]
+
+
+@pytest.mark.asyncio
+async def test_a_permanent_grant_rewrites_a_pattern_removed_from_the_file(
+    tmp_path: Path, config_dir: Path
+) -> None:
+    # Prepare
+    resolver, _ = _resolver(tmp_path, bash={"allowlist": ["ls"]})
+    outcome = await resolver.resolve("file_system.bash", {"command": "npm test"})
+    await resolver.grant("file_system.bash", _granted(outcome), permanent=True)
+    config_file = config_dir / "config.toml"
+    saved = tomllib.loads(config_file.read_text())
+    saved["tools"]["bash"]["allowlist"] = ["ls"]
+    config_file.write_text(tomli_w.dumps(saved))
+
+    # Do
+    await resolver.grant("file_system.bash", _granted(outcome), permanent=True)
+
+    # Assert
+    persisted = tomllib.loads(config_file.read_text())
+    assert persisted["tools"]["bash"]["allowlist"] == ["ls", "npm test"]
+
+
+@pytest.mark.asyncio
+async def test_a_permanent_grant_already_in_the_file_leaves_it_byte_identical(
+    tmp_path: Path, config_dir: Path
+) -> None:
+    # Prepare
+    resolver, _ = _resolver(tmp_path, bash={"allowlist": ["ls"]})
+    outcome = await resolver.resolve("file_system.bash", {"command": "npm test"})
+    config_file = config_dir / "config.toml"
+    saved = tomllib.loads(config_file.read_text())
+    saved.setdefault("tools", {})["bash"] = {"allowlist": ["npm test", "ls"]}
+    original = "# my comment\n" + tomli_w.dumps(saved)
+    config_file.write_text(original)
+
+    # Do
+    await resolver.grant("file_system.bash", _granted(outcome), permanent=True)
+
+    # Assert
+    assert config_file.read_text() == original
+
+
+@pytest.mark.asyncio
+async def test_a_permanent_grant_keeps_entries_deleted_from_the_file_deleted(
+    tmp_path: Path, config_dir: Path
+) -> None:
+    # Prepare
+    resolver, _ = _resolver(tmp_path, bash={"allowlist": ["ls", "make"]})
+    outcome = await resolver.resolve("file_system.bash", {"command": "npm test"})
+    config_file = config_dir / "config.toml"
+    assert "bash" not in tomllib.loads(config_file.read_text()).get("tools", {})
+
+    # Do
+    await resolver.grant("file_system.bash", _granted(outcome), permanent=True)
+
+    # Assert
+    allowlist = tomllib.loads(config_file.read_text())["tools"]["bash"]["allowlist"]
+    assert "make" not in allowlist
+    assert {"npm test", "git status"} <= set(allowlist)
+
+
+@pytest.mark.asyncio
 async def test_a_grant_for_a_command_with_an_expansion_covers_the_next_one(
     tmp_path: Path,
 ) -> None:
@@ -694,7 +801,7 @@ async def test_a_permanent_grant_persists_command_and_path_scopes(
 
     # Assert
     allowlist = orchestrator.config.tools["bash"]["allowlist"]
-    assert allowlist == sorted(["grep", path_grant])
+    assert {"grep", path_grant} <= set(allowlist)
     assert PermissionScope.OUTSIDE_DIRECTORY.value not in caplog.text
     next_session, _ = _resolver(tmp_path, bash={"allowlist": allowlist})
     again = await next_session.resolve("file_system.bash", {"command": command})
@@ -940,7 +1047,7 @@ async def test_a_background_start_asks_scoped_to_the_command_it_would_run(
     """*Prepare*: A resolver over the default tool catalogue.
     *Do*: Resolve a ``process.start`` the user has not approved.
     *Assert*: It asks, scoped to the command the start would run. The start runs
-    ``[shell, "-lc", command]``, so it is the shell's own question, and the
+    ``[shell, "-c", command]``, so it is the shell's own question, and the
     command is what a grant gets recorded against.
     """
     # Prepare
@@ -1317,3 +1424,654 @@ async def test_a_sandboxed_resolver_leaves_home_relative_paths_to_the_sandbox(
     # Assert
     assert home.authorized_path == Path("~/notes.txt")
     assert relative.authorized_path == tmp_path / "notes.txt"
+
+
+@pytest.mark.asyncio
+async def test_a_shell_ask_carries_where_its_redirects_write(tmp_path: Path) -> None:
+    """*Prepare*: A resolver over the default tool catalogue.
+    *Do*: Resolve a bash call whose redirect hides behind a typed root name, as
+    in ``<workspace>/abs/path``, next to a relative redirect and one from a root
+    that names a variable.
+    *Assert*: The ask carries the plainly spelled target, resolved, and the one
+    only the shell can read, as written; not the relative one, which a ``cd``
+    could move.
+    """
+    # Prepare
+    resolver, _ = _resolver(tmp_path)
+    agent = tmp_path / "Library" / "LaunchAgents" / "x.plist"
+
+    # Do
+    outcome = await resolver.resolve(
+        "file_system.bash",
+        {
+            # Forward slashes: a backslash is an escape to the POSIX shells.
+            "command": f"cat tools/plist.tmpl <workspace>{agent.as_posix()} "
+            "2> err.log > /tmp/$NAME.log"
+        },
+    )
+
+    # Assert
+    assert outcome.decision == "ask"
+    assert outcome.shell_write_paths == (agent.resolve(),)
+    assert outcome.unplaced_shell_writes == ("/tmp/$NAME.log",)
+
+
+@pytest.mark.asyncio
+async def test_a_settled_or_non_shell_call_carries_no_write_paths(
+    tmp_path: Path,
+) -> None:
+    """*Prepare*: A resolver whose shells' allowlists cover a command.
+    *Do*: Resolve that command, and a write-file call.
+    *Assert*: Neither carries shell writes: an allowed call is never
+    classified, and only a shell command has redirects.
+    """
+    # Prepare
+    allowlist = {"allowlist": ["npm test"]}
+    resolver, _ = _resolver(
+        tmp_path, bash=allowlist, powershell=allowlist, git_bash=allowlist
+    )
+
+    # Do
+    allowed = await resolver.resolve("file_system.bash", {"command": "npm test"})
+    write = await resolver.resolve(
+        "file_system.write_file", {"path": "a.txt", "content": "x"}
+    )
+
+    # Assert
+    assert allowed.decision == "allow"
+    assert (allowed.shell_write_paths, allowed.unplaced_shell_writes) == ((), ())
+    assert (write.shell_write_paths, write.unplaced_shell_writes) == ((), ())
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("environment", "builtin", "arguments", "unplaced"),
+    [
+        # PowerShell opens ``\tmp\out.log`` on whichever drive is current.
+        ("powershell", "file_system.bash", {"command": "echo x > /tmp/out.log"}, 1),
+        # Git Bash's ``/usr`` lies under its install directory.
+        ("git_bash", "file_system.bash", {"command": "echo x > /usr/x"}, 1),
+        # The process moves the directory Git Bash mounts at ``/tmp``.
+        (
+            "git_bash",
+            "process.start",
+            {"command": "echo x > /tmp/out.log", "env": {"TEMP": "C:\\keys"}},
+            1,
+        ),
+        (
+            "git_bash",
+            "process.start",
+            {"command": "echo x > /tmp/out.log", "env": {"TMPDIR": "C:\\keys"}},
+            1,
+        ),
+        # A POSIX shell reads ``C:\x`` as the relative ``C:x``.
+        ("unix", "file_system.bash", {"command": "echo x > C:\\x"}, 0),
+    ],
+)
+async def test_a_command_is_read_by_the_shell_the_session_runs(
+    tmp_path: Path,
+    environment: CommandEnvironment,
+    builtin: str,
+    arguments: dict[str, Any],
+    unplaced: int,
+) -> None:
+    """*Prepare*: A resolver for a session in one command environment.
+    *Do*: Resolve a shell call whose redirect target that shell opens from a
+    root it does not fix, or, for the POSIX shell, does not open from a root.
+    *Assert*: The target is unplaced where that shell's reading leaves its
+    file open, and not listed where that shell reads it as relative.
+    """
+    # Prepare
+    resolver = _shell_resolver(tmp_path, environment)
+
+    # Do
+    outcome = await resolver.resolve(builtin, arguments)
+
+    # Assert
+    assert outcome.decision == "ask"
+    assert outcome.shell_write_paths == ()
+    assert len(outcome.unplaced_shell_writes) == unplaced
+
+
+@pytest.mark.parametrize(
+    ("target", "temp_moved", "expected"),
+    [
+        ("/c/Users/me/x.ps1", False, "C:/Users/me/x.ps1"),
+        ("/d", False, "D:/"),
+        ("/tmp/out.log", False, f"{tempfile.gettempdir()}/out.log"),
+        ("/tmp/out.log", True, None),
+        ("C:/Users/me/x.ps1", False, "C:/Users/me/x.ps1"),
+        ("C:\\Users\\me\\x.ps1", False, "C:\\Users\\me\\x.ps1"),
+        ("/usr/bin/x", False, None),
+        ("/cd/x", False, None),
+        ("//server/share/x", False, None),
+        ("/c/work/../Users/me/x", False, None),
+        ("C:x", False, None),
+    ],
+)
+def test_git_bash_fixes_only_its_drive_and_temp_mounts(
+    target: str, temp_moved: bool, expected: str | None
+) -> None:
+    """Git Bash mounts each drive at ``/<letter>`` and its ``/tmp`` at the
+    temporary directory unless the process moves it. Any other POSIX path lies
+    under a mount Vibe does not read, and ``..`` may cross one.
+    """
+    assert git_bash_windows_path(target, temp_moved=temp_moved) == expected
+
+
+@pytest.mark.parametrize(
+    ("target", "expected"),
+    [
+        ("C:\\Users\\me\\x.ps1", "C:\\Users\\me\\x.ps1"),
+        ("C:/Users/me/x.ps1", "C:/Users/me/x.ps1"),
+        ("\\\\server\\share\\x.txt", "\\\\server\\share\\x.txt"),
+        ("\\Users\\me\\x.ps1", None),
+        ("/Users/me/x.ps1", None),
+        ("C:x.ps1", None),
+        ("\\\\?\\C:\\x", None),
+        ("\\\\.\\pipe\\x", None),
+    ],
+)
+def test_powershell_fixes_only_drive_and_share_rooted_paths(
+    target: str, expected: str | None
+) -> None:
+    """``\\x`` and ``/x`` land on the drive current when the command runs, ``C:x``
+    under that drive's current directory, and a device path skips the
+    normalisation every other path goes through.
+    """
+    assert windows_drive_path(target) == expected
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="needs this host's drives")
+@pytest.mark.parametrize(
+    ("environment", "command"),
+    [
+        ("powershell", "echo x > C:\\Users\\me\\x.ps1"),
+        ("git_bash", "echo x > /c/Users/me/x.ps1"),
+        ("git_bash", "echo x > 'C:\\Users\\me\\x.ps1'"),
+    ],
+)
+def test_a_windows_shell_places_a_drive_rooted_write(
+    environment: CommandEnvironment, command: str
+) -> None:
+    """Each Windows shell's spelling of the same drive path names one file."""
+    writes = shell_writes(command, environment=environment)
+
+    assert writes == ShellWrites(paths=(Path("C:/Users/me/x.ps1").resolve(),))
+
+
+def test_sandbox_write_paths_are_normalised_without_this_hosts_links() -> None:
+    """*Prepare*: A command writing an absolute path with ``..`` in a sandbox.
+    *Do*: Read where it writes in the sandbox's path space.
+    *Assert*: Collapsed lexically: the path names a file in the sandbox, which
+    this host's file system does not hold.
+    """
+    # Do
+    writes = shell_writes(
+        "echo x > /work/repo/../etc/x", environment="unix", path_space="sandbox"
+    )
+
+    # Assert
+    assert writes == ShellWrites(paths=(Path("/work/etc/x"),))
+
+
+def _workdir_resolver(
+    tmp_path: Path,
+    *,
+    workspace_roots: tuple[Path, ...] = (),
+    config: Mapping[str, Any] | None = None,
+    **tools: dict[str, Any],
+) -> tuple[UnifiedPermissionResolver, FakeConfigOrchestrator[Any]]:
+    """A resolver whose session sits in ``tmp_path/work``, so ``tmp_path`` is outside."""
+    work = tmp_path / "work"
+    work.mkdir(exist_ok=True)
+    orchestrator = FakeConfigOrchestrator(
+        build_test_vibe_config(tools=tools, **(config or {}))
+    )
+    store = PermissionStore()
+    manager = ToolManager(
+        lambda: orchestrator.config,
+        defer_mcp=True,
+        cwd=work,
+        harness_files=HarnessFilesManager().for_session(
+            work, workspace_roots=list(workspace_roots)
+        ),
+        permission_getter=store.get_tool_permission,
+    )
+    return UnifiedPermissionResolver(manager, store, orchestrator), orchestrator
+
+
+_DENY_OUTSIDE = {"outside_workdir": "deny"}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("builtin", "arguments"),
+    [
+        ("file_system.read_file", {"path": "{outside}/secret.txt"}),
+        ("file_system.write_file", {"path": "{outside}/secret.txt", "content": "x"}),
+        (
+            "file_system.edit",
+            {"file_path": "{outside}/secret.txt", "old_string": "a", "new_string": "b"},
+        ),
+    ],
+)
+async def test_outside_workdir_deny_refuses_a_file_tool_call_outside_the_workdir(
+    tmp_path: Path, builtin: str, arguments: dict[str, Any]
+) -> None:
+    resolver, _ = _workdir_resolver(tmp_path, config=_DENY_OUTSIDE)
+    call = {
+        key: value.format(outside=tmp_path) if isinstance(value, str) else value
+        for key, value in arguments.items()
+    }
+    supplied = call.get("path") or call["file_path"]
+
+    outcome = await resolver.resolve(builtin, call)
+
+    assert outcome.decision == "deny"
+    assert outcome.reason is not None
+    assert supplied in outcome.reason
+    assert "outside the working directory" in outcome.reason
+    assert 'outside_workdir = "deny"' in outcome.reason
+
+
+@pytest.mark.asyncio
+async def test_outside_workdir_deny_names_the_supplied_path_not_a_link_target(
+    tmp_path: Path,
+) -> None:
+    (tmp_path / "secret.txt").write_text("secret")
+    try:
+        (tmp_path / "work").mkdir()
+        (tmp_path / "work" / "lnk").symlink_to(tmp_path / "secret.txt")
+    except OSError:
+        pytest.skip("this host cannot create symlinks")
+    resolver, _ = _workdir_resolver(tmp_path, config=_DENY_OUTSIDE)
+
+    outcome = await resolver.resolve(
+        "file_system.read_file", {"path": str(tmp_path / "work" / "lnk")}
+    )
+
+    assert outcome.decision == "deny"
+    assert outcome.reason is not None
+    assert str(tmp_path / "work" / "lnk") in outcome.reason
+    assert str(tmp_path / "secret.txt") not in outcome.reason
+
+
+@pytest.mark.asyncio
+async def test_outside_workdir_deny_keeps_file_tool_calls_inside_the_workdir(
+    tmp_path: Path,
+) -> None:
+    resolver, _ = _workdir_resolver(tmp_path, config=_DENY_OUTSIDE)
+    work = tmp_path / "work"
+
+    read = await resolver.resolve(
+        "file_system.read_file", {"path": str(work / "notes.md")}
+    )
+    sensitive = await resolver.resolve(
+        "file_system.read_file", {"path": str(work / ".env")}
+    )
+
+    assert read.decision == "allow"
+    assert sensitive.decision == "ask"
+
+
+@pytest.mark.asyncio
+async def test_outside_workdir_deny_refuses_an_always_configured_edit_outside(
+    tmp_path: Path,
+) -> None:
+    resolver, _ = _workdir_resolver(
+        tmp_path,
+        config=_DENY_OUTSIDE,
+        write_file={"permission": "always"},
+        edit={"permission": "always"},
+    )
+    work = tmp_path / "work"
+
+    inside = await resolver.resolve(
+        "file_system.write_file", {"path": str(work / "a.txt"), "content": "x"}
+    )
+    outside = await resolver.resolve(
+        "file_system.write_file", {"path": str(tmp_path / "a.txt"), "content": "x"}
+    )
+
+    assert inside.decision == "allow"
+    assert outside.decision == "deny"
+
+
+@pytest.mark.asyncio
+async def test_outside_workdir_access_still_asks_by_default(tmp_path: Path) -> None:
+    resolver, _ = _workdir_resolver(tmp_path)
+
+    read = await resolver.resolve(
+        "file_system.read_file", {"path": str(tmp_path / "secret.txt")}
+    )
+    shell = await resolver.resolve("file_system.bash", {"command": "cat /etc/hosts"})
+
+    assert read.decision == "ask"
+    assert shell.decision == "ask"
+    assert PermissionScope.OUTSIDE_DIRECTORY.value in [
+        permission["scope"] for permission in shell.required_permissions
+    ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("managed_shell", [False, True], ids=["legacy", "managed"])
+@pytest.mark.parametrize(
+    ("command", "denied_path"),
+    [
+        ("cat /etc/hosts", "/etc/hosts"),
+        ("ls ../", "../"),
+        # Git Bash spells a Windows drive as ``/<letter>/``.
+        ("cat /c/Users/victim/secret.txt", "/c/Users/victim/secret.txt"),
+        ("npm test && cat /etc/hosts", "/etc/hosts"),
+    ],
+)
+async def test_outside_workdir_deny_refuses_a_shell_command_reaching_outside(
+    tmp_path: Path, command: str, denied_path: str, managed_shell: bool
+) -> None:
+    resolver, _ = _workdir_resolver(
+        tmp_path, config={**_DENY_OUTSIDE, "managed_shell_tools_enabled": managed_shell}
+    )
+
+    outcome = await resolver.resolve("file_system.bash", {"command": command})
+
+    assert outcome.decision == "deny"
+    assert outcome.reason is not None
+    assert f"Access denied: {denied_path} is outside" in outcome.reason
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("managed_shell", [False, True], ids=["legacy", "managed"])
+@pytest.mark.parametrize(
+    ("command", "link"), [("cat lnk", "lnk"), ("grep -r PRIVATE lnkdir", "lnkdir")]
+)
+async def test_outside_workdir_deny_refuses_a_bare_name_linking_outside(
+    tmp_path: Path, command: str, link: str, managed_shell: bool
+) -> None:
+    secrets = tmp_path / "creds"
+    secrets.mkdir()
+    (secrets / "key.pem").write_text("PRIVATE")
+    (tmp_path / "secret.txt").write_text("secret")
+    work = tmp_path / "work"
+    work.mkdir()
+    try:
+        (work / "lnk").symlink_to(tmp_path / "secret.txt")
+        (work / "lnkdir").symlink_to(secrets, target_is_directory=True)
+    except OSError:
+        pytest.skip("this host cannot create symlinks")
+    resolver, _ = _workdir_resolver(
+        tmp_path, config={**_DENY_OUTSIDE, "managed_shell_tools_enabled": managed_shell}
+    )
+
+    outcome = await resolver.resolve("file_system.bash", {"command": command})
+
+    assert outcome.decision == "deny"
+    assert outcome.reason is not None
+    assert f"Access denied: {link} is outside" in outcome.reason
+    assert str(tmp_path.resolve()) not in outcome.reason
+
+
+@pytest.mark.asyncio
+async def test_outside_workdir_deny_still_asks_for_a_command_inside_the_workdir(
+    tmp_path: Path,
+) -> None:
+    resolver, _ = _workdir_resolver(tmp_path, config=_DENY_OUTSIDE)
+
+    outcome = await resolver.resolve("file_system.bash", {"command": "npm test"})
+
+    assert outcome.decision == "ask"
+    assert [
+        permission["sessionPattern"] for permission in outcome.required_permissions
+    ] == ["npm test *"]
+
+
+@pytest.mark.asyncio
+async def test_a_per_tool_outside_workdir_overrides_the_global_policy(
+    tmp_path: Path,
+) -> None:
+    denies_bash_only, _ = _workdir_resolver(tmp_path, bash=_DENY_OUTSIDE)
+    asks_for_reads_only, _ = _workdir_resolver(
+        tmp_path, config=_DENY_OUTSIDE, read_file={"outside_workdir": "ask"}
+    )
+    outside_read = {"path": str(tmp_path / "secret.txt")}
+    outside_command = {"command": "cat /etc/hosts"}
+
+    assert (
+        await denies_bash_only.resolve("file_system.bash", outside_command)
+    ).decision == "deny"
+    assert (
+        await denies_bash_only.resolve("file_system.read_file", outside_read)
+    ).decision == "ask"
+    assert (
+        await asks_for_reads_only.resolve("file_system.read_file", outside_read)
+    ).decision == "ask"
+    assert (
+        await asks_for_reads_only.resolve("file_system.bash", outside_command)
+    ).decision == "deny"
+
+
+@pytest.mark.asyncio
+async def test_outside_workdir_deny_honours_allowlisted_outside_paths(
+    tmp_path: Path,
+) -> None:
+    shared = tmp_path / "shared"
+    shared.mkdir()
+    grant = f"vibe-path:directory_recursive:{shared.resolve()}"
+    resolver, _ = _workdir_resolver(
+        tmp_path,
+        config=_DENY_OUTSIDE,
+        read_file={"allowlist": [grant]},
+        bash={"allowlist": ["cat", grant]},
+    )
+
+    read = await resolver.resolve(
+        "file_system.read_file", {"path": str(shared / "nested" / "a.txt")}
+    )
+    shell = await resolver.resolve(
+        "file_system.bash", {"command": f"cat {shared / 'a.txt'}"}
+    )
+
+    assert read.decision == "allow"
+    assert shell.decision == "allow"
+
+
+@pytest.mark.asyncio
+async def test_outside_workdir_deny_honours_an_allowlisted_path_spelled_through_a_symlink(
+    tmp_path: Path,
+) -> None:
+    shared = tmp_path / "shared"
+    (shared / "sub").mkdir(parents=True)
+    link = tmp_path / "link"
+    try:
+        link.symlink_to(shared, target_is_directory=True)
+    except OSError:
+        pytest.skip("this host cannot create symlinks")
+    grant = f"vibe-path:directory_recursive:{link / 'sub'}"
+    resolver, _ = _workdir_resolver(
+        tmp_path,
+        config=_DENY_OUTSIDE,
+        read_file={"allowlist": [grant]},
+        bash={"allowlist": ["cat", grant]},
+    )
+
+    read = await resolver.resolve(
+        "file_system.read_file", {"path": str(link / "sub" / "a.txt")}
+    )
+    shell = await resolver.resolve(
+        "file_system.bash", {"command": f"cat {link / 'sub' / 'a.txt'}"}
+    )
+
+    assert read.decision == "allow"
+    assert shell.decision == "allow"
+
+
+@pytest.mark.asyncio
+async def test_outside_workdir_deny_treats_added_directories_as_inside(
+    tmp_path: Path,
+) -> None:
+    added = tmp_path / "added"
+    added.mkdir()
+    resolver, _ = _workdir_resolver(
+        tmp_path, workspace_roots=(added,), config=_DENY_OUTSIDE
+    )
+
+    read = await resolver.resolve(
+        "file_system.read_file", {"path": str(added / "a.txt")}
+    )
+    shell = await resolver.resolve(
+        "file_system.bash", {"command": f"cat {added / 'a.txt'}"}
+    )
+
+    assert read.decision == "allow"
+    assert shell.decision == "allow"
+
+
+@pytest.mark.asyncio
+async def test_outside_workdir_deny_outranks_an_earlier_session_grant(
+    tmp_path: Path,
+) -> None:
+    resolver, orchestrator = _workdir_resolver(tmp_path)
+    call = {"path": str(tmp_path / "secret.txt")}
+    asked = await resolver.resolve("file_system.read_file", call)
+    await resolver.grant("file_system.read_file", _granted(asked), permanent=False)
+    assert (await resolver.resolve("file_system.read_file", call)).decision == "allow"
+
+    await orchestrator.set_field("/outside_workdir", "deny")
+
+    assert (await resolver.resolve("file_system.read_file", call)).decision == "deny"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("managed_shell", [False, True], ids=["legacy", "managed"])
+@pytest.mark.parametrize("policy", ["ask", "deny"])
+async def test_an_always_shell_still_answers_for_paths_outside_the_workdir(
+    tmp_path: Path, policy: str, managed_shell: bool
+) -> None:
+    resolver, _ = _workdir_resolver(
+        tmp_path,
+        config={
+            "outside_workdir": policy,
+            "managed_shell_tools_enabled": managed_shell,
+        },
+        bash={"permission": "always"},
+    )
+
+    outside = await resolver.resolve("file_system.bash", {"command": "cat /etc/hosts"})
+    inside = await resolver.resolve("file_system.bash", {"command": "cat notes.md"})
+
+    assert outside.decision == policy
+    assert inside.decision == "allow"
+
+
+@pytest.mark.asyncio
+async def test_outside_workdir_deny_refuses_a_background_start_run_from_outside(
+    tmp_path: Path,
+) -> None:
+    added = tmp_path / "added"
+    added.mkdir()
+    resolver, _ = _workdir_resolver(
+        tmp_path, workspace_roots=(added,), config=_DENY_OUTSIDE
+    )
+
+    outside = await resolver.resolve(
+        "process.start", {"command": "cat secret.txt", "cwd": str(tmp_path)}
+    )
+    in_added_dir = await resolver.resolve(
+        "process.start", {"command": "cat a.txt", "cwd": str(added)}
+    )
+
+    assert outside.decision == "deny"
+    assert outside.reason is not None
+    assert str(tmp_path.resolve()) in outside.reason
+    assert in_added_dir.decision == "ask"
+
+
+@pytest.mark.asyncio
+async def test_a_background_start_run_from_outside_still_asks_by_default(
+    tmp_path: Path,
+) -> None:
+    resolver, _ = _workdir_resolver(tmp_path)
+
+    outcome = await resolver.resolve(
+        "process.start", {"command": "cat secret.txt", "cwd": str(tmp_path)}
+    )
+
+    assert outcome.decision == "ask"
+    assert outcome.required_permissions == ()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("managed_shell", [False, True], ids=["legacy", "managed"])
+async def test_an_always_shell_asks_only_for_the_outside_path_and_remembers_it(
+    tmp_path: Path, managed_shell: bool
+) -> None:
+    resolver, _ = _workdir_resolver(
+        tmp_path,
+        config={"managed_shell_tools_enabled": managed_shell},
+        bash={"permission": "always"},
+    )
+    call = {"command": f"cp {tmp_path / 'data.txt'} copy.txt"}
+
+    asked = await resolver.resolve("file_system.bash", call)
+    await resolver.grant("file_system.bash", _granted(asked), permanent=False)
+    again = await resolver.resolve("file_system.bash", call)
+
+    assert asked.decision == "ask"
+    assert [permission["scope"] for permission in asked.required_permissions] == [
+        PermissionScope.OUTSIDE_DIRECTORY.value
+    ]
+    assert again.decision == "allow"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("managed_shell", [False, True], ids=["legacy", "managed"])
+@pytest.mark.parametrize(
+    "command", ["diff notes.md /dev/null", "cp /dev/null empty.txt", "cat /dev/stdin"]
+)
+async def test_outside_workdir_deny_lets_the_null_device_and_streams_through(
+    tmp_path: Path, command: str, managed_shell: bool
+) -> None:
+    resolver, _ = _workdir_resolver(
+        tmp_path, config={**_DENY_OUTSIDE, "managed_shell_tools_enabled": managed_shell}
+    )
+
+    outcome = await resolver.resolve("file_system.bash", {"command": command})
+
+    assert outcome.decision != "deny"
+
+
+def test_a_session_that_moved_into_untrusted_worktrees_reads_no_config_from_them(
+    tmp_path: Path,
+) -> None:
+    """*Prepare*: A session whose tools moved into one worktree after another,
+        neither trusted, each with project hooks and skills.
+    *Do*: Read the tools' project roots and write boundary.
+    *Assert*: Both worktrees are writable, but neither is a root project
+    config is read from.
+    """
+    # Prepare
+    checkout, first, second = (tmp_path / name for name in ("c", "w1", "w2"))
+    for directory in (checkout, first, second):
+        (directory / ".vibe").mkdir(parents=True)
+        (directory / ".vibe" / "hooks.toml").write_text("", encoding="utf-8")
+    orchestrator = FakeConfigOrchestrator(build_test_vibe_config())
+    store = PermissionStore()
+    manager = ToolManager(
+        lambda: orchestrator.config,
+        defer_mcp=True,
+        cwd=checkout,
+        harness_files=HarnessFilesManager(sources=("user", "project")).for_session(
+            checkout
+        ),
+        permission_getter=store.get_tool_permission,
+    )
+
+    # Do
+    manager.move_to(second, [first, second])
+    tool = manager.get("write_file")
+
+    # Assert
+    assert first.resolve() not in tool.harness_files.project_roots
+    assert second.resolve() not in tool.harness_files.project_roots
+    assert tool.workspace.allows((first / "a.md").resolve())
+    assert tool.workspace.allows((second / "a.md").resolve())

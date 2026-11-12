@@ -1,17 +1,23 @@
-//! `/thinking` picker state. Mirrors Python's `ThinkingPickerApp`: a bottom-panel
-//! option list over the model's thinking levels, `›` on the current one, Enter
+//! `/thinking` picker state: a bottom-panel option list over the model's
+//! thinking levels, `›` on the current one, Enter
 //! saves and `s` keeps the level for the session. A chained `/model` pick is
-//! written with the level in one `config/write`, then one `config/reload`.
+//! written with the level in one write.
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use serde_json::Value;
+use serde_json::{json, Value};
 
-use crate::app::{App, ThinkingPicker};
+use crate::app::{App, Severity, ThinkingPicker};
 use crate::config_write::{self, Scope};
-use crate::server::{method, Client};
+use crate::model_selection;
+use crate::server::Client;
 
-/// The canonical five, used until the server sends the model's own set.
+/// Shown when a running turn parks a saved pick until it ends.
+pub const PARKED_MESSAGE: &str = "Saved; it applies when the current turn ends.";
+
+/// The server's default set, used until it sends the model's own: a server
+/// offers whatever levels the model's config lists, as written.
 pub const THINKING_LEVELS: [&str; 5] = ["off", "low", "medium", "high", "max"];
 
 /// A `/model` pick waiting on its thinking level.
@@ -28,47 +34,42 @@ impl Default for ThinkingPicker {
     fn default() -> Self {
         Self {
             open: false,
-            selected: 0,
-            scroll: 0,
+            list: Default::default(),
             current_level: String::new(),
             // Skew-safe default until the server sends the model's set.
             levels: THINKING_LEVELS.iter().map(|it| it.to_string()).collect(),
             model_pick: None,
-            tx: None,
         }
     }
 }
 
 /// A committed selection's server answer, applied on the main thread.
 pub enum Event {
-    /// Runtime returned by the follow-up `config/reload`.
-    Reloaded(Value),
-    /// The write or reload was rejected or failed; show why (Python
-    /// `_run_settings_update`).
+    /// The session runs the pick: the write's runtime, and the status to show.
+    Applied(Value, String),
+    /// A running turn parked the pick; `runtime/updated` announces it once it lands.
+    Parked,
+    /// The write was rejected or failed; show why.
     Failed(String),
 }
 
 /// Apply the server's answer and release the commit that was in flight.
 pub fn apply_event(app: &mut App, event: Event) {
+    let id = crate::commands::submission::new_message_id();
     match event {
-        Event::Reloaded(runtime) => {
+        Event::Applied(runtime, status) => {
             crate::event_handler::apply_runtime_value(app, &runtime);
-            crate::transcript::local::add_status(
-                &mut app.view.transcript,
-                &crate::commands::submission::new_message_id(),
-                crate::commands::event::RELOADED_MESSAGE,
-            );
+            crate::transcript::local::add_status(&mut app.view.transcript, &id, &status);
+        }
+        Event::Parked => {
+            show_active_model(app);
+            crate::transcript::local::add_status(&mut app.view.transcript, &id, PARKED_MESSAGE);
         }
         Event::Failed(error) => {
             show_active_model(app);
-            crate::transcript::local::add_command_error(
-                &mut app.view.transcript,
-                &crate::commands::submission::new_message_id(),
-                &error,
-            );
+            crate::notices::inline(app, Severity::Error, &error);
         }
     }
-    app.commit_finished();
 }
 
 /// Open the picker highlighted on the current thinking level.
@@ -77,6 +78,7 @@ pub fn open(app: &mut App) {
         show_active_model(app);
     }
     show(app);
+    crate::model_selection::opened(app, crate::model_selection::Picker::ReasoningEffort);
 }
 
 /// Open on a `/model` pick's own levels before anything is written.
@@ -92,8 +94,7 @@ fn show(app: &mut App) {
         &app.thinking_picker.levels,
         &app.thinking_picker.current_level,
     );
-    app.thinking_picker.selected = selected;
-    app.thinking_picker.scroll = 0;
+    app.thinking_picker.list = crate::option_list::OptionList::new(selected);
     app.thinking_picker.open = true;
 }
 
@@ -107,8 +108,8 @@ pub fn enter_scope(app: &App) -> Scope {
 
 /// Move the highlight up/down by one, wrapping at the ends.
 pub fn navigate(app: &mut App, down: bool) {
-    let picker = &mut app.thinking_picker;
-    picker.selected = crate::list_nav::wrap(picker.selected, picker.levels.len(), down);
+    let len = app.thinking_picker.levels.len();
+    app.thinking_picker.list.step(down, len, true, |_| true);
 }
 
 /// Esc: nothing is written, a chained `/model` pick included.
@@ -139,46 +140,73 @@ pub fn select(app: &mut App, client: &Arc<Client>, scope: Scope) {
         None => app.model_picker.current_model.clone(),
     };
     let mut ops = pick.as_ref().map(model_ops).unwrap_or_default();
+    let mut saved = json!({});
+    if let Some(pick) = &pick {
+        saved["modelAlias"] = json!(pick.alias);
+    }
     if !target.is_empty() {
         let path = format!("/models/{}/thinking", escape_json_pointer(&target));
         ops.extend(config_write::pick_ops(&path, &level, scope));
+        saved["reasoningEffort"] = json!(level);
     }
-    let (reason, prefix) = match &pick {
+    let all_saved = scope == Scope::Saved && pick.as_ref().is_none_or(|p| p.scope == Scope::Saved);
+    let selections =
+        model_selection::picks(app, pick.as_ref().map(|p| p.alias.as_str()), Some(&level));
+    let (reason, what) = match &pick {
         Some(pick) => (
             "app-server config update",
-            format!("Failed to apply: model {}, thinking {level} — ", pick.alias),
+            format!("model {}, thinking {level}", model_label(pick)),
         ),
-        None => (
-            "app-server thinking update",
-            format!("Failed to apply: thinking {level} — "),
-        ),
+        None => ("app-server thinking update", format!("thinking {level}")),
     };
-    commit(app, client, ops, reason, prefix);
+    commit(
+        app,
+        client,
+        ops,
+        all_saved.then_some(saved),
+        reason,
+        what,
+        selections,
+    );
 }
 
 /// Commit a `/model` pick without a thinking level (its model is unresolved).
 pub fn commit_model(app: &mut App, client: &Arc<Client>, pick: &ModelPick) {
-    let prefix = format!("Failed to apply: model {} — ", pick.alias);
+    let what = format!("model {}", model_label(pick));
+    let saved = (pick.scope == Scope::Saved).then(|| json!({"modelAlias": pick.alias}));
+    let selections = model_selection::picks(app, Some(&pick.alias), None);
     commit(
         app,
         client,
         model_ops(pick),
+        saved,
         "app-server config update",
-        prefix,
+        what,
+        selections,
     );
+}
+
+fn model_label(pick: &ModelPick) -> &str {
+    match pick.alias.as_str() {
+        crate::model_picker::UNPINNED_ACTIVE_MODEL => "Default",
+        alias => alias,
+    }
 }
 
 fn model_ops(pick: &ModelPick) -> Vec<Value> {
     config_write::pick_ops("/active_model", &pick.alias, pick.scope)
 }
 
-/// Write `ops`, then `config/reload` (Python `_reload_config`); one event reaches the UI.
+/// Write the pick, which applies it: no idle-only `config/reload` follows for a new turn to refuse.
+/// A saved pick goes through `config/model/write`, which a running turn parks; a session-only one through `config/write`.
 fn commit(
     app: &mut App,
     client: &Arc<Client>,
     ops: Vec<Value>,
+    saved: Option<Value>,
     reason: &'static str,
-    failure_prefix: String,
+    what: String,
+    selections: Vec<BTreeMap<String, Value>>,
 ) {
     if ops.is_empty() {
         return;
@@ -187,37 +215,26 @@ fn commit(
         return;
     };
     let client = client.clone();
-    let thinking_tx = app.thinking_picker.tx.clone();
-    let pending = app.commit_started();
-    tokio::spawn(async move {
-        let written = config_write::write(&client, &session_id, ops, reason).await;
-        // Only a clean write is worth reloading; `_run_settings_update` mounts the error.
-        let event = match written {
-            Err(error) => failed(&failure_prefix, &error),
-            Ok(_) => {
-                let reload = serde_json::json!({
-                    "sessionId": session_id,
-                    "reloadRuntime": true,
-                });
-                match client.request(method::CONFIG_RELOAD, reload).await {
-                    Ok(runtime) => Event::Reloaded(runtime),
-                    // Python's `_run_settings_update` wraps write + reload
-                    // in one try/except: a reload failure mounts the same
-                    // "Failed to apply" error as a write rejection.
-                    Err(error) => failed(&failure_prefix, &error.to_string()),
-                }
+    let telemetry = app.telemetry_tx.clone();
+    crate::ui_event::spawn(app, async move {
+        let written =
+            crate::model_enforcement::write(&client, &session_id, saved, ops, reason).await;
+        // Recorded once the session takes the write, a parked one included.
+        if written.is_ok() {
+            for properties in selections {
+                let name = crate::telemetry::event::MODEL_SELECTION_SELECTED;
+                crate::telemetry::enqueue(telemetry.as_ref(), name, properties);
             }
-        };
-        crate::input::deliver(thinking_tx, event, &pending).await;
+        }
+        match written {
+            Err(error) => Event::Failed(format!("Failed to apply: {what} — {error}")),
+            Ok(written) if config_write::is_parked(&written) => Event::Parked,
+            Ok(written) => Event::Applied(written, format!("Applied: {what}.")),
+        }
     });
 }
 
-/// Python `_run_settings_update`: a failed update mounts an `ErrorMessage`.
-fn failed(prefix: &str, error: &str) -> Event {
-    Event::Failed(format!("{prefix}{error}"))
-}
-
-/// Escape a JSON pointer token (Python `_escape_json_pointer_token`).
+/// Escape a JSON pointer token.
 fn escape_json_pointer(value: &str) -> String {
     value.replace('~', "~0").replace('/', "~1")
 }
@@ -229,7 +246,7 @@ pub fn is_current(app: &App, i: usize) -> bool {
 
 /// The level to persist for the highlighted row.
 pub fn selected_level(app: &App) -> &str {
-    &app.thinking_picker.levels[app.thinking_picker.selected]
+    &app.thinking_picker.levels[app.thinking_picker.list.selected()]
 }
 
 /// Refresh the picker from a `runtime/read`/`runtime/updated` value (shape
@@ -239,33 +256,24 @@ pub fn apply_runtime(app: &mut App, response: &Value) {
     if app.thinking_picker.model_pick.is_some() {
         return;
     }
-    if let Some(level) = response
-        .pointer("/runtime/config/activeModel/thinking")
-        .and_then(Value::as_str)
-    {
-        app.thinking_picker.current_level = level.to_owned();
+    let Some(model) = crate::server::RuntimeSnapshot::config(response).and_then(|c| c.active_model)
+    else {
+        return;
+    };
+    if let Some(level) = model.thinking {
+        app.thinking_picker.current_level = level;
     }
-    let levels = response
-        .pointer("/runtime/config/activeModel/thinkingLevels")
-        .and_then(Value::as_array)
-        .map(|items| {
-            items
-                .iter()
-                .filter_map(Value::as_str)
-                .map(str::to_owned)
-                .collect::<Vec<_>>()
-        });
+    let levels = model.thinking_levels;
     // An absent or empty array keeps the previous set (defensive only: the
     // server normalizes [] before it reaches the wire). Only a genuinely new
     // set re-anchors the highlight — runtime pushes arrive for unrelated
     // config changes too, and must not move the user's selection — and keeps
     // `selected` indexing into `levels`.
-    if let Some(levels) = levels.filter(|it: &Vec<String>| !it.is_empty()) {
-        if levels != app.thinking_picker.levels {
-            let current = app.thinking_picker.current_level.clone();
-            app.thinking_picker.selected = index_of(&levels, &current);
-            app.thinking_picker.levels = levels;
-        }
+    if !levels.is_empty() && levels != app.thinking_picker.levels {
+        let current = &app.thinking_picker.current_level;
+        let index = index_of(&levels, current);
+        app.thinking_picker.list.highlight(index);
+        app.thinking_picker.levels = levels;
     }
 }
 

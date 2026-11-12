@@ -1,6 +1,5 @@
-//! `/mcp` subcommands (Python `mcp_commands.py` and `VibeApp._mcp_*`).
+//! `/mcp` subcommands.
 
-use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 
 use crate::server::method;
@@ -33,35 +32,37 @@ fn status(app: &mut App, client: &Arc<Client>, args: &str) {
         reply(app, CommandEvent::Error("Usage: /mcp status".to_owned()));
         return;
     }
-    let Some((session_id, tx, pending)) = dispatch(app) else {
+    let Some((session_id, tx)) = dispatch(app) else {
         return;
     };
     let client = client.clone();
-    tokio::spawn(async move {
+    crate::work::spawn(async move {
         let event = match client
-            .request(method::MCP_READ, json!({"sessionId": session_id}))
+            .request_err(method::MCP_READ, json!({"sessionId": session_id}))
             .await
         {
-            Ok(value) => CommandEvent::Result(status_text(&value)),
-            Err(error) => CommandEvent::Error(format!("Failed to read MCP servers: {error}")),
+            Ok(value) => status_event(&value),
+            Err(error) => {
+                CommandEvent::Error(format!("Failed to read MCP servers: {}", error.message))
+            }
         };
-        send(&tx, &pending, event, false);
+        let _ = tx.try_send(event);
     });
 }
 
-fn status_text(value: &Value) -> String {
+fn status_event(value: &Value) -> CommandEvent {
     let state = super::state_at(value, "/mcp").unwrap_or_default();
     let statuses = state.statuses();
     if statuses.is_empty() {
-        return "No MCP servers configured.".to_owned();
+        return CommandEvent::Status("No MCP servers configured.".to_owned());
     }
-    let mut lines = vec!["### MCP auth status".to_owned(), String::new()];
+    let mut lines = vec!["## MCP auth status".to_owned(), String::new()];
     lines.extend(
         statuses
             .into_iter()
             .map(|(alias, status)| format!("- `{alias}`: `{status}`")),
     );
-    lines.join("\n")
+    CommandEvent::Result(lines.join("\n"))
 }
 
 fn login(app: &mut App, client: &Arc<Client>, alias: &str) {
@@ -72,32 +73,27 @@ fn login(app: &mut App, client: &Arc<Client>, alias: &str) {
         );
         return;
     }
-    let Some((session_id, tx, pending)) = dispatch(app) else {
+    let Some((session_id, tx)) = dispatch(app) else {
         return;
     };
     let alias = alias.to_owned();
     let client = client.clone();
-    tokio::spawn(async move {
-        send(
-            &tx,
-            &pending,
-            login_event(&client, &session_id, &alias).await,
-            false,
-        );
+    crate::work::spawn(async move {
+        let _ = tx.try_send(login_event(&client, &session_id, &alias).await);
     });
 }
 
 /// The `mcp/login` round-trip; the auth URL arrives as an `mcp/authUrl` notification.
 async fn login_event(client: &Arc<Client>, session_id: &str, alias: &str) -> CommandEvent {
     match client
-        .request(
+        .request_err(
             method::MCP_LOGIN,
             json!({"sessionId": session_id, "name": alias}),
         )
         .await
     {
-        Ok(_) => CommandEvent::Result(format!("MCP server `{alias}` authenticated.")),
-        Err(error) => CommandEvent::Error(error.to_string()),
+        Ok(_) => CommandEvent::Status(format!("MCP server `{alias}` authenticated.")),
+        Err(error) => CommandEvent::Error(error.message),
     }
 }
 
@@ -109,23 +105,23 @@ fn logout(app: &mut App, client: &Arc<Client>, alias: &str) {
         );
         return;
     }
-    let Some((session_id, tx, pending)) = dispatch(app) else {
+    let Some((session_id, tx)) = dispatch(app) else {
         return;
     };
     let alias = alias.to_owned();
     let client = client.clone();
-    tokio::spawn(async move {
+    crate::work::spawn(async move {
         let event = match client
-            .request(
+            .request_err(
                 method::MCP_LOGOUT,
                 json!({"sessionId": session_id, "name": alias}),
             )
             .await
         {
-            Ok(_) => CommandEvent::Result(format!("MCP server `{alias}` logged out.")),
-            Err(error) => CommandEvent::Error(error.to_string()),
+            Ok(_) => CommandEvent::Status(format!("MCP server `{alias}` logged out.")),
+            Err(error) => CommandEvent::Error(error.message),
         };
-        send(&tx, &pending, event, false);
+        let _ = tx.try_send(event);
     });
 }
 
@@ -141,13 +137,13 @@ fn add(app: &mut App, client: &Arc<Client>, raw_args: &str) {
             return;
         }
     };
-    let Some((session_id, tx, pending)) = dispatch(app) else {
+    let Some((session_id, tx)) = dispatch(app) else {
         return;
     };
     let client = client.clone();
-    tokio::spawn(async move {
+    crate::work::spawn(async move {
         let result = client
-            .request(
+            .request_err(
                 method::MCP_ADD,
                 json!({
                     "sessionId": session_id,
@@ -162,7 +158,7 @@ fn add(app: &mut App, client: &Arc<Client>, raw_args: &str) {
         let added = match result {
             Ok(value) => value,
             Err(error) => {
-                send(&tx, &pending, CommandEvent::Error(error.to_string()), false);
+                let _ = tx.try_send(CommandEvent::Error(error.message));
                 return;
             }
         };
@@ -182,25 +178,19 @@ fn add(app: &mut App, client: &Arc<Client>, raw_args: &str) {
         } else {
             format!("Run `/mcp login {name}` to authenticate, or `/mcp status` to inspect it.")
         };
-        send(
-            &tx,
-            &pending,
-            CommandEvent::Result(format!("{head}\n{tail}")),
-            args.login,
-        );
+        let _ = tx.try_send(CommandEvent::Status(format!("{head}\n{tail}")));
         if args.login {
             let event = login_event(&client, &session_id, &name).await;
-            send(&tx, &pending, event, false);
+            let _ = tx.try_send(event);
         }
     });
 }
 
-/// Claim a slot for one background subcommand; the app stays busy until it lands.
-fn dispatch(app: &mut App) -> Option<(String, Sender<CommandEvent>, Arc<AtomicU32>)> {
+/// The session and command channel one background subcommand answers on.
+fn dispatch(app: &mut App) -> Option<(String, Sender<CommandEvent>)> {
     let session_id = app.session.session_id.clone()?;
     let tx = app.command_tx.clone()?;
-    let pending = app.commit_started();
-    Some((session_id, tx, pending))
+    Some((session_id, tx))
 }
 
 /// Answer a subcommand locally, without a server round-trip.
@@ -208,14 +198,5 @@ fn reply(app: &mut App, event: CommandEvent) {
     let Some(tx) = app.command_tx.clone() else {
         return;
     };
-    app.commit_started();
-    let _ = tx.try_send(event);
-}
-
-/// Send one command event; `extra` claims another slot for a follow-up message.
-fn send(tx: &Sender<CommandEvent>, pending: &Arc<AtomicU32>, event: CommandEvent, extra: bool) {
-    if extra {
-        pending.fetch_add(1, Ordering::Relaxed);
-    }
     let _ = tx.try_send(event);
 }

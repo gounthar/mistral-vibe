@@ -1,4 +1,4 @@
-//! Prompt input history recalled with Up/Down (Python `HistoryManager`).
+//! Prompt input history recalled with Up/Down.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -7,12 +7,12 @@ use crate::utils::history_persist::{self, Persister, MAX_ENTRIES};
 use crate::utils::paths;
 
 pub struct HistoryManager {
-    /// Off-thread read-merge-write persistence (Python `_pending_entries`).
+    /// Off-thread read-merge-write persistence.
     persister: Arc<Persister>,
     entries: Vec<String>,
     /// Navigation cursor into `entries`; `-1` means "not navigating".
     index: isize,
-    /// The live input stashed when navigation starts (Python `_temp_input`).
+    /// The live input stashed when navigation starts.
     temp_input: String,
 }
 
@@ -107,8 +107,8 @@ impl HistoryManager {
     /// Flush pending entries via a background read-merge-write; never blocks the UI thread.
     pub fn persist(&self) {
         let persister = self.persister.clone();
-        tokio::spawn(async move {
-            let _ = tokio::task::spawn_blocking(move || persister.flush()).await;
+        crate::work::spawn(async move {
+            let _ = crate::work::spawn_blocking(move || persister.flush()).await;
         });
     }
 

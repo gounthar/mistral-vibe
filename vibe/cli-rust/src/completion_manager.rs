@@ -1,10 +1,9 @@
 //! Shared slash-command, file-path, and skill-mention completion state.
 
-use tokio::sync::watch;
-
 use crate::app::App;
 use crate::commands;
 use crate::input_modes::InputMode;
+use crate::skill::SkillOrigin;
 use crate::utils::fuzzy;
 
 const FILE_MATCH_LIMIT: usize = 100;
@@ -13,6 +12,8 @@ const FILE_MATCH_LIMIT: usize = 100;
 pub struct CompletionEntry {
     pub label: String,
     pub description: String,
+    /// Where a skill row comes from; `None` for built-in commands and files.
+    pub origin: Option<SkillOrigin>,
 }
 
 enum ActiveCompletion {
@@ -29,7 +30,7 @@ pub fn input_changed(app: &mut App) {
     refresh(app);
 }
 
-/// Close the popup after history recall (Python `_navigating_history`): a recalled slash/`@` entry must not reopen the menu, so the next Up/Down keeps recalling; it reopens on the next real edit.
+/// Close the popup after history recall: a recalled slash/`@` entry must not reopen the menu, so the next Up/Down keeps recalling; it reopens on the next real edit.
 pub fn reset_for_recall(app: &mut App) {
     app.completion.dismissed = true;
     app.completion.entries.clear();
@@ -50,8 +51,8 @@ pub fn refresh(app: &mut App) {
         Some(ActiveCompletion::Skill { start, end }) => skill_entries(app, start, end),
         None => Vec::new(),
     };
-    // Python keeps the highlighted item only across re-renders that leave the
-    // list identical (path_completion `_update_suggestions`); a caret move that
+    // The highlighted item survives only re-renders that leave the
+    // list identical; a caret move that
     // lands on another token rebuilds a different list and restarts at the top.
     if entries != app.completion.entries {
         app.completion.selected = 0;
@@ -61,12 +62,14 @@ pub fn refresh(app: &mut App) {
     app.completion.entries = entries;
 }
 
-/// Apply a file-index update not yet seen, so a frame never pairs a ready index with a stale `@` popup.
-pub fn sync_files(app: &mut App, files: &mut watch::Receiver<u64>) {
-    if files.has_changed().unwrap_or(false) {
-        files.borrow_and_update();
+/// Apply a file-index update not yet seen, so a frame never pairs a ready
+/// index with a stale `@` popup. Returns whether one landed.
+pub fn sync_files(app: &mut App) -> bool {
+    if app.completion.files.take_update() {
         refresh(app);
+        return true;
     }
+    false
 }
 
 pub fn is_open(app: &App) -> bool {
@@ -137,6 +140,13 @@ pub fn accept(app: &mut App) -> bool {
     true
 }
 
+/// Enter's accept: a typed built-in runs as typed, even one completion hides (`/pr` with its feature off).
+pub fn accept_on_enter(app: &mut App) -> bool {
+    let typed = matches!(active(app), Some(ActiveCompletion::Slash))
+        && commands::parse(&format!("/{}", app.chat_input.input)).is_some();
+    !typed && accept(app)
+}
+
 /// Tab accepts like `accept`, then leaves a space after a slash command so its arguments (and hint) follow.
 pub fn tab(app: &mut App) {
     let slash = matches!(active(app), Some(ActiveCompletion::Slash));
@@ -186,7 +196,10 @@ fn active(app: &App) -> Option<ActiveCompletion> {
     if query.contains(' ') {
         return None;
     }
-    Some(ActiveCompletion::File { start, end: caret })
+    app.session
+        .startup_config
+        .enable_file_autocomplete
+        .then_some(ActiveCompletion::File { start, end: caret })
 }
 
 /// Start of a `/skill` token ending at the caret: the whitespace-delimited
@@ -207,8 +220,7 @@ fn skill_mention_start(app: &App) -> Option<usize> {
     (mentionable && !command_word && mention).then_some(start)
 }
 
-/// `/help` and `/config` outrank equal matches (Python `_PROMOTED_BOOSTS`,
-/// scaled like `fuzzy::score`, which is 20x the Python score).
+/// `/help` and `/config` outrank equal matches, on the `fuzzy::score` scale.
 fn boost(label: &str) -> i64 {
     match label {
         "/help" => 40,
@@ -218,17 +230,19 @@ fn boost(label: &str) -> i64 {
 }
 
 /// Matching commands, best score first; ties keep the alphabetical entry order
-/// (Python `CommandCompleter._fuzzy_filter`, a stable sort on the score).
+/// (a stable sort on the score).
 fn slash_entries(app: &App) -> Vec<CompletionEntry> {
-    // Python completes on the word up to the caret, not the whole word.
+    // Complete on the word up to the caret, not the whole word.
     let input = &app.chat_input.input;
     let end = crate::chat_input::clamp_offset(input, app.chat_input.cursor);
     let query = input[..end].to_lowercase();
-    let mut scored: Vec<(i64, CompletionEntry)> = commands::entries(&app.completion.skills)
+    let entries = commands::entries(&app.completion.skills, |feature| feature.is_on(app));
+    let mut scored: Vec<(i64, CompletionEntry)> = entries
         .into_iter()
-        .filter_map(|(label, description)| {
-            let score = fuzzy::score(&query, &label[1..].to_lowercase())? + boost(&label);
-            Some((score, CompletionEntry { label, description }))
+        .filter_map(|entry| {
+            let score =
+                fuzzy::score(&query, &entry.label[1..].to_lowercase())? + boost(&entry.label);
+            Some((score, entry))
         })
         .collect();
     scored.sort_by_key(|(score, _)| std::cmp::Reverse(*score));
@@ -239,11 +253,13 @@ fn file_entries(app: &App, start: usize, end: usize) -> Vec<CompletionEntry> {
     let query = app.chat_input.input[start + 1..end].replace('\\', "/");
     app.completion
         .files
+        .index
         .matching(&query, FILE_MATCH_LIMIT)
         .into_iter()
         .map(|label| CompletionEntry {
             label,
             description: String::new(),
+            origin: None,
         })
         .collect()
 }
@@ -256,13 +272,14 @@ fn skill_entries(app: &App, start: usize, end: usize) -> Vec<CompletionEntry> {
         .completion
         .skills
         .iter()
-        .filter_map(|(name, description)| {
-            let score = fuzzy::score(&query, &name.to_lowercase())?;
+        .filter_map(|skill| {
+            let score = fuzzy::score(&query, &skill.name.to_lowercase())?;
             Some((
                 score,
                 CompletionEntry {
-                    label: format!("/{name}"),
-                    description: description.clone(),
+                    label: format!("/{}", skill.name),
+                    description: skill.description.clone(),
+                    origin: Some(skill.origin),
                 },
             ))
         })

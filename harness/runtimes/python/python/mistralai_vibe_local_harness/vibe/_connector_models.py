@@ -9,11 +9,15 @@ from typing import Literal, Protocol
 
 from pydantic import JsonValue
 
+from mistralai_vibe_local_harness.vibe._tool_schemas import ToolsLeftOutSignal
+
 type JsonObject = dict[str, JsonValue]
 type JsonSchema = bool | JsonObject
-type ConnectorAuthAction = Literal["none", "oauth", "credentials_setup", "unknown"]
+type ConnectorAuthAction = Literal[
+    "none", "oauth", "credentials_setup", "no_auth_connect", "unknown"
+]
 type ConnectorSourceStatus = Literal[
-    "disabled", "connected", "needs_auth", "needs_setup", "unavailable"
+    "disabled", "connected", "needs_auth", "needs_setup", "needs_connect", "unavailable"
 ]
 
 
@@ -131,7 +135,7 @@ class ConnectorAuthorizationRequiredSignal:
 
 
 type ConnectorRuntimeEventSink = Callable[
-    [ConnectorAuthorizationRequiredSignal], Awaitable[None] | None
+    [ConnectorAuthorizationRequiredSignal | ToolsLeftOutSignal], Awaitable[None] | None
 ]
 
 

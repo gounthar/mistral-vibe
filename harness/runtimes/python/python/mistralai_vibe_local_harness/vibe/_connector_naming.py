@@ -22,6 +22,7 @@ from mistralai_vibe_local_harness.vibe._connector_models import (
     ResolvedConnectorCatalog,
     ResolvedConnectorSelection,
 )
+from mistralai_vibe_local_harness.vibe._tool_schemas import type_is_not_object
 
 NAMING_VERSION = "mistral.vibe.connector-naming/v1"
 _IDENTIFIER = re.compile(r"^[A-Za-z_$][A-Za-z0-9_$]*$")
@@ -69,6 +70,8 @@ def build_connector_snapshot(
                         selection, alias=connector.alias, raw_tool_name=tool.raw_name
                     )
                     and (connector.alias, tool.raw_name) not in suspended
+                    # Core refuses a tool whose schema's type is not "object".
+                    and not type_is_not_object(tool.input_schema)
                 ),
             )
             for tool in sorted(connector.tools, key=lambda item: item.raw_name)
@@ -178,6 +181,8 @@ def _source_status(  # noqa: PLR0911 - one return per source status
         return "needs_auth"
     if connector.auth_action == "credentials_setup":
         return "needs_setup"
+    if connector.auth_action == "no_auth_connect":
+        return "needs_connect"
     return "unavailable"
 
 

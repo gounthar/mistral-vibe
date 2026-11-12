@@ -15,15 +15,19 @@ import pytest
 
 pytest.importorskip("mistralai_vibe_local_harness.vibe")
 
+from mistralai_vibe_local_harness.vibe import SandboxExecResult
 from tests.stubs.local_sandbox import (
     ROOT_DOC,
     SUB_DOC,
     RecordingSandbox,
     build_trusted_project,
 )
+from vibe.app_server._process_services import ProcessServices
 from vibe.app_server._runtime import HarnessProcess
+from vibe.app_server._sandbox_workspace import sandbox_git_status
 from vibe.app_server._unified_harness_backend_adapter import UnifiedSessionSettings
 from vibe.app_server.protocol import SessionOptions
+from vibe.core.config import ProjectContextConfig
 from vibe.core.config.harness_files import HarnessFilesManager
 from vibe.core.trusted_folders import trusted_folders_manager
 
@@ -39,7 +43,7 @@ def project(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
 
 @pytest.mark.asyncio
 async def test_a_sandboxed_session_reads_the_same_workspace_context_through_its_adapter(
-    project: Path, monkeypatch: pytest.MonkeyPatch
+    project: Path, monkeypatch: pytest.MonkeyPatch, process_services: ProcessServices
 ) -> None:
     """*Prepare*: A trusted host session and a sandboxed session over the same
     repository, the sandboxed one configured to offer background processes.
@@ -51,10 +55,10 @@ async def test_a_sandboxed_session_reads_the_same_workspace_context_through_its_
     # Prepare
     sandbox = RecordingSandbox(project)
     host_process = HarnessProcess(
-        HarnessFilesManager(sources=("user", "project")), experimental_harness=True
+        HarnessFilesManager(sources=("user", "project")), services=process_services
     )
     monkeypatch.setenv("VIBE_ENABLE_BACKGROUND_PROCESSES", "true")
-    sandbox_process = HarnessProcess(experimental_harness=True, sandbox=sandbox)
+    sandbox_process = HarnessProcess(sandbox=sandbox, services=process_services)
 
     # Do
     host = (
@@ -95,7 +99,7 @@ async def test_a_sandboxed_session_reads_the_same_workspace_context_through_its_
 
 @pytest.mark.asyncio
 async def test_a_sandboxed_session_in_a_subdirectory_reads_docs_up_to_its_workspace(
-    project: Path, monkeypatch: pytest.MonkeyPatch
+    project: Path, monkeypatch: pytest.MonkeyPatch, process_services: ProcessServices
 ) -> None:
     """*Prepare*: A host session started in a subdirectory of a trusted repository,
     and a sandboxed one started in the same subdirectory of its workspace.
@@ -107,9 +111,9 @@ async def test_a_sandboxed_session_in_a_subdirectory_reads_docs_up_to_its_worksp
     monkeypatch.setattr(trusted_folders_manager, "find_trust_root", lambda _: project)
     sandbox = RecordingSandbox(project)
     host_process = HarnessProcess(
-        HarnessFilesManager(sources=("user", "project")), experimental_harness=True
+        HarnessFilesManager(sources=("user", "project")), services=process_services
     )
-    sandbox_process = HarnessProcess(experimental_harness=True, sandbox=sandbox)
+    sandbox_process = HarnessProcess(sandbox=sandbox, services=process_services)
     subdirectory = str(project / "sub")
 
     # Do
@@ -136,7 +140,7 @@ async def test_a_sandboxed_session_in_a_subdirectory_reads_docs_up_to_its_worksp
 
 @pytest.mark.asyncio
 async def test_a_sandboxed_session_without_git_says_so_like_the_host(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, process_services: ProcessServices
 ) -> None:
     """*Prepare*: A sandbox workspace that is not a git repository.
     *Do*: Derive the session's system instructions.
@@ -146,7 +150,7 @@ async def test_a_sandboxed_session_without_git_says_so_like_the_host(
     monkeypatch.setenv("MISTRAL_API_KEY", "test-key")
     monkeypatch.setenv("GIT_CEILING_DIRECTORIES", str(tmp_path))
     process = HarnessProcess(
-        experimental_harness=True, sandbox=RecordingSandbox(tmp_path)
+        sandbox=RecordingSandbox(tmp_path), services=process_services
     )
 
     # Do
@@ -159,3 +163,39 @@ async def test_a_sandboxed_session_without_git_says_so_like_the_host(
         derived.core_config.system_instructions
     )
     await process.close()
+
+
+class _TimedSandbox(RecordingSandbox):
+    """A Recording Sandbox that also records each command's time limit."""
+
+    def __init__(self, workspace: Path) -> None:
+        super().__init__(workspace)
+        self.timeouts: list[float | None] = []
+
+    async def execute(
+        self, command: str, cwd: str, timeout: float | None
+    ) -> SandboxExecResult:
+        self.timeouts.append(timeout)
+        return await super().execute(command, cwd, timeout)
+
+
+@pytest.mark.asyncio
+async def test_a_sandboxed_session_reads_git_metadata_in_one_round_trip(
+    project: Path,
+) -> None:
+    """*Prepare*: A sandbox over a repository, and the default 2s git timeout.
+    *Do*: Read the git metadata section through the sandbox.
+    *Assert*: It names the branch, and took one sandbox call, with a time
+    limit longer than the 2s meant for git on the host.
+    """
+    # Prepare
+    sandbox = _TimedSandbox(project)
+    config = ProjectContextConfig()
+
+    # Do
+    section = await sandbox_git_status(sandbox, config, cwd=project)
+
+    # Assert
+    assert "Current branch: main" in section
+    assert len(sandbox.commands) == 1
+    assert sandbox.timeouts == [10.0]
