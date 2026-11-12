@@ -30,11 +30,11 @@ BLUE='\033[0;34m'
 BOLD='\033[1m'
 NC='\033[0m'
 
-info()    { echo -e "${BLUE}[INFO]${NC} $1"; }
+info() { echo -e "${BLUE}[INFO]${NC} $1"; }
 success() { echo -e "${GREEN}[OK]${NC} $1"; }
 warning() { echo -e "${YELLOW}[WARN]${NC} $1"; }
-error()   { echo -e "${RED}[ERROR]${NC} $1" >&2; }
-step()    { echo -e "\n${BOLD}==> $1${NC}"; }
+error() { echo -e "${RED}[ERROR]${NC} $1" >&2; }
+step() { echo -e "\n${BOLD}==> $1${NC}"; }
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -51,33 +51,33 @@ step "Checking system dependencies"
 MISSING=()
 
 check_cmd() {
-    local cmd="$1"
-    local pkg="$2"
-    if command -v "$cmd" &>/dev/null; then
-        success "$cmd found: $(command -v "$cmd")"
-    else
-        error "$cmd not found (install: sudo apt install $pkg)"
-        MISSING+=("$pkg")
-    fi
+  local cmd="$1"
+  local pkg="$2"
+  if command -v "$cmd" &>/dev/null; then
+    success "$cmd found: $(command -v "$cmd")"
+  else
+    error "$cmd not found (install: sudo apt install $pkg)"
+    MISSING+=("$pkg")
+  fi
 }
 
-check_cmd gcc       gcc
-check_cmd g++       g++
-check_cmd make      make
-check_cmd cargo     cargo
-check_cmd git       git
-check_cmd rg        ripgrep
+check_cmd gcc gcc
+check_cmd g++ g++
+check_cmd make make
+check_cmd cargo cargo
+check_cmd git git
+check_cmd rg ripgrep
 check_cmd pkg-config pkg-config
 
 # Check dev libraries via dpkg (Debian/Ubuntu)
 check_dev_lib() {
-    local pkg="$1"
-    if dpkg -s "$pkg" &>/dev/null; then
-        success "$pkg installed"
-    else
-        error "$pkg not found (install: sudo apt install $pkg)"
-        MISSING+=("$pkg")
-    fi
+  local pkg="$1"
+  if dpkg -s "$pkg" &>/dev/null; then
+    success "$pkg installed"
+  else
+    error "$pkg not found (install: sudo apt install $pkg)"
+    MISSING+=("$pkg")
+  fi
 }
 
 check_dev_lib python3-dev
@@ -86,13 +86,13 @@ check_dev_lib libffi-dev
 check_dev_lib libssl-dev
 
 if [[ ${#MISSING[@]} -gt 0 ]]; then
-    echo
-    error "Missing dependencies detected. Install them with:"
-    echo -e "  ${YELLOW}sudo apt install ${MISSING[*]}${NC}"
-    echo
-    echo "For Cargo/Rust (if missing), install via rustup:"
-    echo -e "  ${YELLOW}curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh${NC}"
-    exit 1
+  echo
+  error "Missing dependencies detected. Install them with:"
+  echo -e "  ${YELLOW}sudo apt install ${MISSING[*]}${NC}"
+  echo
+  echo "For Cargo/Rust (if missing), install via rustup:"
+  echo -e "  ${YELLOW}curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh${NC}"
+  exit 1
 fi
 
 # ---------------------------------------------------------------------------
@@ -101,12 +101,12 @@ fi
 step "Ensuring uv is available"
 
 if command -v uv &>/dev/null; then
-    success "uv found: $(uv --version)"
+  success "uv found: $(uv --version)"
 else
-    info "Installing uv $UV_VERSION..."
-    curl -LsSf "https://astral.sh/uv/$UV_VERSION/install.sh" | sh
-    export PATH="$HOME/.local/bin:$PATH"
-    success "uv installed: $(uv --version)"
+  info "Installing uv $UV_VERSION..."
+  curl -LsSf "https://astral.sh/uv/$UV_VERSION/install.sh" | sh
+  export PATH="$HOME/.local/bin:$PATH"
+  success "uv installed: $(uv --version)"
 fi
 
 # ---------------------------------------------------------------------------
@@ -142,13 +142,30 @@ success "All dependencies synced"
 # ---------------------------------------------------------------------------
 # Step 4: Build vibe-acp binary
 # ---------------------------------------------------------------------------
+step "Building vibe-rs (bundled by vibe-acp for --setup)"
+
+# Since v3.0, vibe-acp.spec refuses to build without vibe-rs. Mirror
+# upstream's scripts/ci/build-pyinstaller-binaries.sh: build it from
+# source without the voice feature and point the spec at it.
+# VIBE_SKIP_RUST_TUI=1 still produces a bundle without the wizard.
+if [[ -z "${VIBE_SKIP_RUST_TUI:-}" && -z "${VIBE_ACP_RUST_TUI:-}" ]]; then
+  tui_target="$PROJECT_DIR/.native-build/vibe-rs-target"
+  read -r -a tui_flags <<<"${CARGO_BUILD_FLAGS:---no-default-features}"
+  CARGO_TARGET_DIR="$tui_target" cargo build --release --locked \
+    --manifest-path vibe/cli-rust/Cargo.toml --bin vibe-rs "${tui_flags[@]}"
+  export VIBE_ACP_RUST_TUI="$tui_target/release/vibe-rs"
+  success "vibe-rs built: $VIBE_ACP_RUST_TUI"
+else
+  info "Skipping vibe-rs build (VIBE_SKIP_RUST_TUI or VIBE_ACP_RUST_TUI set)"
+fi
+
 step "Building vibe-acp with PyInstaller"
 
 uv run --no-dev --group build pyinstaller vibe-acp.spec 2>&1 | tail -n 15
 
 if [[ ! -f "$PROJECT_DIR/dist/vibe-acp-dir/vibe-acp" ]]; then
-    error "Build failed: dist/vibe-acp-dir/vibe-acp not found"
-    exit 1
+  error "Build failed: dist/vibe-acp-dir/vibe-acp not found"
+  exit 1
 fi
 
 success "Binary built: dist/vibe-acp-dir/vibe-acp ($(du -sh "$PROJECT_DIR/dist/vibe-acp-dir" | cut -f1) total)"
