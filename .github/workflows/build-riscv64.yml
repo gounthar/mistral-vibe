@@ -86,7 +86,14 @@ jobs:
           fi
 
           ZIP_NAME="vibe-acp-linux-riscv64-${VERSION}.zip"
-          chmod +x "$ARTIFACT_DIR/vibe-acp"
+          # upload-artifact drops file modes, so restore the exec bit on both
+          # binaries; vibe-acp --setup execs the bundled vibe-rs.
+          VIBE_RS="$ARTIFACT_DIR/_internal/vibe/_bin/vibe-rs"
+          if [[ ! -f "$VIBE_RS" ]]; then
+            echo "::error::Bundled vibe-rs not found at $VIBE_RS"
+            exit 1
+          fi
+          chmod +x "$ARTIFACT_DIR/vibe-acp" "$VIBE_RS"
           (cd "$ARTIFACT_DIR/.." && zip -r "$OLDPWD/release-assets/${ZIP_NAME}" vibe-acp-dir/)
           echo "Created: release-assets/${ZIP_NAME}"
 
