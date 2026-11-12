@@ -33,7 +33,7 @@ fn tool_call_completion(action_id: &str, call_id: &str) -> Value {
                 "arguments_json": "{\"path\":\"original.txt\"}",
             }],
             "finish_reason": "tool_call",
-            "usage": null,
+            "usage": {"input_tokens": 100, "output_tokens": 20, "total_tokens": 120, "cached_input_tokens": 0, "cache_write_tokens": 0, "reasoning_tokens": 0},
         },
     })
 }
@@ -95,8 +95,9 @@ fn provided_tool_name_collisions_reject_session_creation() {
             "exposure": exposure,
         })
     };
-    let reserved_configs =
-        crate::core::tools::resolved::RESERVED_TOOL_NAMESPACES.map(|namespace| {
+    let reserved_configs = crate::core::tools::resolved::RESERVED_TOOL_NAMESPACES
+        .into_iter()
+        .map(|namespace| {
             let mut config = config();
             config.settings.tools.background_processes = BackgroundProcessMode::Disabled;
             config.settings.tools.subagents = SubagentMode::Disabled;
@@ -106,7 +107,8 @@ fn provided_tool_name_collisions_reject_session_creation() {
             }]))
             .expect("reserved group remains structurally valid");
             config
-        });
+        })
+        .collect::<Vec<_>>();
     let mut duplicate_stable_id = config();
     duplicate_stable_id.capabilities.tool_groups = serde_json::from_value(json!([{
         "name": "calendar",
@@ -127,13 +129,16 @@ fn provided_tool_name_collisions_reject_session_creation() {
     .expect("duplicate direct tools remain structurally valid");
 
     // Do
-    let reserved_errors = reserved_configs.map(|config| {
-        let namespace = config.capabilities.tool_groups[0].name.clone();
-        let error = HarnessSession::create(config)
-            .err()
-            .expect("reserved namespace rejects session creation");
-        (namespace, error)
-    });
+    let reserved_errors = reserved_configs
+        .into_iter()
+        .map(|config| {
+            let namespace = config.capabilities.tool_groups[0].name.clone();
+            let error = HarnessSession::create(config)
+                .err()
+                .expect("reserved namespace rejects session creation");
+            (namespace, error)
+        })
+        .collect::<Vec<_>>();
     let duplicate_stable_error = HarnessSession::create(duplicate_stable_id)
         .err()
         .expect("duplicate stable ID rejects session creation");
@@ -163,6 +168,78 @@ fn provided_tool_name_collisions_reject_session_creation() {
 }
 
 ///
+/// *Prepare*: A provided tool's input schema sets top-level types other than `object`, by its
+/// `type`, by `anyOf`/`oneOf` branches (also nested) or by a local `$ref`; other schemas have
+/// the type `object` or set no type.
+/// *Do*: Create a Harness session with each schema.
+/// *Assert*: Session creation rejects the first kind with an error naming the tool and its schema,
+/// and accepts the second kind.
+///
+#[test]
+fn input_schema_whose_type_is_not_object_rejects_session_creation() {
+    // Prepare
+    let config_with_schema = |input_schema: Value| {
+        let mut config = config();
+        config.capabilities.tool_groups = serde_json::from_value(json!([{
+            "name": "client",
+            "tools": [{
+                "name": "release_notes",
+                "description": "Provided tool.",
+                "input_schema": input_schema,
+                "exposure": "direct",
+            }],
+        }]))
+        .expect("the tool group remains structurally valid");
+        config
+    };
+    // Every Runtime checks the same cases, from the shared fixture.
+    let cases: Value = serde_json::from_str(
+        &std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../fixtures/tool-input-schema-types.json"
+        ))
+        .expect("the shared schema fixture reads"),
+    )
+    .expect("the shared schema fixture is JSON");
+    let refused = cases["not_object"]
+        .as_array()
+        .expect("the fixture lists schemas whose type is not object")
+        .clone();
+    let accepted = cases["object"]
+        .as_array()
+        .expect("the fixture lists schemas whose type is object or unset")
+        .clone();
+    assert!(!refused.is_empty() && !accepted.is_empty());
+
+    // Do
+    let refused_errors = refused
+        .iter()
+        .map(|schema| {
+            HarnessSession::create(config_with_schema(schema.clone()))
+                .err()
+                .expect("a schema whose type is not object rejects session creation")
+        })
+        .collect::<Vec<_>>();
+    let accepted_results = accepted
+        .iter()
+        .map(|schema| HarnessSession::create(config_with_schema(schema.clone())).err())
+        .collect::<Vec<_>>();
+
+    // Assert
+    for (schema, error) in refused.iter().zip(refused_errors) {
+        assert_eq!(
+            error,
+            format!(
+                "tool \"client.release_notes\": input schema type must be \"object\", got {schema}"
+            )
+        );
+    }
+    for (schema, error) in accepted.iter().zip(accepted_results) {
+        assert_eq!(error, None, "schema {schema} is accepted");
+    }
+}
+
+///
 /// *Prepare*: A direct filesystem call is pending with a private path argument.
 /// *Do*: Inspect the session through the public Core interface.
 /// *Assert*: Inspection identifies the pending Runtime tool but exposes neither its arguments nor the private path.
@@ -189,7 +266,7 @@ fn tool_inspection_identifies_the_route_without_exposing_arguments() {
                     "arguments_json": "{\"path\":\"secret.txt\"}",
                 }],
                 "finish_reason": "tool_call",
-                "usage": null,
+                "usage": {"input_tokens": 100, "output_tokens": 20, "total_tokens": 120, "cached_input_tokens": 0, "cache_write_tokens": 0, "reasoning_tokens": 0},
             },
         }),
     )));
@@ -296,6 +373,7 @@ fn direct_tool_hooks_commit_only_the_transformed_result() {
     assert_eq!(post_hook_pending["transition"]["observations"], json!([]));
     let committed = &transformed["transition"]["observations"][0];
     assert_eq!(committed["type"], "tool_result_committed");
+    assert_eq!(committed["call"], tool_action["call"]);
     assert_eq!(
         committed["result"]["content"][0]["text"],
         "transformed public result"
@@ -406,7 +484,7 @@ fn invalid_provided_tool_hook_arguments_use_the_resolved_catalog() {
                     "arguments_json": "{\"query\":\"planning\"}",
                 }],
                 "finish_reason": "tool_call",
-                "usage": null,
+                "usage": {"input_tokens": 100, "output_tokens": 20, "total_tokens": 120, "cached_input_tokens": 0, "cache_write_tokens": 0, "reasoning_tokens": 0},
             },
         }),
     )));
@@ -605,6 +683,10 @@ fn restored_direct_pre_tool_skip_commits_failure_without_runtime_execution() {
     assert_eq!(observations[0]["result"]["error"]["code"], "tool_skipped");
     assert_eq!(
         observations[0]["result"]["content"][0]["text"],
+        "file access denied"
+    );
+    assert_eq!(
+        observations[0]["result"]["error"]["message"],
         "file access denied"
     );
     assert_eq!(observations[1]["type"], "tool_execution_finished");

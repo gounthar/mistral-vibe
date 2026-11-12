@@ -48,18 +48,18 @@ fn start(app: &mut App, client: &Arc<Client>, command: String) {
         return;
     };
     app.begin_command_loading();
-    app.terminal_notifier.set_running(true);
-    let pending = app.commit_started();
+    app.terminal_notifier.clear_outcome();
     let operation_id = new_message_id();
     app.session.shell_operation_id = Some(operation_id.clone());
-    app.session.shell_started_at = Some(std::time::Instant::now());
+    app.session.shell_started_at = Some(crate::clock::now());
     app.session.shell_request_started = false;
+    app.session.shell_rpc_completed = false;
     app.session.shell_interrupt_requested = false;
     app.view
         .loading
         .set_label(crate::ui::loading::SHELL_LOADING_STATUS);
     let client = client.clone();
-    tokio::spawn(async move {
+    crate::work::spawn(async move {
         let params = SessionShellCommandParams {
             session_id,
             command: Some(command),
@@ -82,7 +82,6 @@ fn start(app: &mut App, client: &Arc<Client>, command: String) {
                 operation_id,
                 error,
             },
-            &pending,
         )
         .await;
     });
@@ -117,7 +116,7 @@ fn send_interrupt(app: &App, client: &Arc<Client>) {
         return;
     };
     let client = client.clone();
-    tokio::spawn(async move {
+    crate::work::spawn(async move {
         let params = SessionShellCommandParams {
             session_id,
             command: None,

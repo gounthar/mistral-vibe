@@ -39,7 +39,9 @@ use crate::core::features::programmatic_tool_calling::model::PartialEvaluation;
 use crate::core::features::programmatic_tool_calling::model::ToolState;
 #[cfg(test)]
 use crate::core::features::programmatic_tool_calling::model::{ToolFunction, ToolKind};
+#[cfg(test)]
 use crate::core::step_protocol::DeterminismContext;
+use crate::core::tools::arguments::{ArgumentsRejection, validate_arguments};
 
 static INITIALIZE_V8: Once = Once::new();
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(2);
@@ -48,7 +50,7 @@ const MAX_HEAP_BYTES: usize = 16 * 1024 * 1024;
 /// Largest program source that is evaluated, measured in V8's string
 /// representation. The source embeds every replayed tool result. A larger
 /// source cannot fit in the heap, so it fails before an isolate is created.
-const MAX_SOURCE_BYTES: usize = MAX_HEAP_BYTES;
+pub(crate) const MAX_SOURCE_BYTES: usize = MAX_HEAP_BYTES;
 /// How far the near-heap-limit callback raises the heap limit each time it
 /// runs. After one raise, V8 can allocate the source string and the parser's
 /// copy of its largest string literal before it checks the limit again, so a
@@ -119,6 +121,21 @@ struct ExecutionWatchdog {
     thread: Option<thread::JoinHandle<()>>,
 }
 
+struct StoppedProgram(TypeScriptRunResult);
+
+fn stop_program_at_budget<'s, 'i>(
+    scope: &mut v8::PinScope<'s, 'i>,
+    args: v8::FunctionCallbackArguments<'s>,
+    _return_value: v8::ReturnValue<'s>,
+) {
+    let result = deno_core::serde_v8::from_v8::<TypeScriptRunResult>(scope, args.get(0))
+        .unwrap_or_else(|error| error_result("SerializationError", error.to_string()));
+    scope.set_slot(StoppedProgram(result));
+    // A JavaScript exception can be caught and retried indefinitely. This
+    // cooperative boundary exits the disposable isolate with its captured result.
+    scope.thread_safe_handle().terminate_execution();
+}
+
 impl ExecutionWatchdog {
     fn start(isolate_handle: v8::IsolateHandle, timeout: Duration) -> Self {
         let (stop_tx, stop_rx) = mpsc::channel();
@@ -159,59 +176,20 @@ macro_rules! v8_exception_result {
 }
 
 pub(super) fn evaluate(request: EvaluationRequest<'_>) -> Result<TypeScriptRunResult, String> {
-    run_typescript(
-        request.partial_evaluation,
-        request.tools,
-        request.execution_id,
-        request.determinism,
-        request.max_program_effects,
-        request.max_program_operations,
-    )
-}
-
-fn run_typescript(
-    partial_evaluation: &PartialEvaluation,
-    tools: &[TypeScriptTool],
-    execution_id: &str,
-    determinism: DeterminismContext,
-    max_program_effects: u32,
-    max_program_operations: u32,
-) -> Result<TypeScriptRunResult, String> {
-    run_typescript_with_timeout(
-        partial_evaluation,
-        tools,
-        execution_id,
-        determinism,
-        max_program_effects,
-        max_program_operations,
-        DEFAULT_TIMEOUT,
-    )
+    run_typescript_with_timeout(request, DEFAULT_TIMEOUT)
 }
 
 fn run_typescript_with_timeout(
-    partial_evaluation: &PartialEvaluation,
-    tools: &[TypeScriptTool],
-    execution_id: &str,
-    determinism: DeterminismContext,
-    max_program_effects: u32,
-    max_program_operations: u32,
+    request: EvaluationRequest<'_>,
     timeout: Duration,
 ) -> Result<TypeScriptRunResult, String> {
-    let transpiled = match transpile(&partial_evaluation.code) {
+    let transpiled = match transpile(&request.partial_evaluation.code) {
         Ok(code) => code,
         Err(error) => return Ok(error_result("SyntaxError", error)),
     };
-    let mut evaluation = partial_evaluation.clone();
-    for _ in 0..=max_program_operations {
-        let source = match build_source(
-            &evaluation,
-            tools,
-            execution_id,
-            &transpiled,
-            determinism,
-            max_program_effects,
-            max_program_operations,
-        ) {
+    let mut evaluation = request.partial_evaluation.clone();
+    for _ in 0..=request.max_program_operations {
+        let source = match build_source(&evaluation, &request, &transpiled) {
             Ok(source) => source,
             Err(error) => return Ok(error_result("SerializationError", error)),
         };
@@ -230,20 +208,29 @@ fn run_typescript_with_timeout(
         let mut isolate = HeapLimitedIsolate::new(isolate, &heap_limit_monitor);
         let _watchdog = ExecutionWatchdog::start(isolate_handle, timeout);
         let result = execute(isolate.isolate_mut(), &source);
+        let stopped = isolate.isolate_mut().remove_slot::<StoppedProgram>();
         let heap_limit_reached = isolate.limit_reached();
+        if let Some(StoppedProgram(result)) = stopped {
+            return Ok(result);
+        }
         if heap_limit_reached {
             return Ok(memory_limit_result(evaluation.tool_state));
         }
         let result = result?;
         let TypeScriptRunResult::PartialEvaluation {
             mut partial_evaluation,
+            logs,
         } = result
         else {
             return Ok(result);
         };
-        let validation = reject_invalid_pending_tools(&mut partial_evaluation.tool_state, tools);
+        let validation =
+            reject_invalid_pending_tools(&mut partial_evaluation.tool_state, request.tools);
         if !validation.rejected_any || validation.has_valid_pending {
-            return Ok(TypeScriptRunResult::PartialEvaluation { partial_evaluation });
+            return Ok(TypeScriptRunResult::PartialEvaluation {
+                partial_evaluation,
+                logs,
+            });
         }
         evaluation = partial_evaluation;
     }
@@ -288,32 +275,36 @@ fn reject_invalid_pending_tools(
     result
 }
 
+/// A program's tool call goes through the same argument check as a direct call
+/// (`validate_arguments`), worded for the program. A schema that does not
+/// compile leaves the call to the tool, as before.
 fn validate_tool_arguments(tool: &TypeScriptTool, arguments: &Value) -> Option<Value> {
-    let mut schema = serde_json::Map::from_iter([
-        (
-            "$schema".to_string(),
-            json!("http://json-schema.org/draft-07/schema#"),
-        ),
-        ("type".to_string(), json!("object")),
-    ]);
-    for keyword in ["properties", "required", "additionalProperties"] {
-        if let Some(value) = tool.input_schema.get(keyword) {
-            schema.insert(keyword.to_string(), value.clone());
+    let invalid = |summary: String| {
+        // Recorded like any other tool failure: `name` holds the error code.
+        json!({
+            "name": "invalid_arguments",
+            "message": format!(
+                "Invalid arguments for {}: {summary}",
+                tool.programmatic_name.display_name()
+            ),
+        })
+    };
+    let rejection =
+        validate_arguments(tool.runtime_builtin, &tool.input_schema, arguments).err()?;
+    let summary = rejection.detail(&tool.input_schema);
+    match rejection {
+        ArgumentsRejection::InvalidSchema(_) => None,
+        ArgumentsRejection::Domain(_) => Some(invalid(summary)),
+        ArgumentsRejection::Schema { error, .. } => {
+            let mut rejection = invalid(summary);
+            rejection["details"] = json!({
+                "type": "jsonSchemaArgumentValidationError",
+                "functionName": tool.name,
+                "argumentsValidationErrors": format_ajv_validation_errors(error),
+            });
+            Some(rejection)
         }
     }
-    let validator = jsonschema::draft7::options()
-        .should_validate_formats(true)
-        .build(&Value::Object(schema))
-        .ok()?;
-    let error = validator.validate(arguments).err()?;
-    let errors = format_ajv_validation_errors(error);
-    Some({
-        json!({
-            "type": "jsonSchemaArgumentValidationError",
-            "functionName": tool.name,
-            "argumentsValidationErrors": errors,
-        })
-    })
 }
 
 fn format_ajv_validation_errors(error: jsonschema::ValidationError<'_>) -> Vec<Value> {
@@ -534,18 +525,15 @@ fn calls_main(expression: &Expr) -> bool {
 
 fn build_source(
     partial_evaluation: &PartialEvaluation,
-    tools: &[TypeScriptTool],
-    execution_id: &str,
+    request: &EvaluationRequest<'_>,
     transpiled: &str,
-    determinism: DeterminismContext,
-    max_program_effects: u32,
-    max_program_operations: u32,
 ) -> Result<String, String> {
     let previous =
         serde_json::to_string(&partial_evaluation.tool_state).map_err(|error| error.to_string())?;
     let input =
         serde_json::to_string(&partial_evaluation.input).map_err(|error| error.to_string())?;
-    let tool_bindings = tools
+    let tool_bindings = request
+        .tools
         .iter()
         .map(|tool| SandboxToolBinding {
             runtime_name: &tool.name,
@@ -556,23 +544,31 @@ fn build_source(
     let tool_bindings = serde_json::to_string(&tool_bindings).map_err(|error| error.to_string())?;
     let original_code =
         serde_json::to_string(&partial_evaluation.code).map_err(|error| error.to_string())?;
-    let execution_id = serde_json::to_string(execution_id).map_err(|error| error.to_string())?;
+    let execution_id =
+        serde_json::to_string(request.execution_id).map_err(|error| error.to_string())?;
     let transpiled = serde_json::to_string(transpiled).map_err(|error| error.to_string())?;
-    let time_unix_ms = determinism.time_unix_ms.to_string();
-    let random_seed = determinism.random_seed.to_string();
-    let max_program_effects = max_program_effects.to_string();
-    let max_program_operations = max_program_operations.to_string();
+    let time_unix_ms = request.determinism.time_unix_ms.to_string();
+    let random_seed = request.determinism.random_seed.to_string();
+    let round = request.round.to_string();
+    let max_program_effects = request.max_program_effects.to_string();
+    let max_program_operations = request.max_program_operations.to_string();
+    let budget_error = match &request.budget_error {
+        Some(error) => serde_json::to_string(error).map_err(|error| error.to_string())?,
+        None => "null".to_string(),
+    };
 
     render_template(&[
         ("__PREVIOUS_OPERATIONS__", &previous),
         ("__INPUT__", &input),
         ("__TOOL_BINDINGS__", &tool_bindings),
         ("__EXECUTION_ID__", &execution_id),
+        ("__ROUND__", &round),
         ("__ORIGINAL_CODE__", &original_code),
         ("__TIME_UNIX_MS__", &time_unix_ms),
         ("__RANDOM_SEED__", &random_seed),
         ("__MAX_PROGRAM_EFFECTS__", &max_program_effects),
         ("__MAX_PROGRAM_OPERATIONS__", &max_program_operations),
+        ("__BUDGET_ERROR__", &budget_error),
         ("__USER_PROGRAM__", &transpiled),
     ])
 }
@@ -628,6 +624,26 @@ fn execute(isolate: &mut v8::OwnedIsolate, source: &str) -> Result<TypeScriptRun
     let context = v8::Context::new(handle_scope, Default::default());
     let scope = &mut v8::ContextScope::new(handle_scope, context);
     v8::tc_scope!(let try_catch, scope);
+
+    let global = context.global(try_catch);
+    let Some(name) = v8::String::new(try_catch, "__harnessStopAtBudget") else {
+        return Ok(error_result(
+            "V8Error",
+            "could not allocate the budget-stop binding",
+        ));
+    };
+    let Some(stop) = v8::Function::new(try_catch, stop_program_at_budget) else {
+        return Ok(error_result(
+            "V8Error",
+            "could not construct the budget-stop binding",
+        ));
+    };
+    if global.set(try_catch, name.into(), stop.into()) != Some(true) {
+        return Ok(error_result(
+            "V8Error",
+            "could not install the budget-stop binding",
+        ));
+    }
 
     let Some(source) = v8::String::new(try_catch, source) else {
         return Ok(error_result(
@@ -760,6 +776,7 @@ fn memory_limit_result(tool_state: Vec<ToolState>) -> TypeScriptRunResult {
         stdout: None,
         stderr: None,
         tool_state,
+        log_positions: Vec::new(),
         result: CodeResult::Error {
             error: json!({
                 "name": "MemoryLimitError",
@@ -783,15 +800,22 @@ const RUNTIME_TEMPLATE: &str = r#"
   const __input = __INPUT__;
   const __toolBindings = __TOOL_BINDINGS__;
   const __executionId = __EXECUTION_ID__;
+  const __round = __ROUND__;
   const __originalCode = __ORIGINAL_CODE__;
   const __timeUnixMs = __TIME_UNIX_MS__;
   const __randomSeed = __RANDOM_SEED__;
   const __maxProgramEffects = __MAX_PROGRAM_EFFECTS__;
   const __maxProgramOperations = __MAX_PROGRAM_OPERATIONS__;
+  const __budgetError = __BUDGET_ERROR__;
+  const __stopAtBudget = globalThis.__harnessStopAtBudget;
+  delete globalThis.__harnessStopAtBudget;
   const __output = [];
   const __stdout = [];
+  const __stdoutPositions = [];
   const __stderr = [];
   let __index = 0;
+  let __replayed = 0;
+  const __lastRoundStart = __firstOperationOfLastRound();
   let __diverged = false;
   let __stepDepth = 0;
   let __stepRandomState = 0;
@@ -824,6 +848,17 @@ const RUNTIME_TEMPLATE: &str = r#"
 
   function __serializeError(error) {
     try {
+      if (error instanceof ToolError) {
+        return __serialize({
+          name: error.name,
+          message: error.message,
+          stack: error.stack,
+          code: error.code,
+          tool: error.tool,
+          details: error.details,
+          structuredContent: error.structuredContent,
+        });
+      }
       if (error instanceof Error) {
         return __serialize({ name: error.name, message: error.message, stack: error.stack });
       }
@@ -882,6 +917,22 @@ const RUNTIME_TEMPLATE: &str = r#"
     return __OriginalJSONStringify(__copyJSONDataWithoutHooks(value, ancestors));
   }
 
+  // For each console.log line, the number of operations recorded before it.
+  function __logPositions() {
+    const recordedBefore = [];
+    let count = 0;
+    for (let index = 0; index <= __output.length; index += 1) {
+      recordedBefore[index] = count;
+      if (index < __output.length && __output[index]) count += 1;
+    }
+    const positions = [];
+    __OriginalObjectSetPrototypeOf(positions, null);
+    for (let index = 0; index < __stdoutPositions.length; index += 1) {
+      positions[index] = recordedBefore[__stdoutPositions[index]];
+    }
+    return positions;
+  }
+
   function __recordedOperations() {
     const operations = [];
     __OriginalObjectSetPrototypeOf(operations, null);
@@ -893,12 +944,73 @@ const RUNTIME_TEMPLATE: &str = r#"
 
   function __deserializeError(error) {
     if (error && typeof error === "object" && typeof error.message === "string") {
-      const replayed = new Error(error.message, { cause: error });
+      const replayed = error.name === "ToolError" && typeof error.code === "string"
+        ? new ToolError(error.message, {
+            code: error.code,
+            tool: error.tool,
+            details: error.details,
+            structuredContent: error.structuredContent,
+          })
+        : new Error(error.message, { cause: error });
       replayed.name = typeof error.name === "string" ? error.name : "Error";
       if (typeof error.stack === "string") replayed.stack = error.stack;
       return replayed;
     }
     return error;
+  }
+
+  // Every failed tool call rejects with a ToolError: `message` is readable,
+  // `code` is the stable error code, and `tool` names the called function.
+  // All fields are enumerable, so a returned or logged ToolError keeps them.
+  class ToolError extends Error {
+    constructor(message, options) {
+      super(message);
+      Object.defineProperty(this, "message", {
+        value: message,
+        writable: true,
+        configurable: true,
+        enumerable: true,
+      });
+      this.name = "ToolError";
+      this.code = options.code;
+      this.tool = options.tool;
+      if (options.details !== undefined && options.details !== null) this.details = options.details;
+      if (options.structuredContent !== undefined) this.structuredContent = options.structuredContent;
+    }
+  }
+  Object.defineProperty(globalThis, "ToolError", {
+    value: ToolError,
+    writable: true,
+    configurable: true,
+    enumerable: false,
+  });
+
+  // A recorded rejection stores the error code in `name`. A checkpoint from
+  // before ToolError may hold a raw argument validation report without a
+  // `message`; replay rejects with it unchanged, as the program first saw it.
+  function __toolError(rejection, tool) {
+    if (rejection && typeof rejection === "object" && rejection.type === "jsonSchemaArgumentValidationError"
+      && typeof rejection.message !== "string") {
+      return rejection;
+    }
+    const record = rejection && typeof rejection === "object" ? rejection : {};
+    const code = typeof record.name === "string" ? record.name : "tool_error";
+    let message = record.message;
+    if (typeof message !== "string") {
+      let serialized;
+      try {
+        serialized = __OriginalJSONStringify(rejection);
+      } catch (_) {
+        serialized = String(rejection);
+      }
+      message = tool + " failed: " + serialized;
+    }
+    return new ToolError(message, {
+      code,
+      tool,
+      details: record.details,
+      structuredContent: record.structuredContent,
+    });
   }
 
   function __canonical(value) {
@@ -924,7 +1036,7 @@ const RUNTIME_TEMPLATE: &str = r#"
     const current = __previous[__index];
     if (!current) return { type: "new" };
     if (current.type === "pending_tool") return { type: "mismatch" };
-    if (current.function.name === name && __equal(current.function.arguments || {}, args)) {
+    if (current.function.name === name && __equal(current.function.arguments ?? {}, args)) {
       return { type: "replay", state: current };
     }
     return { type: "mismatch" };
@@ -932,6 +1044,25 @@ const RUNTIME_TEMPLATE: &str = r#"
 
   function __operationId(kind, index) {
     return __executionId + ":" + kind + ":" + String(index);
+  }
+
+  function __operationExecutionId(id) {
+    return id.slice(0, id.lastIndexOf(":", id.lastIndexOf(":") - 1));
+  }
+
+  // Index of the first operation recorded by the previous round, or -1 before
+  // the first round. A round replays a prefix of the recorded operations and
+  // records new ones after it, so the operations of the previous round are the
+  // trailing ones that share its execution id. While some of them are still
+  // pending, this evaluation only reads what the program printed and sends
+  // nothing, so it also returns -1.
+  function __firstOperationOfLastRound() {
+    if (__previous.length === 0) return -1;
+    if (__previous.some((operation) => operation.type === "pending_tool")) return -1;
+    const last = __operationExecutionId(__previous[__previous.length - 1].id);
+    let start = __previous.length - 1;
+    while (start > 0 && __operationExecutionId(__previous[start - 1].id) === last) start -= 1;
+    return start;
   }
 
   function __internalRace(left, right) {
@@ -942,19 +1073,67 @@ const RUNTIME_TEMPLATE: &str = r#"
   }
 
   function __consumeExternalEffectBudget() {
-    if (__externalEffectCount >= __maxProgramEffects) {
-      throw new Error("run_typescript exceeded maxProgramEffects (" + String(__maxProgramEffects) + ").");
-    }
+    if (__externalEffectCount >= __maxProgramEffects) __throwEffectBudgetExceeded();
     __externalEffectCount += 1;
+  }
+
+  // Replay restarts the per-round counters. Every earlier round sent at least
+  // one new operation, so the round number also counts toward the effect limit
+  // when this round sends one. A program that replays its recorded operations
+  // has already counted at least that many effects in this round, so this only
+  // stops a program that keeps sending operations it does not replay.
+  // __checkReplayProgress normally stops such a program first.
+  function __consumeNewExternalEffectBudget() {
+    if (__round >= __maxProgramEffects) __throwEffectBudgetExceeded();
+    __consumeExternalEffectBudget();
+  }
+
+  function __throwEffectBudgetExceeded() {
+    throw new Error("run_typescript exceeded maxProgramEffects (" + String(__maxProgramEffects) + ").");
   }
 
   function __checkProgramOperationBudget() {
     if (__index >= __maxProgramOperations) {
+      __checkTimeBudget();
       throw new Error("run_typescript exceeded maxProgramOperations (" + String(__maxProgramOperations) + ").");
     }
   }
 
-  function __callTool(name, argsInput) {
+  // After the time budget, Core stops the program before its next tool call.
+  // A fresh step stops it here, so a program cannot keep running on steps.
+  function __checkTimeBudget() {
+    if (__budgetError === null) return;
+    __stopProgram(__budgetError);
+  }
+
+  // Ends the program with `error`. Unlike a thrown error, the program cannot
+  // catch this stop.
+  function __stopProgram(error) {
+    __stopAtBudget({
+      type: "code_result",
+      stdout: __stdout.length > 0 ? __joinStdout("\n") : undefined,
+      stderr: __stderr.length > 0 ? __joinStderr("\n") : undefined,
+      tool_state: __recordedOperations(),
+      log_positions: __logPositions(),
+      result: { type: "error", error },
+    });
+  }
+
+  // A round that sends new operations must first replay the first operation
+  // that the previous round sent. Otherwise it sends that operation again, and
+  // the next round does the same.
+  function __checkReplayProgress() {
+    if (__replayed > __lastRoundStart) return;
+    __stopProgram({
+      name: "ProgramReplayDiverged",
+      message: "run_typescript stopped: its last tool calls already ran, but when the program " +
+        "ran again with their results, it took a different path before it used them. Core " +
+        "stopped it so it does not send those calls again. Check their effects before you " +
+        "repeat them.",
+    });
+  }
+
+  function __callTool(name, displayName, argsInput) {
     if (__stepDepth > 0) {
       return __OriginalPromiseReject(new Error(
         "Tool calls are not allowed inside step(). Call tools before or after step()."));
@@ -967,14 +1146,18 @@ const RUNTIME_TEMPLATE: &str = r#"
     }
     __checkProgramOperationBudget();
 
+    // A call rejected above never reads replay state, so every round rejects it
+    // the same way. From here on, a call either replays the recorded operation
+    // at its index or records a new one at that index.
     if (!__diverged) {
       const lookup = __lookup(name, args);
       if (lookup.type === "replay") {
         __consumeExternalEffectBudget();
         __output.push(lookup.state);
         __index += 1;
+        __replayed += 1;
         if (lookup.state.type === "resolved_tool") return __OriginalPromiseResolve(lookup.state.result);
-        return __OriginalPromiseReject(__deserializeError(lookup.state.error));
+        return __OriginalPromiseReject(__toolError(lookup.state.error, displayName));
       }
       if (lookup.type === "mismatch") __diverged = true;
     }
@@ -986,8 +1169,9 @@ const RUNTIME_TEMPLATE: &str = r#"
       return new __OriginalPromise(() => {});
     }
 
+    __checkReplayProgress();
     const operationIndex = __index;
-    __consumeExternalEffectBudget();
+    __consumeNewExternalEffectBudget();
     __index += 1;
     __output.push({
       kind: "external",
@@ -1018,12 +1202,14 @@ const RUNTIME_TEMPLATE: &str = r#"
       if (lookup.type === "replay") {
         __output.push(lookup.state);
         __index += 1;
+        __replayed += 1;
         if (lookup.state.type === "resolved_tool") return { type: "resolve", value: lookup.state.result };
         return { type: "reject", value: lookup.state.error };
       }
       if (lookup.type === "mismatch") __diverged = true;
     }
 
+    __checkTimeBudget();
     const operationIndex = __index;
     const outputIndex = __output.length;
     __index += 1;
@@ -1073,10 +1259,13 @@ const RUNTIME_TEMPLATE: &str = r#"
   }
 
   const console = Object.freeze({
-    log: (...args) => __stdout.push(args.map((value) => {
-      if (typeof value === "string") return value;
-      try { return __OriginalJSONStringify(value); } catch (_) { return String(value); }
-    }).join(" ")),
+    log: (...args) => {
+      __stdoutPositions[__stdoutPositions.length] = __output.length;
+      __stdout.push(args.map((value) => {
+        if (typeof value === "string") return value;
+        try { return __OriginalJSONStringify(value); } catch (_) { return String(value); }
+      }).join(" "));
+    },
     info: (...args) => console.log(...args),
     debug: (...args) => console.log(...args),
     error: (...args) => __stderr.push(args.map((value) => {
@@ -1091,7 +1280,8 @@ const RUNTIME_TEMPLATE: &str = r#"
     const namespace = binding.namespace;
     const functionName = binding.function_name;
     if (!tools[namespace]) tools[namespace] = {};
-    tools[namespace][functionName] = (args) => __callTool(binding.runtime_name, args);
+    const displayName = "tools." + namespace + "." + functionName;
+    tools[namespace][functionName] = (args) => __callTool(binding.runtime_name, displayName, args);
   }
   for (const namespace of Object.keys(tools)) Object.freeze(tools[namespace]);
   Object.freeze(tools);
@@ -1319,12 +1509,14 @@ const RUNTIME_TEMPLATE: &str = r#"
     ? {
         type: "partial_evaluation",
         partial_evaluation: { code: __originalCode, input: __input, tool_state: __recordedOperations() },
+        logs: { stdout: __stdoutText, stderr: __stderrText, log_positions: __logPositions() },
       }
     : {
         type: "code_result",
         stdout: __stdoutText,
         stderr: __stderrText,
         tool_state: __recordedOperations(),
+        log_positions: __logPositions(),
         result: __collected,
       };
   return __serializeEvaluatorResult(__result);
@@ -1334,6 +1526,40 @@ const RUNTIME_TEMPLATE: &str = r#"
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::tools::external::RuntimeBuiltinToolName;
+
+    fn build_request<'a>(
+        partial_evaluation: &'a PartialEvaluation,
+        tools: &'a [TypeScriptTool],
+        execution_id: &'a str,
+    ) -> EvaluationRequest<'a> {
+        EvaluationRequest {
+            partial_evaluation,
+            tools,
+            execution_id,
+            round: 0,
+            determinism: determinism(),
+            max_program_effects: 128,
+            max_program_operations: 1024,
+            budget_error: None,
+        }
+    }
+
+    fn run_typescript(
+        partial_evaluation: &PartialEvaluation,
+        tools: &[TypeScriptTool],
+        execution_id: &str,
+        determinism: DeterminismContext,
+        max_program_effects: u32,
+        max_program_operations: u32,
+    ) -> Result<TypeScriptRunResult, String> {
+        evaluate(EvaluationRequest {
+            determinism,
+            max_program_effects,
+            max_program_operations,
+            ..build_request(partial_evaluation, tools, execution_id)
+        })
+    }
 
     fn determinism() -> DeterminismContext {
         DeterminismContext {
@@ -1368,6 +1594,7 @@ mod tests {
             description: String::new(),
             input_schema: json!({"type": "object"}),
             output_schema: None,
+            runtime_builtin: None,
         }
     }
 
@@ -1388,7 +1615,9 @@ mod tests {
 
     fn pending(result: TypeScriptRunResult) -> PartialEvaluation {
         match result {
-            TypeScriptRunResult::PartialEvaluation { partial_evaluation } => partial_evaluation,
+            TypeScriptRunResult::PartialEvaluation {
+                partial_evaluation, ..
+            } => partial_evaluation,
             other => panic!("expected a partial evaluation, got {other:?}"),
         }
     }
@@ -1439,6 +1668,7 @@ async function main(): Promise<number> {
             TypeScriptRunResult::CodeResult {
                 stdout: None,
                 stderr: None,
+                log_positions: Vec::new(),
                 tool_state: resolved.tool_state,
                 result: CodeResult::Success { value: json!(7) },
             }
@@ -1474,6 +1704,7 @@ async function main() {{
                 TypeScriptRunResult::CodeResult {
                     stdout: None,
                     stderr: None,
+                    log_positions: Vec::new(),
                     tool_state: resolved.tool_state,
                     result: CodeResult::Success {
                         value: json!("draft-1")
@@ -1562,6 +1793,7 @@ async function main() {
             TypeScriptRunResult::CodeResult {
                 stdout: None,
                 stderr: None,
+                log_positions: Vec::new(),
                 tool_state: Vec::new(),
                 result: CodeResult::Success {
                     value: json!("actual result"),
@@ -1692,6 +1924,42 @@ async function main() {
         assert_eq!(error["name"], "SerializationError");
     }
 
+    /// *Prepare*: A program whose first tool call returned after its time budget ran out.
+    /// *Do*: Evaluate it while it retries fresh steps in a loop and catches every error.
+    /// *Assert*: It stops with the budget error, its output, and its recorded call.
+    #[test]
+    fn a_fresh_step_after_the_time_budget_stops_the_program() {
+        let source = r#"
+async function main() {
+  console.log("before");
+  await tools.test.echo({});
+  while (true) { try { Date.now(); } catch (_) {} }
+}
+"#;
+        let first = pending(run(&partial(source), &[tool("echo")], "run"));
+        let resolved = resolve_all(first, &[json!({"ok": true})]);
+        let budget_error = json!({"name": "ProgramBudgetExceeded", "message": "stopped"});
+
+        let result = evaluate(EvaluationRequest {
+            budget_error: Some(budget_error.clone()),
+            ..build_request(&resolved, &[tool("echo")], "run")
+        })
+        .expect("TypeScript host execution should succeed");
+
+        assert_eq!(
+            result,
+            TypeScriptRunResult::CodeResult {
+                stdout: Some("before".to_string()),
+                stderr: None,
+                log_positions: vec![0],
+                tool_state: resolved.tool_state,
+                result: CodeResult::Error {
+                    error: budget_error
+                },
+            }
+        );
+    }
+
     #[test]
     fn preserves_valid_json_and_unicode_across_the_v8_boundary() {
         let source = r#"
@@ -1742,6 +2010,7 @@ async function main() {
             TypeScriptRunResult::CodeResult {
                 stdout: Some("😀e\u{301}\0\u{8}\t\n\u{c}\r".to_string()),
                 stderr: None,
+                log_positions: vec![0],
                 tool_state: resolved.tool_state,
                 result: CodeResult::Success {
                     value: json!({
@@ -1783,7 +2052,9 @@ async function main(): Promise<number> {{
         for _ in 0..8 {
             let result = run(&evaluation, &tools, "run");
             match result {
-                TypeScriptRunResult::PartialEvaluation { partial_evaluation } => {
+                TypeScriptRunResult::PartialEvaluation {
+                    partial_evaluation, ..
+                } => {
                     for state in &partial_evaluation.tool_state {
                         match state {
                             ToolState::Pending { id, function, .. } => {
@@ -1815,6 +2086,7 @@ async function main(): Promise<number> {{
                     stderr,
                     tool_state,
                     result: CodeResult::Success { value },
+                    ..
                 } => {
                     assert_eq!(stdout, None);
                     assert_eq!(stderr, None);
@@ -2278,6 +2550,7 @@ async function main() {
             TypeScriptRunResult::CodeResult {
                 stdout: None,
                 stderr: None,
+                log_positions: Vec::new(),
                 tool_state: state.tool_state,
                 result: CodeResult::Success {
                     value: json!({"value": captured})
@@ -2452,6 +2725,184 @@ async function main() {
     }
 
     #[test]
+    fn tool_failures_reject_with_tool_error_instances() {
+        let source = r#"
+async function main() {
+  try {
+    await tools.test.failure({ value: 1 });
+    return "unreachable";
+  } catch (error) {
+    return {
+      isToolError: error instanceof ToolError,
+      isError: error instanceof Error,
+      name: error.name,
+      code: error.code,
+      tool: error.tool,
+      message: error.message,
+      details: error.details,
+    };
+  }
+}
+"#;
+        let mut state = pending(run(&partial(source), &[tool("failure")], "run"));
+        let ToolState::Pending { kind, id, function } = state.tool_state.remove(0) else {
+            panic!("expected a pending tool");
+        };
+        state.tool_state.push(ToolState::Rejected {
+            kind,
+            id,
+            function,
+            error: json!({
+                "name": "mcp_tool_execution_failed",
+                "message": "upstream timed out",
+                "details": {"server": "search"},
+            }),
+            content: Vec::new(),
+        });
+
+        let TypeScriptRunResult::CodeResult {
+            result: CodeResult::Success { value },
+            ..
+        } = run(&state, &[tool("failure")], "run")
+        else {
+            panic!("expected the program to catch the tool failure");
+        };
+        assert_eq!(
+            value,
+            json!({
+                "isToolError": true,
+                "isError": true,
+                "name": "ToolError",
+                "code": "mcp_tool_execution_failed",
+                "tool": "tools.test.failure",
+                "message": "upstream timed out",
+                "details": {"server": "search"},
+            })
+        );
+    }
+
+    #[test]
+    fn returned_tool_errors_keep_their_fields() {
+        let source = r#"
+async function main() {
+  const [result] = await Promise.allSettled([tools.test.failure({ value: 1 })]);
+  return result;
+}
+"#;
+        let mut state = pending(run(&partial(source), &[tool("failure")], "run"));
+        let ToolState::Pending { kind, id, function } = state.tool_state.remove(0) else {
+            panic!("expected a pending tool");
+        };
+        state.tool_state.push(ToolState::Rejected {
+            kind,
+            id,
+            function,
+            error: json!({"name": "tool_failed", "message": "disk full"}),
+            content: Vec::new(),
+        });
+
+        let TypeScriptRunResult::CodeResult {
+            result: CodeResult::Success { value },
+            ..
+        } = run(&state, &[tool("failure")], "run")
+        else {
+            panic!("expected the program to return the settled result");
+        };
+        assert_eq!(
+            value,
+            json!({
+                "status": "rejected",
+                "reason": {
+                    "message": "disk full",
+                    "name": "ToolError",
+                    "code": "tool_failed",
+                    "tool": "tools.test.failure",
+                },
+            })
+        );
+    }
+
+    #[test]
+    fn uncaught_tool_failures_keep_their_code() {
+        let source = r#"
+async function main() {
+  await tools.test.failure({ value: 1 });
+}
+"#;
+        let mut state = pending(run(&partial(source), &[tool("failure")], "run"));
+        let ToolState::Pending { kind, id, function } = state.tool_state.remove(0) else {
+            panic!("expected a pending tool");
+        };
+        state.tool_state.push(ToolState::Rejected {
+            kind,
+            id,
+            function,
+            error: json!({
+                "name": "permission_denied",
+                "message": "denied by policy",
+                "structuredContent": {"policy": "read-only"},
+            }),
+            content: Vec::new(),
+        });
+
+        let TypeScriptRunResult::CodeResult {
+            result: CodeResult::Error { error },
+            ..
+        } = run(&state, &[tool("failure")], "run")
+        else {
+            panic!("expected an uncaught tool failure");
+        };
+        assert_eq!(error["name"], "ToolError");
+        assert_eq!(error["code"], "permission_denied");
+        assert_eq!(error["tool"], "tools.test.failure");
+        assert_eq!(error["message"], "denied by policy");
+        assert_eq!(error["structuredContent"], json!({"policy": "read-only"}));
+    }
+
+    /// *Prepare*: A checkpoint from before ToolError, whose call failed argument validation.
+    /// *Do*: Replay the program that reads the stored validation report.
+    /// *Assert*: The program sees the report it first saw, so the replay does not diverge.
+    #[test]
+    fn replays_an_older_validation_report_unchanged() {
+        let source = r#"
+async function main() {
+  try {
+    await tools.test.failure({ value: 1 });
+  } catch (error) {
+    return { isToolError: error instanceof ToolError, type: error.type };
+  }
+}
+"#;
+        let mut state = pending(run(&partial(source), &[tool("failure")], "run"));
+        let ToolState::Pending { kind, id, function } = state.tool_state.remove(0) else {
+            panic!("expected a pending tool");
+        };
+        state.tool_state.push(ToolState::Rejected {
+            kind,
+            id,
+            function,
+            error: json!({
+                "type": "jsonSchemaArgumentValidationError",
+                "functionName": "failure",
+                "argumentsValidationErrors": [],
+            }),
+            content: Vec::new(),
+        });
+
+        let TypeScriptRunResult::CodeResult {
+            result: CodeResult::Success { value },
+            ..
+        } = run(&state, &[tool("failure")], "run")
+        else {
+            panic!("expected the program to catch the stored report");
+        };
+        assert_eq!(
+            value,
+            json!({"isToolError": false, "type": "jsonSchemaArgumentValidationError"})
+        );
+    }
+
+    #[test]
     fn validates_tool_arguments_before_emitting_external_calls() {
         let source = r#"
 async function main() {
@@ -2476,11 +2927,21 @@ async function main() {
             panic!("expected invalid arguments to fail inside run_typescript");
         };
 
-        assert_eq!(error["type"], "jsonSchemaArgumentValidationError");
-        assert_eq!(error["functionName"], "search");
-        assert_eq!(error["argumentsValidationErrors"][0]["keyword"], "required");
+        assert_eq!(error["name"], "ToolError");
+        assert_eq!(error["code"], "invalid_arguments");
         assert_eq!(
-            error["argumentsValidationErrors"][0]["params"]["missingProperty"],
+            error["message"],
+            "Invalid arguments for tools.test.search: \"query\" is a required property"
+        );
+        let details = &error["details"];
+        assert_eq!(details["type"], "jsonSchemaArgumentValidationError");
+        assert_eq!(details["functionName"], "search");
+        assert_eq!(
+            details["argumentsValidationErrors"][0]["keyword"],
+            "required"
+        );
+        assert_eq!(
+            details["argumentsValidationErrors"][0]["params"]["missingProperty"],
             "query"
         );
         assert!(matches!(
@@ -2489,6 +2950,71 @@ async function main() {
                 kind: ToolKind::External,
                 ..
             }]
+        ));
+    }
+
+    ///
+    /// *Prepare*: The bash tool as Core gives it to programs, under a Host maximum of 300 s.
+    /// *Do*: Run a program that calls it with `timeout_seconds` 301, then one with 300.
+    /// *Assert*: 301 is rejected inside `run_typescript`, naming the maximum, before any
+    /// external call; 300 becomes a pending call.
+    ///
+    #[test]
+    fn a_program_bash_call_above_the_host_maximum_is_rejected() {
+        // Prepare
+        let config = crate::core::testing::config();
+        let max_seconds = config.settings.tools.bash_timeout.unwrap().max_seconds;
+        let tools = crate::core::tools::resolved::ResolvedTools::compile(&config).unwrap();
+        let bash = tools
+            .program_descriptors()
+            .iter()
+            .find(|tool| {
+                tool.programmatic_name.namespace == "file_system"
+                    && tool.programmatic_name.name == "bash"
+            })
+            .unwrap();
+        let call = |seconds: u64| {
+            format!(
+                "async function main() {{\n  return await tools.file_system.bash({{ command: \"ls\", timeout_seconds: {seconds} }});\n}}\n"
+            )
+        };
+
+        // Do
+        let above = run(
+            &partial(&call(max_seconds + 1)),
+            std::slice::from_ref(bash),
+            "above",
+        );
+        let at = run(
+            &partial(&call(max_seconds)),
+            std::slice::from_ref(bash),
+            "at",
+        );
+
+        // Assert
+        let TypeScriptRunResult::CodeResult {
+            result: CodeResult::Error { error },
+            tool_state,
+            ..
+        } = above
+        else {
+            panic!("expected a timeout above the maximum to fail inside run_typescript");
+        };
+        assert_eq!(error["code"], "invalid_arguments");
+        let details = &error["details"];
+        assert_eq!(details["type"], "jsonSchemaArgumentValidationError");
+        assert_eq!(
+            details["argumentsValidationErrors"][0]["keyword"],
+            "maximum"
+        );
+        assert!(matches!(
+            tool_state.as_slice(),
+            [ToolState::Rejected { .. }]
+        ));
+        let partial_evaluation = pending(at);
+        assert!(matches!(
+            partial_evaluation.tool_state.as_slice(),
+            [ToolState::Pending { .. }]
         ));
     }
 
@@ -2518,7 +3044,9 @@ async function main() {
         else {
             panic!("expected invalid arguments to fail inside run_typescript");
         };
-        let errors = error["argumentsValidationErrors"].as_array().unwrap();
+        let errors = error["details"]["argumentsValidationErrors"]
+            .as_array()
+            .unwrap();
         assert_eq!(errors.len(), 1);
         assert_eq!(errors[0]["keyword"], "required");
         assert_eq!(errors[0]["params"]["missingProperty"], "limit");
@@ -2536,7 +3064,11 @@ async function main() {
         else {
             panic!("expected minLength validation to fail inside run_typescript");
         };
-        let error = &error["argumentsValidationErrors"][0];
+        assert_eq!(
+            error["message"],
+            "Invalid arguments for tools.test.search: at /query: \"\" is shorter than 1 character"
+        );
+        let error = &error["details"]["argumentsValidationErrors"][0];
         assert_eq!(error["keyword"], "minLength");
         assert_eq!(error["params"]["limit"], 1);
         assert_eq!(error["message"], "must NOT have fewer than 1 characters");
@@ -2566,10 +3098,45 @@ async function main() {
         else {
             panic!("expected non-object arguments to fail validation");
         };
-        let error = &error["argumentsValidationErrors"][0];
+        assert_eq!(
+            error["message"],
+            "Invalid arguments for tools.test.search: \"hello\" is not of type \"object\""
+        );
+        let error = &error["details"]["argumentsValidationErrors"][0];
         assert_eq!(error["keyword"], "type");
         assert_eq!(error["params"]["type"], "object");
         assert_eq!(error["message"], "must be object");
+        assert!(matches!(
+            tool_state.as_slice(),
+            [ToolState::Rejected { .. }]
+        ));
+    }
+
+    #[test]
+    fn non_object_tool_arguments_are_rejected_without_an_object_schema() {
+        let source = r#"
+async function main() {
+  return await tools.test.echo("hello");
+}
+"#;
+        let echo = tool_with_schema("echo", json!({}));
+
+        let TypeScriptRunResult::CodeResult {
+            result: CodeResult::Error { error },
+            tool_state,
+            ..
+        } = run(&partial(source), &[echo], "run")
+        else {
+            panic!("expected non-object arguments to fail validation");
+        };
+        assert_eq!(
+            error["message"],
+            "Invalid arguments for tools.test.echo: \"hello\" is not of type \"object\""
+        );
+        assert_eq!(
+            error["details"]["argumentsValidationErrors"][0]["keyword"],
+            "type"
+        );
         assert!(matches!(
             tool_state.as_slice(),
             [ToolState::Rejected { .. }]
@@ -2602,13 +3169,12 @@ async function main() {
         };
 
         assert_eq!(
-            error["argumentsValidationErrors"][0]["keyword"],
-            "additionalProperties"
+            error["message"],
+            "Invalid arguments for tools.test.search: Additional properties are not allowed ('max_results' was unexpected). Allowed fields: query."
         );
-        assert_eq!(
-            error["argumentsValidationErrors"][0]["params"]["additionalProperty"],
-            "max_results"
-        );
+        let errors = &error["details"]["argumentsValidationErrors"];
+        assert_eq!(errors[0]["keyword"], "additionalProperties");
+        assert_eq!(errors[0]["params"]["additionalProperty"], "max_results");
     }
 
     #[test]
@@ -2619,7 +3185,15 @@ async function main() {
     await tools.test.search({});
     return "unexpected";
   } catch (error) {
-    return error.type;
+    return {
+      isToolError: error instanceof ToolError,
+      isError: error instanceof Error,
+      name: error.name,
+      code: error.code,
+      tool: error.tool,
+      message: error.message,
+      type: error.details.type,
+    };
   }
 }
 "#;
@@ -2638,8 +3212,89 @@ async function main() {
                 result: CodeResult::Success { value },
                 tool_state,
                 ..
-            } if value == json!("jsonSchemaArgumentValidationError")
+            } if value == json!({
+                "isToolError": true,
+                "isError": true,
+                "name": "ToolError",
+                "code": "invalid_arguments",
+                "tool": "tools.test.search",
+                "message": "Invalid arguments for tools.test.search: \"query\" is a required property",
+                "type": "jsonSchemaArgumentValidationError",
+            })
                 && matches!(tool_state.as_slice(), [ToolState::Rejected { .. }])
+        ));
+    }
+
+    #[test]
+    fn a_built_in_tools_worded_schema_error_reaches_the_program_as_is() {
+        let source = r#"
+async function main() {
+  try {
+    await tools.test.spawn({ name: "a/b", message: "hi" });
+    return "unexpected";
+  } catch (error) {
+    return { code: error.code, message: error.message };
+  }
+}
+"#;
+        let spawn = TypeScriptTool {
+            runtime_builtin: Some(RuntimeBuiltinToolName::SubagentSpawn),
+            ..tool_with_schema(
+                "spawn",
+                json!({
+                    "type": "object",
+                    "properties": {
+                        "name": {"type": "string", "pattern": "^(?!\\.{1,2}$)[^/]+$"},
+                        "message": {"type": "string"},
+                    },
+                }),
+            )
+        };
+
+        assert!(matches!(
+            run(&partial(source), &[spawn], "run"),
+            TypeScriptRunResult::CodeResult {
+                result: CodeResult::Success { value },
+                ..
+            } if value == json!({
+                "code": "invalid_arguments",
+                "message": "Invalid arguments for tools.test.spawn: at /name: \"a/b\" is not a valid \
+                    name: use one path segment, without `/`, other than `.` or `..`",
+            })
+        ));
+    }
+
+    #[test]
+    fn a_program_call_is_checked_against_the_full_schema() {
+        let source = r#"
+async function main() {
+  try {
+    await tools.test.pick({ count: "two" });
+    return "unexpected";
+  } catch (error) {
+    return { code: error.code, message: error.message };
+  }
+}
+"#;
+        // The reference into `definitions` is followed.
+        let pick = tool_with_schema(
+            "pick",
+            json!({
+                "type": "object",
+                "properties": {"count": {"$ref": "#/definitions/count"}},
+                "definitions": {"count": {"type": "integer"}},
+            }),
+        );
+
+        assert!(matches!(
+            run(&partial(source), &[pick], "run"),
+            TypeScriptRunResult::CodeResult {
+                result: CodeResult::Success { value },
+                ..
+            } if value == json!({
+                "code": "invalid_arguments",
+                "message": "Invalid arguments for tools.test.pick: at /count: \"two\" is not of type \"integer\"",
+            })
         ));
     }
 
@@ -2711,6 +3366,215 @@ async function main() {
             panic!("expected a pending replacement call");
         };
         assert_eq!(function.name, "right");
+    }
+
+    /// Evaluates `source` round by round as the host does, resolving every
+    /// pending call with `{"ok": true}`. With `replace`, the recorded operation
+    /// at that index gets another tool name after the first round, so the next
+    /// round takes a different path at that operation. Returns every dispatched
+    /// call and the result.
+    fn run_rounds(
+        source: &str,
+        tools: &[TypeScriptTool],
+        max_program_effects: u32,
+        replace: Option<usize>,
+    ) -> (Vec<String>, TypeScriptRunResult) {
+        let mut state = partial(source);
+        let mut dispatched = Vec::new();
+        for round in 0..=max_program_effects + 1 {
+            let result = evaluate(EvaluationRequest {
+                round,
+                max_program_effects,
+                ..build_request(&state, tools, &format!("run:{round}"))
+            })
+            .expect("TypeScript host execution should succeed");
+            let TypeScriptRunResult::PartialEvaluation {
+                partial_evaluation, ..
+            } = result
+            else {
+                return (dispatched, result);
+            };
+            let pending = partial_evaluation
+                .tool_state
+                .iter()
+                .filter_map(|state| match state {
+                    ToolState::Pending { function, .. } => Some(function.name.clone()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            let values = vec![json!({"ok": true}); pending.len()];
+            dispatched.extend(pending);
+            state = resolve_all(partial_evaluation, &values);
+            if let Some(index) = replace.filter(|_| round == 0) {
+                let (ToolState::Resolved { function, .. }
+                | ToolState::Rejected { function, .. }
+                | ToolState::Pending { function, .. }) = &mut state.tool_state[index];
+                function.name = "replaced".to_string();
+            }
+        }
+        panic!("program did not finish within its effect limit");
+    }
+
+    #[test]
+    fn a_rejected_call_before_a_real_call_does_not_repeat_the_real_call() {
+        let lookup = tool("lookup");
+        let search = tool_with_schema(
+            "search",
+            json!({
+                "type": "object",
+                "properties": {"query": {"type": "string"}},
+                "required": ["query"]
+            }),
+        );
+        for rejected_call in [
+            "tools.agent.list({})",
+            "tools.test.lookup({ value: 1n })",
+            "tools.test.search({})",
+            "step(() => tools.test.lookup({}))",
+            "tools.test.lookup(\"x\")",
+            "tools.test.lookup(\"\")",
+            "tools.test.lookup(0)",
+            "tools.test.lookup(false)",
+        ] {
+            let source = format!(
+                r#"
+async function main() {{
+  let rejected = false;
+  try {{ await {rejected_call}; }} catch {{ rejected = true; }}
+  const result = await tools.test.lookup({{}});
+  return {{ rejected, result }};
+}}
+"#
+            );
+
+            let (dispatched, result) =
+                run_rounds(&source, &[lookup.clone(), search.clone()], 128, None);
+
+            assert_eq!(dispatched, ["lookup"], "{rejected_call}");
+            let TypeScriptRunResult::CodeResult {
+                result: CodeResult::Success { value },
+                ..
+            } = result
+            else {
+                panic!("expected {rejected_call} program to return, got {result:?}");
+            };
+            assert_eq!(
+                value,
+                json!({"rejected": true, "result": {"ok": true}}),
+                "{rejected_call}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_round_that_does_not_replay_the_last_sent_call_stops_without_sending_it_again() {
+        let source = r#"
+async function main() {
+  try {
+    return await tools.test.lookup({});
+  } catch (error) {
+    return "caught";
+  }
+}
+"#;
+
+        let (dispatched, result) = run_rounds(source, &[tool("lookup")], 128, Some(0));
+
+        assert_eq!(dispatched, ["lookup"]);
+        let TypeScriptRunResult::CodeResult {
+            result: CodeResult::Error { error },
+            ..
+        } = result
+        else {
+            panic!("expected the program to stop, got {result:?}");
+        };
+        assert_eq!(error["name"], "ProgramReplayDiverged");
+        assert!(
+            error["message"]
+                .as_str()
+                .unwrap()
+                .contains("last tool calls already ran")
+        );
+    }
+
+    #[test]
+    fn a_round_that_replays_the_last_sent_call_may_take_a_new_path_after_it() {
+        let source = r#"
+async function main() {
+  const [first, second] = await Promise.all([tools.test.first({}), tools.test.second({})]);
+  return { first, second };
+}
+"#;
+
+        let (dispatched, result) =
+            run_rounds(source, &[tool("first"), tool("second")], 128, Some(1));
+
+        assert_eq!(dispatched, ["first", "second", "second"]);
+        let TypeScriptRunResult::CodeResult {
+            result: CodeResult::Success { value },
+            ..
+        } = result
+        else {
+            panic!("expected the program to return, got {result:?}");
+        };
+        assert_eq!(
+            value,
+            json!({"first": {"ok": true}, "second": {"ok": true}})
+        );
+    }
+
+    #[test]
+    fn earlier_rounds_count_toward_the_effect_limit_of_new_calls() {
+        let source = r#"
+async function main() {
+  return await tools.test.lookup({});
+}
+"#;
+        let state = partial(source);
+
+        let result = evaluate(EvaluationRequest {
+            round: 3,
+            max_program_effects: 3,
+            ..build_request(&state, &[tool("lookup")], "run:3")
+        })
+        .expect("TypeScript host execution should succeed");
+
+        let TypeScriptRunResult::CodeResult {
+            result: CodeResult::Error { error },
+            ..
+        } = result
+        else {
+            panic!("expected the effect limit to end the program, got {result:?}");
+        };
+        assert_eq!(
+            error["message"],
+            "run_typescript exceeded maxProgramEffects (3)."
+        );
+    }
+
+    #[test]
+    fn earlier_rounds_do_not_reduce_the_effects_of_a_replaying_program() {
+        let source = r#"
+async function main() {
+  const results = [];
+  for (let index = 0; index < 3; index += 1) {
+    results.push(await tools.test.lookup({ index }));
+  }
+  return results.length;
+}
+"#;
+
+        let (dispatched, result) = run_rounds(source, &[tool("lookup")], 3, None);
+
+        assert_eq!(dispatched, ["lookup", "lookup", "lookup"]);
+        let TypeScriptRunResult::CodeResult {
+            result: CodeResult::Success { value },
+            ..
+        } = result
+        else {
+            panic!("expected the program to return, got {result:?}");
+        };
+        assert_eq!(value, json!(3));
     }
 
     #[test]
@@ -2799,6 +3663,7 @@ async function main() {
             TypeScriptRunResult::CodeResult {
                 stdout: None,
                 stderr: None,
+                log_positions: Vec::new(),
                 tool_state,
                 result: CodeResult::Success { value },
             }
@@ -2904,6 +3769,7 @@ async function main() {
             TypeScriptRunResult::CodeResult {
                 stdout: None,
                 stderr: None,
+                log_positions: Vec::new(),
                 tool_state,
                 result: CodeResult::Success { value },
             }
@@ -2974,6 +3840,7 @@ async function main() {
             TypeScriptRunResult::CodeResult {
                 stdout: None,
                 stderr: None,
+                log_positions: Vec::new(),
                 tool_state,
                 result: CodeResult::Success { value },
             }
@@ -3288,6 +4155,7 @@ async function main() {
             TypeScriptRunResult::CodeResult {
                 stdout: None,
                 stderr: None,
+                log_positions: Vec::new(),
                 tool_state,
                 result: CodeResult::Success { value },
             }
@@ -3431,12 +4299,11 @@ async function main() {
         assert!(matches!(syntax, TypeScriptRunResult::Error { .. }));
 
         let timeout = run_typescript_with_timeout(
-            &partial("async function main() { while (true) {} }"),
-            &[],
-            "run",
-            determinism(),
-            128,
-            1024,
+            build_request(
+                &partial("async function main() { while (true) {} }"),
+                &[],
+                "run",
+            ),
             Duration::from_millis(25),
         );
         assert_eq!(
@@ -3487,12 +4354,7 @@ async function main() {
 
         // Do
         let result = run_typescript_with_timeout(
-            &memory_exhausting_program,
-            &[],
-            "run",
-            determinism(),
-            128,
-            1024,
+            build_request(&memory_exhausting_program, &[], "run"),
             Duration::from_secs(2),
         );
         let subsequent_result = run(
@@ -3507,6 +4369,7 @@ async function main() {
             TypeScriptRunResult::CodeResult {
                 stdout: None,
                 stderr: None,
+                log_positions: Vec::new(),
                 tool_state: Vec::new(),
                 result: CodeResult::Error {
                     error: json!({
@@ -3581,12 +4444,8 @@ async function main() {
         );
         let source = build_source(
             &replay,
-            &tools,
-            "fetch",
+            &build_request(&replay, &tools, "fetch"),
             &transpile(&replay.code).unwrap(),
-            determinism(),
-            128,
-            1024,
         )
         .unwrap();
         assert!(

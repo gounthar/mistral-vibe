@@ -10,7 +10,7 @@ from e2e.app_server.events import (
     user_msg,
     write_file,
 )
-from e2e.app_server.scenario import Timeline
+from e2e.app_server.scenario import Timeline, take_snapshot
 
 _PROMPT = "edit then write"
 
@@ -31,9 +31,10 @@ timeline: Timeline = [
     write_file("greet.py", _CONTENT),
     assistant_msg("Done."),
     turn_completed(),
-    _click(15),
-    _click(16),
-    _click(21),
-    _click(16),
+    _click(11),
+    _click(12),
     _click(17),
+    _click(12),
+    _click(13),
+    take_snapshot(),
 ]

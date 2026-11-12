@@ -70,18 +70,14 @@ fn has_body_counts_output_fallback_text_and_warnings() {
 }
 
 #[test]
-fn body_renders_error_reason_and_output_text_fallback() {
-    let base = json!({"kind": "shell", "display": {"verb": "Ran"}});
-    let effect = |state: Value| effect(json!({"detail": base, "state": state}));
-
-    let failed = effect(json!({"status": "failed", "error": {"message": "boom"}}));
-    assert_eq!(body(&failed), ["Error: boom"]);
-
-    let skipped = effect(json!({"status": "skipped", "reason": "hook deny"}));
-    assert_eq!(body(&skipped), ["Skipped: hook deny"]);
-
-    let fallback = effect(json!({"status": "completed", "outputText": "deny reason"}));
-    assert_eq!(body(&fallback), ["deny reason"]);
+fn agent_tools_count_as_subagent_effects_under_both_namespaces() {
+    // `subagent.` is the deprecated pre-rename prefix of `agents.`.
+    for tool_name in ["agents.send_message", "subagent.send_message"] {
+        let entry = effect(json!({"detail": {"kind": "tool", "toolName": tool_name}}));
+        assert!(entry.is_subagent(), "{tool_name} is a subagent effect");
+    }
+    let other = effect(json!({"detail": {"kind": "tool", "toolName": "agentsx.read"}}));
+    assert!(!other.is_subagent());
 }
 
 #[test]
@@ -135,4 +131,20 @@ fn subagent_body_keeps_status_paths_and_generic_output() {
         json!({"status": "completed", "output": {"type": "success"}}),
     );
     assert_eq!(body(&wait_ok), ["type: success"]);
+}
+
+#[test]
+fn a_huge_failed_tool_error_body_is_capped() {
+    use vibe_rs::utils::text::{MESSAGE_MAX_CHARS, MESSAGE_TRUNCATION_MARKER};
+    let failed = effect(json!({
+        "detail": {"kind": "tool", "toolName": "file_system.read_file"},
+        "state": {"status": "failed", "error": {"message": "A".repeat(1_200_000)}}
+    }));
+    assert_eq!(
+        body(&failed),
+        [format!(
+            "Error: {}{MESSAGE_TRUNCATION_MARKER}",
+            "A".repeat(MESSAGE_MAX_CHARS)
+        )]
+    );
 }

@@ -12,8 +12,6 @@ from e2e.app_server.events import (
 )
 from e2e.app_server.scenario import Timeline
 
-env = {"VIBE_REPLAY_SETTLE_BUSY": "1"}
-
 _REPLACE = "session/turn/queue/replace"
 _UP = "\x1b[A"
 
@@ -21,9 +19,7 @@ _promoted = turn_started()
 _promoted["params"]["turn"]["queueItemId"] = queued_turn(2)["id"]
 
 on_request = {_REPLACE: [_promoted, turn_queue_updated()]}
-screen_contains = {"python": ("second edited",), "rust": ("second edited",)}
-capture_steps = {7}
-settle_per_key = True
+screen_contains = ("second edited",)
 
 timeline: Timeline = [
     "first\r",

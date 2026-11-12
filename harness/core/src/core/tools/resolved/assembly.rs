@@ -3,7 +3,7 @@
 
 use std::collections::BTreeSet;
 
-use crate::core::config::HarnessConfig;
+use crate::core::config::{HarnessConfig, ImageDeliveryMode};
 use crate::core::features::background_processes;
 use crate::core::features::file_system;
 use crate::core::features::programmatic_tool_calling::{ProgrammaticName, TypeScriptTool};
@@ -25,7 +25,7 @@ pub(crate) struct ToolBinding {
 }
 
 pub(crate) fn direct_routes(config: &HarnessConfig) -> Vec<(String, ToolTarget)> {
-    let mut routes = file_system::tools(config.settings.tools.command_environment)
+    let mut routes = file_system_specs(config)
         .into_iter()
         .map(|spec| {
             (
@@ -36,13 +36,23 @@ pub(crate) fn direct_routes(config: &HarnessConfig) -> Vec<(String, ToolTarget)>
             )
         })
         .collect::<Vec<_>>();
-    let skill_name = skills::ToolName::Read;
-    routes.push((
-        skill_name.direct_name().to_string(),
-        ToolTarget::RuntimeBuiltin {
-            name: skill_name.runtime_tool(),
-        },
-    ));
+    if crate::core::features::model_wait::is_offered(&config.settings.tools) {
+        routes.push((
+            "wait".to_string(),
+            ToolTarget::RuntimeBuiltin {
+                name: crate::core::tools::external::RuntimeBuiltinToolName::SelfWait,
+            },
+        ));
+    }
+    if !config.settings.tools.skills.is_disabled() {
+        let skill_name = skills::ToolName::Read;
+        routes.push((
+            skill_name.direct_name().to_string(),
+            ToolTarget::RuntimeBuiltin {
+                name: skill_name.runtime_tool(),
+            },
+        ));
+    }
     routes.extend(config.tool_groups().flat_map(|group| {
         group
             .tools
@@ -50,7 +60,7 @@ pub(crate) fn direct_routes(config: &HarnessConfig) -> Vec<(String, ToolTarget)>
             .filter(|tool| tool.exposure.is_direct())
             .map(|tool| {
                 (
-                    tool.name.clone(),
+                    tool.direct_function_name().to_string(),
                     ToolTarget::Provided {
                         group_name: group.name.clone(),
                         tool_name: tool.name.clone(),
@@ -61,8 +71,59 @@ pub(crate) fn direct_routes(config: &HarnessConfig) -> Vec<(String, ToolTarget)>
     routes
 }
 
-fn filesystem_tools(environment: CommandEnvironment) -> Vec<ToolBinding> {
-    file_system::tools(environment)
+/// The file system tool specs the Session exposes, or none when disabled.
+fn file_system_specs(config: &HarnessConfig) -> Vec<file_system::ToolSpec> {
+    if !config.settings.tools.file_system.is_enabled() {
+        return Vec::new();
+    }
+    file_system::exposed_tools(
+        config.settings.tools.command_environment,
+        bash_timeout(config),
+        config.settings.tools.background_processes.is_enabled(),
+        direct_read_file_support(config),
+        file_system::Exposure::Direct,
+    )
+}
+
+pub(super) fn bash_timeout(config: &HarnessConfig) -> file_system::BashTimeout {
+    file_system::BashTimeout::from_settings(config.settings.tools.bash_timeout.as_ref())
+}
+
+/// A model without image input would only receive `[Image]`, so the direct
+/// `read_file` description leaves the `native` image sentence out for it.
+fn direct_read_file_support(config: &HarnessConfig) -> file_system::ReadFileSupport {
+    let support = config.settings.tools.file_system.read_file();
+    let shows_images =
+        config.settings.context.effective_image_delivery().agent == ImageDeliveryMode::Native;
+    if support.images == file_system::ReadFileImages::Native && !shows_images {
+        return file_system::ReadFileSupport {
+            images: file_system::ReadFileImages::Unsupported,
+            ..support
+        };
+    }
+    support
+}
+
+fn session_filesystem_tools(config: &HarnessConfig) -> Vec<ToolBinding> {
+    if !config.settings.tools.file_system.is_enabled() {
+        return Vec::new();
+    }
+    filesystem_tools(
+        config.settings.tools.command_environment,
+        bash_timeout(config),
+        config.settings.tools.background_processes.is_enabled(),
+        direct_read_file_support(config),
+    )
+}
+
+fn filesystem_tools(
+    environment: CommandEnvironment,
+    timeout: file_system::BashTimeout,
+    background: bool,
+    read_file: file_system::ReadFileSupport,
+) -> Vec<ToolBinding> {
+    let exposure = file_system::Exposure::Direct;
+    file_system::exposed_tools(environment, timeout, background, read_file, exposure)
         .into_iter()
         .map(|spec| {
             let name = spec.direct_name;
@@ -73,9 +134,10 @@ fn filesystem_tools(environment: CommandEnvironment) -> Vec<ToolBinding> {
                         namespace: file_system::NAMESPACE.to_string(),
                         name: name.to_string(),
                     },
-                    description: spec.description.to_string(),
+                    description: spec.description,
                     input_schema: spec.input_schema,
                     output_schema: Some(spec.output_schema),
+                    runtime_builtin: Some(spec.name.runtime_tool()),
                 },
                 target: ToolTarget::RuntimeBuiltin {
                     name: spec.name.runtime_tool(),
@@ -85,9 +147,10 @@ fn filesystem_tools(environment: CommandEnvironment) -> Vec<ToolBinding> {
         .collect()
 }
 
-fn subagent_tools() -> Vec<ToolBinding> {
-    subagents::tools()
+fn subagent_tools(mode: &subagents::Mode, prompts: &subagents::Prompts) -> Vec<ToolBinding> {
+    subagents::tools(mode.supports_conversation_forking(), prompts)
         .into_iter()
+        .filter(|spec| mode.supports(spec.name))
         .map(|spec| ToolBinding {
             descriptor: TypeScriptTool {
                 name: spec.name.sandbox_name().to_string(),
@@ -98,6 +161,7 @@ fn subagent_tools() -> Vec<ToolBinding> {
                 description: spec.description.to_string(),
                 input_schema: spec.input_schema,
                 output_schema: Some(spec.output_schema),
+                runtime_builtin: Some(spec.name.runtime_tool()),
             },
             target: ToolTarget::RuntimeBuiltin {
                 name: spec.name.runtime_tool(),
@@ -119,6 +183,7 @@ fn background_process_tools() -> Vec<ToolBinding> {
                 description: spec.description.to_string(),
                 input_schema: spec.input_schema,
                 output_schema: Some(spec.output_schema),
+                runtime_builtin: Some(spec.name.runtime_tool()),
             },
             target: ToolTarget::RuntimeBuiltin {
                 name: spec.name.runtime_tool(),
@@ -139,6 +204,7 @@ fn skill_tool() -> ToolBinding {
             description: spec.description.to_string(),
             input_schema: spec.input_schema,
             output_schema: Some(spec.output_schema),
+            runtime_builtin: Some(spec.name.runtime_tool()),
         },
         target: ToolTarget::RuntimeBuiltin {
             name: spec.name.runtime_tool(),
@@ -146,10 +212,16 @@ fn skill_tool() -> ToolBinding {
     }
 }
 
-pub(crate) fn direct_tools(config: &HarnessConfig) -> Vec<ToolDefinition> {
+pub(crate) fn builtin_direct_tools(config: &HarnessConfig) -> Vec<ToolDefinition> {
     let mut tools = Vec::new();
+    if crate::core::features::model_wait::is_offered(&config.settings.tools) {
+        tools.push(crate::core::features::model_wait::tool(
+            config.settings.tools.max_wait_ms,
+            &config.settings.prompts.wait_description,
+        ));
+    }
     tools.extend(
-        filesystem_tools(config.settings.tools.command_environment)
+        session_filesystem_tools(config)
             .into_iter()
             .map(|tool| ToolDefinition {
                 name: tool.descriptor.name,
@@ -157,24 +229,13 @@ pub(crate) fn direct_tools(config: &HarnessConfig) -> Vec<ToolDefinition> {
                 parameters: tool.descriptor.input_schema,
             }),
     );
-    if let Some(spec) = skills::direct_tool(config.skills()) {
+    if let Some(spec) = skills::direct_tool(config.settings.tools.skills, config.skills()) {
         tools.push(ToolDefinition {
             name: spec.name.direct_name().to_string(),
             description: spec.description.to_string(),
             parameters: spec.input_schema,
         });
     }
-    tools.extend(config.tool_groups().flat_map(|group| {
-        group
-            .tools
-            .iter()
-            .filter(|tool| tool.exposure.is_direct())
-            .map(|tool| ToolDefinition {
-                name: tool.name.clone(),
-                description: tool.description.clone(),
-                parameters: tool.input_schema.clone(),
-            })
-    }));
     tools
 }
 
@@ -186,33 +247,55 @@ pub(crate) const RESERVED_TOOL_NAMESPACES: [&str; 5] = [
     subagents::NAMESPACE,
 ];
 
-pub(crate) fn is_reserved_direct_name(environment: CommandEnvironment, name: &str) -> bool {
+/// Direct names a caller tool cannot take. `skill` stays free while skills are disabled, so a
+/// caller can declare its own; a Session that may gain skills later keeps it reserved.
+pub(crate) fn is_reserved_direct_name(
+    environment: CommandEnvironment,
+    skill_mode: skills::Mode,
+    name: &str,
+) -> bool {
     file_system::is_direct_name(environment, name)
         || background_processes::is_sandbox_name(name)
-        || skills::is_direct_name(name)
+        || (!skill_mode.is_disabled() && skills::is_direct_name(name))
         || name == "sleep"
+        || name == "wait"
 }
 
 /// Hookable tool identities used by Runtime hook-selector planning.
 ///
 /// Feature modules remain the source of built-in identities and availability.
 pub(crate) fn hook_tool_catalog(config: &HarnessConfig) -> Vec<HookToolKey> {
-    let mut tools = filesystem_tools(config.settings.tools.command_environment);
-    tools.extend(self_tools());
-    // Unconditional, unlike the model-facing list: skills have no enable/disable setting,
-    // and a hook scoped to `skill` must not disappear from the catalogue just because the
-    // project has not declared a skill yet.
-    tools.push(skill_tool());
+    let mut tools = session_filesystem_tools(config);
+    if config.settings.tools.programmatic.offers_sleep() {
+        tools.extend(self_tools(config.settings.tools.programmatic.max_sleep_ms));
+    }
+    // Present unless skills are disabled, unlike the model-facing list: a hook scoped to
+    // `skill` must not disappear from the catalogue just because the project has not
+    // declared a skill yet.
+    if !config.settings.tools.skills.is_disabled() {
+        tools.push(skill_tool());
+    }
     if config.settings.tools.background_processes.is_enabled() {
         tools.extend(background_process_tools());
     }
     if config.settings.tools.subagents.is_enabled() {
-        tools.extend(subagent_tools());
+        tools.extend(subagent_tools(
+            &config.settings.tools.subagents,
+            &config.settings.prompts.agent_tools,
+        ));
     }
     let mut keys = tools
         .into_iter()
         .map(|tool| tool.target.hook_tool_key())
         .collect::<BTreeSet<_>>();
+    if crate::core::features::model_wait::is_offered(&config.settings.tools) {
+        keys.insert(
+            ToolTarget::RuntimeBuiltin {
+                name: crate::core::tools::external::RuntimeBuiltinToolName::SelfWait,
+            }
+            .hook_tool_key(),
+        );
+    }
     keys.extend(config.tool_groups().flat_map(|group| {
         group.tools.iter().map(|tool| HookToolKey {
             target: HookToolTarget::Provided,
@@ -222,9 +305,19 @@ pub(crate) fn hook_tool_catalog(config: &HarnessConfig) -> Vec<HookToolKey> {
     keys.into_iter().collect()
 }
 
-pub(super) fn non_filesystem_runtime_builtin_tools() -> Vec<ToolBinding> {
-    let mut tools = subagent_tools();
-    tools.extend(self_tools());
+/// Every built-in except the file system ones. Subagent tools are listed even
+/// when the session has them off; `conversation_forking` follows the session,
+/// so a pre-tool hook's result is checked against the spawn schema the model
+/// was offered.
+pub(super) fn non_filesystem_runtime_builtin_tools(
+    max_sleep_ms: u64,
+    conversation_forking: bool,
+) -> Vec<ToolBinding> {
+    let mut tools = subagent_tools(
+        &subagents::Mode::enabled().with_conversation_forking(conversation_forking),
+        &crate::core::prompt::PromptSettings::default().agent_tools,
+    );
+    tools.extend(self_tools(max_sleep_ms));
     tools.push(skill_tool());
     tools.extend(background_process_tools());
     tools
@@ -248,7 +341,7 @@ mod tests {
     #[test]
     fn edit_direct_tool_exposes_exact_argument_guidance() {
         // Prepare
-        let tools = direct_tools(&config());
+        let tools = builtin_direct_tools(&config());
 
         // Do
         let tool = tools
@@ -261,7 +354,7 @@ mod tests {
             tool.description,
             r#"Exact string replacement in a file.
 
-Read the current file first. `old_string` must match exactly, including whitespace, indentation, and line endings. With `replace_all=false` (the default), `old_string` must occur exactly once; set `replace_all=true` only to replace every occurrence. If an edit fails, re-read the file before retrying.
+Read the current file first. `old_string` must match exactly, including whitespace and indentation. Line endings don't need to match: the file keeps its own. With `replace_all=false` (the default), `old_string` must occur exactly once; set `replace_all=true` only to replace every occurrence. If an edit fails, re-read the file before retrying.
 
 Example:
 {"file_path":"src/config.ts","old_string":"const mode = \"old\";","new_string":"const mode = \"new\";","replace_all":false}"#
@@ -276,7 +369,7 @@ Example:
         );
         assert_eq!(
             tool.parameters["properties"]["old_string"]["description"],
-            "Exact text to find, including whitespace, indentation, and line endings. It must occur exactly once unless `replace_all` is true."
+            "Exact text to find, including whitespace and indentation. It must occur exactly once unless `replace_all` is true."
         );
         assert_eq!(
             tool.parameters["properties"]["new_string"]["description"],
@@ -289,15 +382,125 @@ Example:
         assert!(tool.parameters["properties"].get("content").is_none());
     }
 
+    ///
+    /// *Prepare*: A Unix configuration with background processes disabled, then enabled.
+    /// *Do*: Select the model-visible `bash` definition from each.
+    /// *Assert*: Only the enabled configuration tells the model to start long work in
+    /// the background, in the description and in `timeout_seconds`.
+    ///
+    #[test]
+    fn bash_advises_backgrounding_only_when_background_processes_are_enabled() {
+        // Prepare
+        let mut config = config();
+        config.settings.tools.background_processes = BackgroundProcessMode::Disabled;
+        let mut background = config.clone();
+        background.settings.tools.background_processes = BackgroundProcessMode::Enabled;
+
+        // Do
+        let bash = |config: &HarnessConfig| {
+            builtin_direct_tools(config)
+                .into_iter()
+                .find(|tool| tool.name == "bash")
+                .expect("Unix exposes bash")
+        };
+        let (foreground, background) = (bash(&config), bash(&background));
+
+        // Assert
+        for (tool, advised) in [(&foreground, false), (&background, true)] {
+            let timeout = tool.parameters["properties"]["timeout_seconds"]["description"]
+                .as_str()
+                .expect("the timeout is described");
+            assert_eq!(tool.description.contains("tools.process.start"), advised);
+            assert_eq!(timeout.contains("tools.process.start"), advised);
+        }
+    }
+
+    ///
+    /// *Prepare*: Sessions that declare extracted document text with native images, and the
+    /// text found in images alone.
+    /// *Do*: Compile their tools and select the direct `read_file` definition and the
+    /// `tools.file_system.read_file` declaration.
+    /// *Assert*: Each description adds one sentence per declared value, documents first, and
+    /// the declaration a program calls leaves out the native image sentence.
+    ///
+    #[test]
+    fn declared_read_file_support_extends_the_read_file_descriptions() {
+        // Prepare
+        let with_read_file = |read_file: file_system::ReadFileSupport| {
+            let mut config = config();
+            config.settings.tools.file_system = file_system::Mode::Enabled { read_file };
+            config
+        };
+        let documents_and_native_images = with_read_file(file_system::ReadFileSupport {
+            documents: file_system::ReadFileDocuments::ExtractedText,
+            images: file_system::ReadFileImages::Native,
+        });
+        let image_text = with_read_file(file_system::ReadFileSupport {
+            images: file_system::ReadFileImages::ExtractedText,
+            ..Default::default()
+        });
+
+        // Do
+        let descriptions = |config: &HarnessConfig| {
+            let tools = crate::core::tools::resolved::ResolvedTools::compile(config)
+                .expect("the configuration compiles");
+            let direct = tools
+                .top_level_tools()
+                .iter()
+                .find(|tool| tool.name == "read_file")
+                .expect("Core exposes read_file directly")
+                .description
+                .clone();
+            let programmatic = tools
+                .program_descriptors()
+                .iter()
+                .find(|tool| {
+                    tool.programmatic_name.namespace == file_system::NAMESPACE
+                        && tool.programmatic_name.name == "read_file"
+                })
+                .expect("Core declares tools.file_system.read_file")
+                .description
+                .clone();
+            (direct, programmatic)
+        };
+        let documents_and_native_images = descriptions(&documents_and_native_images);
+        let image_text = descriptions(&image_text);
+
+        // Assert
+        let text = "Read a text file with optional zero-indexed line offset and limit. When `was_truncated` is true, read on from `next_offset`. An offset past the end of the file is an error. A directory reads as a listing of its entries, one per line with `/` after each subdirectory, at most 500 at a time.";
+        let documents = "PDF, Word, PowerPoint, and email files return their extracted text.";
+        assert_eq!(
+            documents_and_native_images,
+            (
+                format!("{text} {documents} An image file returns the image itself."),
+                format!("{text} {documents}"),
+            )
+        );
+        let image_text_description =
+            format!("{text} An image file returns only the text found in the image.");
+        assert_eq!(
+            image_text,
+            (image_text_description.clone(), image_text_description)
+        );
+    }
+
     #[test]
     fn builtin_catalog_should_be_covered_by_reserved_tool_namespaces() {
-        let bindings = filesystem_tools(CommandEnvironment::Unix)
-            .into_iter()
-            .chain(self_tools())
-            .chain(std::iter::once(skill_tool()))
-            .chain(background_process_tools())
-            .chain(subagent_tools())
-            .collect::<Vec<_>>();
+        let bindings = filesystem_tools(
+            CommandEnvironment::Unix,
+            file_system::BashTimeout::default(),
+            true,
+            file_system::ReadFileSupport::default(),
+        )
+        .into_iter()
+        .chain(self_tools(30_000))
+        .chain(std::iter::once(skill_tool()))
+        .chain(background_process_tools())
+        .chain(subagent_tools(
+            &subagents::Mode::enabled(),
+            &crate::core::prompt::PromptSettings::default().agent_tools,
+        ))
+        .collect::<Vec<_>>();
         let mut stable_ids = BTreeSet::new();
         let mut namespaces = BTreeSet::new();
         for binding in &bindings {
@@ -321,7 +524,7 @@ Example:
 
     ///
     /// *Prepare*: Disable optional process and subagent tools in an otherwise empty configuration.
-    /// *Do*: Build the Core hook-tool catalog, then enable both optional features and rebuild it.
+    /// *Do*: Build the Core hook-tool catalog, then enable both optional features and wait, and rebuild it.
     /// *Assert*: Always-available tools remain stable and optional tools follow their settings.
     ///
     #[test]
@@ -334,7 +537,9 @@ Example:
         // Do
         let baseline = hook_tool_catalog(&config);
         config.settings.tools.background_processes = BackgroundProcessMode::Enabled;
-        config.settings.tools.subagents = SubagentMode::Enabled;
+        config.settings.tools.subagents = SubagentMode::enabled();
+        config.settings.tools.model_wait =
+            serde_json::from_value(serde_json::json!({"mode": "enabled"})).unwrap();
         let enabled = hook_tool_catalog(&config);
 
         // Assert
@@ -351,11 +556,11 @@ Example:
                 },
                 HookToolKey {
                     target: HookToolTarget::Filesystem,
-                    qualified_name: "file_system.read_file".to_string(),
+                    qualified_name: "file_system.edit".to_string(),
                 },
                 HookToolKey {
                     target: HookToolTarget::Filesystem,
-                    qualified_name: "file_system.search_replace".to_string(),
+                    qualified_name: "file_system.read_file".to_string(),
                 },
                 HookToolKey {
                     target: HookToolTarget::Filesystem,
@@ -373,12 +578,11 @@ Example:
             "process.write",
             "process.list",
             "process.stop",
-            "subagent.list",
-            "subagent.spawn",
-            "subagent.wait",
-            "subagent.send_message",
-            "subagent.interrupt",
-            "subagent.stop",
+            "agents.list",
+            "agents.spawn",
+            "agents.send_message",
+            "agents.interrupt",
+            "self.wait",
         ] {
             assert!(enabled.iter().any(|key| key.qualified_name == expected));
         }
@@ -437,17 +641,19 @@ Example:
     #[test]
     fn runtime_builtin_names_round_trip_through_their_live_wire_encoding() {
         // Prepare
-        let names = file_system::runtime_contracts()
+        let names = file_system::runtime_contracts(file_system::BashTimeout::default())
             .into_iter()
             .map(|contract| contract.name)
-            .chain(non_filesystem_runtime_builtin_tools().into_iter().map(
-                |tool| match tool.target {
-                    ToolTarget::RuntimeBuiltin { name } => name,
-                    ToolTarget::Provided { .. } => {
-                        unreachable!("resolved built-in tools contain no provided tools")
-                    }
-                },
-            ))
+            .chain(
+                non_filesystem_runtime_builtin_tools(30_000, false)
+                    .into_iter()
+                    .map(|tool| match tool.target {
+                        ToolTarget::RuntimeBuiltin { name } => name,
+                        ToolTarget::Provided { .. } => {
+                            unreachable!("resolved built-in tools contain no provided tools")
+                        }
+                    }),
+            )
             .collect::<Vec<_>>();
 
         // Do

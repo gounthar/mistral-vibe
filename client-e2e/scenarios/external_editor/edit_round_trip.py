@@ -16,8 +16,7 @@ env = {
     "EDITOR": "false",
 }
 
-capture_startup = False
-screen_contains = {"rust": ("HELLO WORLD", "second line")}
-screen_excludes = {"rust": ("hello world",)}
+screen_contains = ("HELLO WORLD", "second line")
+screen_excludes = ("hello world",)
 
 timeline: Timeline = ["hello world", _CTRL_G]

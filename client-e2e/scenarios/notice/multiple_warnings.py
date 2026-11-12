@@ -1,4 +1,4 @@
-"""Two server warnings in one turn stack as separate toasts (VIBE-4622)."""
+"""Two server warnings after a turn mount as two rows (VIBE-4622, VIBE-4099)."""
 
 from __future__ import annotations
 
@@ -11,12 +11,6 @@ from e2e.app_server.events import (
 )
 from e2e.app_server.scenario import Timeline
 
-# Python renders warnings through Textual `App.notify`, whose toasts mount on a
-# later frame and are not deterministically captured; Rust draws them inline.
-skip_terminal_parity = (
-    "python's Textual notify toast mounts async; rust draws it inline"
-)
-
 timeline: Timeline = [
     "hi\r",
     turn_started(),
@@ -27,4 +21,4 @@ timeline: Timeline = [
     server_warning("second warning"),
 ]
 
-screen_contains = {"rust": ("first warning", "second warning")}
+screen_contains = ("⚠ first warning", "⚠ second warning")

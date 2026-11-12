@@ -11,12 +11,15 @@ from vibe.core.agents._migration import (
     LEGACY_BASE_DISABLED_KEY,
     migrate_agent_profile_config,
 )
-from vibe.core.paths import PLANS_DIR
+from vibe.core.config._defaults import SHELL_TOOLS
+
+# A post_agent hook's `match = "main"` selects the user's agent, whatever its mode,
+# so no agent profile may take that name.
+RESERVED_AGENT_NAME = "main"
 
 
 class BuiltinAgentName(StrEnum):
     ASK = "ask"
-    PLAN = "plan"
     ACCEPT_EDITS = "accept-edits"
     SMART_APPROVE = "smart-approve"
     AUTO_APPROVE = "auto-approve"
@@ -41,9 +44,19 @@ class AgentProfile:
     file behind it, so a profile that reaches that surface has to remember where
     it came from.
     """
+    config_error: str | None = field(default=None, compare=False)
+    """The config error the profile's settings make, or ``None`` when they are
+    valid. A profile with one stays discovered, so choosing it gives this error
+    as a broken ``config.toml`` does, rather than "not found".
+    """
 
     @classmethod
     def from_toml(cls, path: Path) -> AgentProfile:
+        if path.stem.casefold() == RESERVED_AGENT_NAME:
+            raise ValueError(
+                f"'{RESERVED_AGENT_NAME}' is reserved for hook matching; "
+                "rename the agent file"
+            )
         with path.open("rb") as f:
             data = tomllib.load(f)
         migrate_agent_profile_config(data)
@@ -52,23 +65,23 @@ class AgentProfile:
             name=path.stem,
             display_name=data.pop("display_name", path.stem.replace("-", " ").title()),
             description=data.pop("description", ""),
-            safety=AgentSafety(data.pop("safety", AgentSafety.NEUTRAL)),
-            agent_type=AgentType(data.pop("agent_type", AgentType.AGENT)),
+            safety=_enum_field(data, "safety", AgentSafety, AgentSafety.NEUTRAL),
+            agent_type=_enum_field(data, "agent_type", AgentType, AgentType.AGENT),
             instructions=data.pop("instructions", None),
             overrides=data,
             source_path=path,
         )
 
 
-def _plan_overrides() -> dict[str, Any]:
-    plans_pattern = str(PLANS_DIR.path / "*")
-    return {
-        "tools": {
-            "write_file": {"permission": "never", "allowlist": [plans_pattern]},
-            "edit": {"permission": "never", "allowlist": [plans_pattern]},
-            "read_file": {"allowlist": [plans_pattern]},
-        }
-    }
+def _enum_field[E: StrEnum](
+    data: dict[str, Any], key: str, enum: type[E], default: E
+) -> E:
+    value = data.pop(key, default)
+    try:
+        return enum(value)
+    except ValueError:
+        allowed = ", ".join(repr(member.value) for member in enum)
+        raise ValueError(f"{key}: {value!r} is not one of {allowed}") from None
 
 
 ASK = AgentProfile(
@@ -76,14 +89,6 @@ ASK = AgentProfile(
     "Ask",
     "Requires approval for tool executions",
     AgentSafety.NEUTRAL,
-    overrides={"disabled_tools": ["exit_plan_mode"]},
-)
-PLAN = AgentProfile(
-    BuiltinAgentName.PLAN,
-    "Plan",
-    "Read-only agent for exploration and planning",
-    AgentSafety.SAFE,
-    overrides=_plan_overrides(),
 )
 ACCEPT_EDITS = AgentProfile(
     BuiltinAgentName.ACCEPT_EDITS,
@@ -91,11 +96,10 @@ ACCEPT_EDITS = AgentProfile(
     "Auto-approves file edits only",
     AgentSafety.DESTRUCTIVE,
     overrides={
-        "disabled_tools": ["exit_plan_mode"],
         "tools": {
             "write_file": {"permission": "always"},
             "edit": {"permission": "always"},
-        },
+        }
     },
 )
 AUTO_APPROVE = AgentProfile(
@@ -103,7 +107,7 @@ AUTO_APPROVE = AgentProfile(
     "Auto Approve",
     "Auto-approves all tool executions",
     AgentSafety.YOLO,
-    overrides={"bypass_tool_permissions": True, "disabled_tools": ["exit_plan_mode"]},
+    overrides={"bypass_tool_permissions": True},
 )
 SMART_APPROVE = AgentProfile(
     BuiltinAgentName.SMART_APPROVE,
@@ -113,7 +117,6 @@ SMART_APPROVE = AgentProfile(
     # No static permission overrides: a model classifier gates each call via the
     # runtime "classify" tool mode (Unified Harness only). The runtime derives that
     # gate from the active agent; see build_unified_session_context / _rust_tool_modes.
-    overrides={"disabled_tools": ["exit_plan_mode"]},
 )
 
 EXPLORE = AgentProfile(
@@ -164,17 +167,25 @@ LEAN = AgentProfile(
             "temperature": 0.2,
             "thinking": "off",
         },
-        "tools": {"bash": {"default_timeout": 1200}},
-        "disabled_tools": ["exit_plan_mode"],
+        # Every shell tool: the command environment picks one (git_bash or
+        # powershell on Windows), whose settings give Core's bash timeouts.
+        "tools": {
+            name: {"default_timeout": 1200, "max_timeout_seconds": 1200}
+            for name in SHELL_TOOLS
+        },
     },
 )
 
 BUILTIN_AGENTS: dict[str, AgentProfile] = {
     BuiltinAgentName.ASK: ASK,
-    BuiltinAgentName.PLAN: PLAN,
     BuiltinAgentName.ACCEPT_EDITS: ACCEPT_EDITS,
     BuiltinAgentName.SMART_APPROVE: SMART_APPROVE,
     BuiltinAgentName.AUTO_APPROVE: AUTO_APPROVE,
     BuiltinAgentName.EXPLORE: EXPLORE,
     BuiltinAgentName.LEAN: LEAN,
 }
+
+# Builtin agents dropped from the product, mapped to the agent a config that still
+# names one as `default_agent` starts on. Plan was read-only: ask runs no tool
+# without approval, so the fallback grants no permission the user did not have.
+REMOVED_BUILTIN_AGENTS: dict[str, str] = {"plan": BuiltinAgentName.ASK}

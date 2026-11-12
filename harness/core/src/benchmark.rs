@@ -65,7 +65,7 @@ fn benchmark(options: &Options) -> Result<serde_json::Value, String> {
             let serialized =
                 serde_json::to_string(checkpoint).map_err(|error| error.to_string())?;
             let decoded = crate::core::decode_checkpoint(&serialized)?;
-            engine.restore(config(index), decoded, 0)
+            engine.restore(config(index), decoded, 0, None)
         })
         .collect::<Result<Vec<_>, String>>()?;
     let restore_elapsed = restore_started.elapsed();
@@ -147,9 +147,19 @@ fn config(index: usize) -> HarnessConfig {
         "system_instructions": "",
         "settings": {
             "turn": { "max_iterations": 4 },
-            "context": { "compaction": { "mode": "disabled" } },
+            "context": {
+                "compaction": { "mode": "disabled" },
+                "notifications": { "pending_count": 1000, "pending_bytes": 1048576, "recent_ids": 1000 },
+                "model_facts": {
+                    "context_window": 262144,
+                    "compaction_threshold": 202144,
+                    "compaction_threshold_max": 238144,
+                    "input_modalities": ["text", "image"],
+                    "image_cost": { "kind": "fixed", "tokens": 8192 }
+                }
+            },
             "tools": {
-                "programmatic": { "max_effects": 16, "max_operations": 64 },
+                "programmatic": { "max_effects": 16, "max_operations": 64, "max_elapsed_ms": 60000, "max_sleep_ms": 30000 },
                 "large_output": { "mode": "disabled" },
                 "subagents": { "mode": "enabled" },
                 "background_processes": { "mode": "disabled" },

@@ -9,9 +9,9 @@ from e2e.app_server.events import (
     turn_started,
     user_msg,
 )
-from e2e.app_server.scenario import Timeline
+from e2e.app_server.scenario import Timeline, take_snapshot
 
-screen_rows = {"rust": {23: "⏵ Ran 8 commands"}}
+screen_rows = {23: "⏵ Ran 8 commands"}
 
 _WHEEL_UP = "\x1b[<64;60;10M"
 
@@ -30,20 +30,26 @@ timeline: Timeline = [
     user_msg("hello"),
     assistant_msg(_reply("Greeting line", 20)),
     turn_completed(),
+    take_snapshot(),
     "list files\r",
     turn_started(),
     user_msg("list files"),
     *(bash(f"ls dir{index}", f"file{index}.txt") for index in range(1, 9)),
     assistant_msg(_reply("Listed", 3)),
     turn_completed(),
+    take_snapshot(),
     "summarize\r",
     turn_started(),
     user_msg("summarize"),
     assistant_msg(_reply("Summary line", 30)),
     turn_completed(),
+    take_snapshot(),
     _WHEEL_UP * 33,
+    take_snapshot(),
     # SGR row 28 hits the group header, near the viewport bottom.
     _click(28, 1),
+    take_snapshot(),
     # The reveal lifted the header to SGR row 24; another column avoids a double-click.
     _click(24, 3),
+    take_snapshot(),
 ]

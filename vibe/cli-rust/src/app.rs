@@ -1,9 +1,10 @@
 //! UI state; the `ui` module renders a pure view over it.
 
+use crate::clock::UiInstant;
 use std::collections::{BTreeMap, BTreeSet, HashSet, VecDeque};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use crate::post_ready::AccountReads;
 use crate::server::{UserQuestion, UserQuestionRequest};
@@ -29,7 +30,7 @@ use crate::turn_summary::Narrator;
 use crate::ui;
 use crate::ui::banner::Banner;
 use crate::ui::loading::LoadingAnim;
-use crate::utils::file_index::FileIndex;
+use crate::utils::file_index::FileIndexHandle;
 use crate::utils::history_manager::HistoryManager;
 use crate::utils::startup_cache::StartupConfig;
 use crate::utils::transcript_cache::{QueueSpacer, TranscriptCache};
@@ -43,7 +44,7 @@ pub enum Status {
     Ready,
     /// A turn is running since `since` (drives the elapsed counter).
     Generating {
-        since: Instant,
+        since: UiInstant,
     },
 }
 
@@ -72,15 +73,15 @@ pub enum Surface {
     /// A selectable rendered region, identified independently from its mouse target.
     Region(RegionId),
     Composer,
-    /// The bottom bar (working directory + PID), a single selectable row.
+    /// The bottom bar (working directory, model and token budget), a single selectable row.
     BottomBar,
 }
 
-/// Mouse text-selection state, shared by both surfaces (Python `WordSelectScreen`
-/// for the transcript and `ChatTextArea`'s own multi-click for the composer).
+/// Mouse text-selection state, shared by both surfaces (word selection in the
+/// transcript and the composer's own multi-click).
 #[derive(Default)]
 pub struct SelectionState {
-    /// Multi-click chain deciding `granularity` (Python `_update_click_chain`).
+    /// Multi-click chain deciding `granularity`.
     pub chain: ClickChain,
     /// Granularity of the gesture in flight: char, word, or paragraph.
     pub granularity: Granularity,
@@ -96,36 +97,18 @@ pub struct SelectionState {
     pub press: Option<(u16, u16)>,
     /// Whether the pointer moved since the press (a drag, not a click).
     pub dragged: bool,
-    /// Python `_had_selection_at_press`: a selection showed when the button went down.
+    /// A selection showed when the button went down.
     pub had_selection_at_press: bool,
 }
 
-/// An inline status line (Python `InlineNotice`), shown until `until`.
-pub struct Notice {
-    pub text: String,
-    pub severity: ToastSeverity,
-    pub until: Instant,
-}
+use crate::ui::notice::Notice;
 
-/// Toast severity, selecting the left-border color (Python `App.notify` severity).
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub enum ToastSeverity {
+/// Notice severity, selecting its color.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Severity {
     Information,
     Warning,
     Error,
-}
-
-/// A short-lived warning/error toast overlay (Python `App.notify` → `Toast`).
-pub struct Toast {
-    /// Identity within this process, so a selection can follow the toast it was
-    /// anchored in while the rack shifts it around.
-    pub id: u64,
-    pub text: String,
-    pub severity: ToastSeverity,
-    pub duration: Duration,
-    pub until: Option<Instant>,
-    /// Evictions reported with this toast at overflow time.
-    pub omitted: usize,
 }
 
 /// A prompt the client still owns end to end, used by the `/clear <prompt>` seed.
@@ -139,20 +122,20 @@ pub struct QueuedPrompt {
 pub struct ChatInput {
     pub input: String,
     pub mode: crate::input_modes::InputMode,
-    /// Caret position as a byte offset into `input` (always on a char boundary),
-    /// mirroring Textual's TextArea cursor. Keyboard editing moves and edits here.
+    /// Caret position as a byte offset into `input` (always on a char boundary).
+    /// Keyboard editing moves and edits here.
     pub cursor: usize,
     /// The fixed end of a keyboard text selection (byte offset), or `None` when
     /// nothing is selected. The selection spans `anchor..cursor`; a Shift-move
-    /// sets it, a plain move clears it (Textual's TextArea selection).
+    /// sets it, a plain move clears it.
     pub anchor: Option<usize>,
     /// Explicit composer viewport top row. `None` follows the caret automatically.
     pub scroll: Option<u16>,
     /// Caret byte offset right after a history entry was loaded, or `None` when the
-    /// chat input does not hold a recalled entry (Textual's `_cursor_pos_after_load`).
+    /// chat input does not hold a recalled entry.
     pub cursor_pos_after_load: Option<usize>,
-    /// Whether the caret has moved since a history entry was loaded (Textual's
-    /// `_cursor_moved_since_load`). Once moved, Up/Down edit text instead of history.
+    /// Whether the caret has moved since a history entry was loaded. Once moved,
+    /// Up/Down edit text instead of history.
     pub cursor_moved_since_load: bool,
     /// Input history recalled with Up/Down, persisted to `$VIBE_HOME/vibehistory`.
     pub history: HistoryManager,
@@ -165,12 +148,14 @@ pub struct ChatInput {
     pub collapsed_pastes: crate::collapsed_pastes::CollapsedPastes,
     /// The paste just collapsed, which pasting it again shows in full until the next edit.
     pub expandable_paste: Option<std::sync::Arc<str>>,
+    /// Text removed by the last kill (Ctrl+K, Ctrl+U, Ctrl+W...), which Ctrl+Y yanks back.
+    pub kill_buffer: String,
     /// The composer as history recall found it, mentions and mode included,
     /// given back whole when Down leaves the recalled entries.
     pub recall_draft: Option<crate::edit_history::Snapshot>,
     /// When the last key reached the chat input, so a bottom-app that wants to
-    /// replace it can wait for a pause first (Textual `_last_keystroke_time`).
-    pub last_keystroke: Option<Instant>,
+    /// replace it can wait for a pause first.
+    pub last_keystroke: Option<UiInstant>,
 }
 
 impl ChatInput {
@@ -185,14 +170,18 @@ pub struct Session {
     pub session_id: Option<String>,
     /// The in-progress turn's id (from `turn/started`), needed to interrupt it.
     pub active_turn_id: Option<String>,
+    /// Completion held while a promoted prompt awaits its local enqueue result.
+    pub deferred_completion: Option<(String, crate::terminal_notifier::NotificationContext)>,
     /// A manual shell command submitted before startup became ready.
     pub pending_shell: Option<crate::commands::shell::PendingShell>,
     /// The in-progress manual shell operation, needed to reject queued input.
     pub shell_operation_id: Option<String>,
     /// When the manual shell operation started, for the loader elapsed time.
-    pub shell_started_at: Option<Instant>,
+    pub shell_started_at: Option<UiInstant>,
     /// Whether the shell run frame has been handed to the app-server writer.
     pub shell_request_started: bool,
+    /// RPC settled before the final shell effect reached the transcript.
+    pub shell_rpc_completed: bool,
     /// An interrupt pressed before the run frame was sent, replayed once it is safe.
     pub shell_interrupt_requested: bool,
     pub status: Status,
@@ -203,64 +192,52 @@ pub struct Session {
     pub worktree: Option<crate::worktree::WorktreeInfo>,
     /// The worktree THIS run's `--worktree` prepared, from the move announce:
     /// a resumed session's restored effect carries the original run's
-    /// `created` verdict, so the exit cleanup pins this run's own (Python's
-    /// `worktree_session.created`).
+    /// `created` verdict, so the exit cleanup pins this run's own.
     pub prepared_worktree: Option<crate::worktree::WorktreeInfo>,
     /// Context budget `(current_tokens, max_tokens)`; `(_, 0)` renders as empty.
     pub tokens: (u64, u64),
-    pub stats: AgentStats,
+    /// The session's PR/MR artifacts, latest first; the footer link opens a modal listing them.
+    pub artifacts: Vec<crate::server::PublicSessionArtifact>,
+    /// The session `artifacts` was read for; a switch away re-reads the list.
+    pub artifacts_session: Option<String>,
+    /// Artifacts whose status changed since the modal was last open; the bar marks them.
+    pub artifacts_unseen: std::collections::HashSet<String>,
+    pub stats: crate::server::SessionStats,
     pub startup_config: StartupConfig,
     pub startup_error: Option<String>,
     /// The `--continue`/`--resume` intent, consumed once after `ready`.
     pub startup_resume: StartupResume,
-    /// The interactive CLI flags (Python `_session_options`), resent on every resume.
+    /// The interactive CLI flags, resent on every resume.
     pub agent_config: crate::server::AgentConfig,
-    /// The positional `vibe <prompt>` argument (Python `_initial_prompt`), sent
-    /// once startup has converged.
+    /// The positional `vibe <prompt>` argument, sent once startup has converged.
     pub initial_prompt: Option<String>,
-    /// `--teleport`: teleport the initial prompt instead of sending it.
-    pub teleport_on_start: bool,
     /// A `session/resume` has landed, so the handshake's own session is stale.
     pub resumed: bool,
-    /// The workspace-trust gate opened during this startup (Python
-    /// `_startup_prompt_for_workspace_trust`).
+    /// The workspace-trust gate opened during this startup.
     pub trust_prompted: bool,
+    /// The `--resume` picker opened during this startup.
+    pub resume_picker_shown: bool,
     /// `vibe.startup` properties held until the first frame is painted.
     pub startup_telemetry: Option<std::collections::BTreeMap<String, Value>>,
-    /// Whether the last turn was interrupted, so `/retry` can continue it
-    /// (Python `_retry_presentation is not None`).
+    /// Telemetry queued before the session id exists, flushed by `set_session_id`.
+    pub held_telemetry: Vec<crate::telemetry::TelemetryEvent>,
+    /// Whether the last turn failed or was interrupted, so `/retry` can re-run it.
     pub can_retry: bool,
-    /// The active turn's latest assistant row (Python `_turn_assistant_message`).
-    pub turn_assistant_id: Option<String>,
-    /// Python `_RetryPresentation`: armed on retryable failures.
+    /// The rows a successful `/retry` replaces.
     pub retry_presentation: Option<crate::commands::retry::RetryPresentation>,
-    /// A retried turn's output merging into the interrupted assistant row.
-    pub retry_continuation: Option<crate::commands::retry::RetryContinuation>,
-    /// Silent incomplete_stream continuations spent (Python `_incomplete_stream_retries`).
+    /// Silent incomplete_stream retries spent.
     pub incomplete_stream_retries: u32,
-    /// The mounted custom-tools deprecation entry's id, Python's message guard.
-    pub custom_tools_deprecation_id: Option<String>,
-    /// The mounted what's-new entry's id, dropped on the first submit like
-    /// Python's `_whats_new_message`.
-    pub whats_new_id: Option<String>,
-    /// Token usage snapshot at attach (Python `reset_usage_baseline`); the
-    /// exit summary reports the delta against it.
+    /// The mounted what's-new entry, dropped on the first submit.
+    pub whats_new: Option<crate::startup::banners::WhatsNew>,
+    /// Token usage snapshot at attach; the exit summary reports the delta
+    /// against it.
     pub usage_baseline: Option<crate::server::TokenUsage>,
-    /// The latest `runtime` value, so a transcript rebuild can re-run the
-    /// checks that read it (Python re-shows the deprecation on its rebuild).
+    /// The latest `runtime` value, for views that read it after the event.
     pub runtime: Value,
-}
-
-/// Runtime token and cost totals rendered by `/status`.
-#[derive(Default)]
-pub struct AgentStats {
-    pub steps: u64,
-    pub session_prompt_tokens: u64,
-    pub session_completion_tokens: u64,
-    pub session_cached_tokens: u64,
-    pub last_turn_total_tokens: u64,
-    pub last_turn_cached_tokens: u64,
-    pub session_cost: f64,
+    /// How many of the session's background processes run, from its latest state.
+    pub running_processes: usize,
+    /// What a running `wait` waits for, when the subagents and tasks name it.
+    pub wait_target: Option<String>,
 }
 
 /// Transcript rendering state: content, scroll, per-entry caches, and chrome.
@@ -279,16 +256,15 @@ pub struct View {
     pub markdown_cache: ui::markdown::MarkdownCache,
     /// Unfolded entry ids and `tool-group:<first member id>` keys, including a lone call's future group.
     pub expanded: HashSet<String>,
-    /// Python `_tools_collapsed`: the Ctrl+O bulk fold state applied to every
-    /// group and collapsible result body at once.
+    /// The Ctrl+O bulk fold state applied to every group and collapsible
+    /// result body at once.
     pub tools_collapsed: bool,
     /// Per-frame hit map `(top, bottom, header, id)` in screen rows, used to route a click to its entry.
     pub entry_hitmap: Vec<(u16, u16, Option<u16>, String)>,
     /// Markdown links painted in the current frame, used for hover and click routing.
     pub link_hitmap: Vec<ui::markdown::Link>,
     /// Per-frame `(top, bottom, gutter_width)` of every edit-diff view on screen.
-    /// Its gutter is chrome, so selection and copy start after it (Python
-    /// `DiffView._gutter_width`).
+    /// Its gutter is chrome, so selection and copy start after it.
     pub diff_hitmap: Vec<(u16, u16, u16)>,
     /// Markdown table cells from the current layout, in document coordinates.
     pub table_hitmap: Vec<TableCellHit>,
@@ -298,28 +274,28 @@ pub struct View {
     pub pointer_shape: crate::pointer::Shape,
     /// The selectable region painted last frame, published by the visible screen.
     pub selection_region: Region,
-    /// Text rectangle of each toast painted last frame, keyed by toast id and
-    /// ordered newest last. Bounded by the stack the rack fits on screen.
-    pub toast_text_areas: Vec<(u64, Rect)>,
-    /// The toast text region a selection is anchored in, or the default region
-    /// while no toast owns one.
-    pub toast_selection_region: Region,
+    /// The active model's name on the composer's top border painted last frame, which a click opens `/model` on.
+    pub model_area: Rect,
+    /// The context gauge in the bottom bar painted last frame, which a click opens `/context` on.
+    pub footer_tokens_area: Rect,
     /// The loading-area row a drag can select, published by whichever screen
-    /// paints it (Python's loading widgets are selectable Statics).
+    /// paints it.
     pub loading_selection_region: Region,
     /// The box content a drag can select while a bottom app replaces the input box.
     pub bottom_app_selection_region: Region,
     /// Bottom-app box `(y, x0, x1)` cells painted as chrome (question option
     /// prefixes, scrollbars), so a selection never highlights or copies them.
     pub bottom_app_selection_chrome: Vec<RowSpan>,
+    /// A box split in halves: the columns of its left and right half a selection keeps to, by the half its anchor is in.
+    pub bottom_app_selection_halves: Option<(Rect, Rect)>,
     /// Bottom-app box rows that continue a wrapped line, so a copy rejoins them.
     pub bottom_app_selection_folds: crate::selection::Folds,
     /// The bottom app drawn last frame and its box rect, which own the box selection.
     pub bottom_app: Option<(crate::ui::bottom_app::Kind, Rect)>,
-    /// Wrapped rows of each toast painted last frame, keyed by toast id.
-    pub toast_folds: Vec<(u64, crate::selection::Folds)>,
+    /// The links painted in the bottom bar last frame (the cwd's copy icon, the PR/MR link), for click routing.
+    pub bottom_bar_links: Vec<ui::bottom_bar::BarLink>,
     /// Inclusive `(y, x0, x1)` cells inside the region that belong to no widget,
-    /// so Textual never selects them: padding around and between widgets.
+    /// so a drag never selects them: padding around and between widgets.
     pub selection_chrome: Vec<(u16, u16, u16)>,
     /// Hang indent cells of painted transcript rows, cut out of the highlight only.
     pub selection_hangs: Vec<(u16, u16, u16)>,
@@ -332,13 +308,13 @@ pub struct View {
     /// Captured mouse gesture and scrollbar state.
     pub mouse: crate::mouse::MouseState,
     pub banner: Banner,
-    /// The VS Code extension promo body (Python `VscodeExtensionPromoMessage`),
-    /// mounted before the messages area, so it renders under the banner.
+    /// The VS Code extension promo body, mounted before the messages area, so
+    /// it renders under the banner.
     pub promo: Option<String>,
     /// Spinner glyph + label gradient state, ticked every 100ms while thinking.
     pub loading: LoadingAnim,
     /// A background slash command is fetching, so the loading area shows a
-    /// hint-free spinner (Python mounts `LoadingWidget(status="Loading")`).
+    /// hint-free `Loading` spinner.
     pub command_loading: bool,
     /// Shared phase for the 100 ms pulse on active reasoning and tool entries.
     pub pulse_frame: usize,
@@ -346,12 +322,16 @@ pub struct View {
     pub cursor_on: bool,
     /// Chat input caret cell painted this frame, where dead-key and IME previews should draw.
     pub cursor_position: Option<Position>,
-    /// Whether the terminal window holds focus (Python `App.app_focus`); the
-    /// caret stops blinking and stays dark while it does not.
+    /// Whether the terminal window holds focus; the caret stops blinking and
+    /// stays dark while it does not.
     pub app_focus: bool,
-    /// Entry index the next frame must bring to the top of the viewport
-    /// (Python `scroll_to_widget(..., top=True)`), consumed by the render.
+    /// Entry index the next frame must bring to the top of the viewport,
+    /// consumed by the render.
     pub scroll_to_entry: Option<usize>,
+    /// Entry index and painted rows of the prompt pinned over the transcript top last frame.
+    pub sticky_prompt: Option<(usize, u16)>,
+    /// The `enable_sticky_prompt` config value.
+    pub sticky_prompt_enabled: bool,
     /// Entry an expand/collapse toggle holds steady, consumed by the next render.
     pub scroll_anchor: Option<crate::utils::scroll::ScrollAnchor>,
     /// Per-frame `(index, viewport-relative top, height)` of each painted entry, bounded by the viewport.
@@ -367,7 +347,7 @@ impl Default for View {
         let mut loading = LoadingAnim::default();
         loading.set_label(ui::loading::INITIALIZING_LOADING_STATUS);
         Self {
-            transcript: Transcript::default(),
+            transcript: Transcript::main(),
             scroll: 0,
             scroll_target: 0,
             last_total: 0,
@@ -382,14 +362,15 @@ impl Default for View {
             mouse_position: None,
             pointer_shape: crate::pointer::Shape::default(),
             selection_region: Region::default(),
-            toast_text_areas: Vec::new(),
-            toast_selection_region: Region::default(),
+            model_area: Rect::default(),
+            footer_tokens_area: Rect::default(),
             loading_selection_region: Region::default(),
             bottom_app_selection_region: Region::default(),
             bottom_app_selection_chrome: Vec::new(),
+            bottom_app_selection_halves: None,
             bottom_app_selection_folds: crate::selection::Folds::default(),
             bottom_app: None,
-            toast_folds: Vec::new(),
+            bottom_bar_links: Vec::new(),
             selection_chrome: Vec::new(),
             selection_hangs: Vec::new(),
             selection_scrollbar: ui::scrollbar::State::default(),
@@ -405,6 +386,8 @@ impl Default for View {
             cursor_position: None,
             app_focus: true,
             scroll_to_entry: None,
+            sticky_prompt: None,
+            sticky_prompt_enabled: true,
             scroll_anchor: None,
             entry_rows: Vec::new(),
             at_top: false,
@@ -413,28 +396,23 @@ impl Default for View {
     }
 }
 
-/// Transient overlays: inline notice, toast, and quit confirm.
+/// Transient overlays: inline notice and quit confirm.
 #[derive(Default)]
 pub struct Overlays {
-    /// Active inline notice (e.g. "Copied to clipboard"), self-hiding after its timeout.
+    /// Active inline notice: a confirmation fades on its timer, a refusal stays until the next key.
     pub notice: Option<Notice>,
-    /// Stacked warning/error toasts (Python `App.notify` → `ToastRack`), each self-hiding.
-    pub toasts: VecDeque<Toast>,
-    /// Identity handed to the next toast; only ever moves forward.
-    next_toast_id: u64,
     /// When the last unhandled Escape landed, so a second one within
-    /// `DOUBLE_ESC_DELAY` clears the input or enters rewind mode (Python
-    /// `App._last_escape_time`).
-    pub last_escape: Option<Instant>,
+    /// `DOUBLE_ESC_DELAY` clears the input or enters rewind mode.
+    pub last_escape: Option<UiInstant>,
 }
 
 /// Shared `/` and `@` completion popup state.
 #[derive(Default)]
 pub struct Completion {
-    /// User-invocable skills `(name, description)`, shown as `/name` popup rows.
-    pub skills: Vec<(String, String)>,
-    /// Files below `cwd`, maintained by a background watcher.
-    pub files: FileIndex,
+    /// User-invocable skills, shown as `/name` popup rows.
+    pub skills: Vec<crate::skill::Skill>,
+    /// Files below `cwd`, maintained by a background watcher the handle owns.
+    pub files: FileIndexHandle,
     /// Entries currently displayed by the shared `/` and `@` popup.
     pub entries: Vec<CompletionEntry>,
     /// Selected entry index in the completion popup (Up/Down, wrap-around).
@@ -450,11 +428,11 @@ pub struct Completion {
 /// Voice-mode state: config projection, recording lifecycle, and mic level.
 #[derive(Default)]
 pub struct Voice {
-    /// Whether voice mode is on (Python `voice_mode_enabled`); gates Ctrl+R.
+    /// Whether voice mode is on; gates Ctrl+T.
     pub mode_enabled: bool,
     /// Projected transcription config, `None` until `config/read` returns.
     pub transcription: Option<TranscriptionConfig>,
-    /// Current recording lifecycle (Python `TranscribeState`).
+    /// Current recording lifecycle.
     pub transcribe_state: TranscribeState,
     /// Live mic level in `[0,1]`, written by the audio thread, read by the indicator.
     pub peak: Arc<AtomicU32>,
@@ -464,11 +442,11 @@ pub struct Voice {
     pub tx: Option<Sender<VoiceEvent>>,
     /// Frame counter driving the flushing-indicator animation (advanced per voice tick).
     pub frame: usize,
-    /// Per-recording analytics bookkeeping (Python `VoiceManager._tracking`).
+    /// Per-recording analytics bookkeeping.
     pub tracking: crate::voice::tracking::RecordingTracking,
 }
 
-/// `/config` settings screen state (Python's `ConfigScreen` modal).
+/// `/config` settings screen state (a modal).
 #[derive(Default)]
 pub struct ConfigScreen {
     /// While set, the settings rows overlay the chat and Esc closes it.
@@ -479,70 +457,60 @@ pub struct ConfigScreen {
     pub fields: Vec<ConfigField>,
     /// Writable persistence layers from `config/fields/read`.
     pub targets: Vec<String>,
-    /// Highlighted field index in the config screen (↑↓/jk navigation).
-    pub selected: usize,
-    /// Top line offset of the option list, reconciled to keep the selection visible.
-    pub scroll: usize,
-    /// Mouse-wheel scrolling temporarily detaches the viewport from the highlight.
-    pub free_scroll: bool,
+    /// Highlighted field and the option-list viewport.
+    pub list: crate::option_list::OptionList<crate::option_list::MultiAction>,
     /// Search field filtering the settings rows.
     pub search: crate::search_field::Search,
-    /// Full terminal area from the most recent config render, used for mouse hit testing.
-    pub area: Rect,
     /// Nested editor opened by Enter on a writable settings field.
     pub edit: Option<ConfigEdit>,
+    /// A failure or refusal shown in place of the key hints until the next key.
+    pub status: Option<Notice>,
 }
 
-/// `/theme` picker state (Python's `ThemePickerApp` bottom-app).
+/// `/theme` picker state (a bottom-app).
 #[derive(Default)]
 pub struct ThemePicker {
     /// While set the picker replaces the input box: title, option list, hint.
     pub open: bool,
-    /// Highlighted option index (0 = `auto`, then `theme::ALL`).
-    pub selected: usize,
-    /// Top line offset of the picker option list (Textual `scroll_to_highlight`).
-    pub scroll: usize,
-    /// Scrollbar dragging temporarily detaches the viewport from the highlight.
-    pub free_scroll: bool,
+    /// Highlighted option (0 = `auto`, then `theme::ALL`) and the viewport.
+    pub list: crate::option_list::OptionList<crate::option_list::SingleAction>,
     /// Option index carrying the current configured name, including `auto`.
     pub current: usize,
     /// `theme::ALL` index to restore if the picker is cancelled (Esc).
     pub original: usize,
-    /// Deadline of the pending debounced preview (Python `PREVIEW_DEBOUNCE_SECONDS`).
+    /// Deadline of the pending debounced preview.
     pub preview_at: Option<Instant>,
-    /// Sender carrying the theme returned by a `config/write` response, so the
-    /// commit re-applies the server's config (Python re-applies the written runtime).
-    pub tx: Option<Sender<crate::theme_picker::Event>>,
 }
 
-/// Agent modes: the runtime snapshot plus the Shift+Tab switch in flight
-/// (Python's `AgentResource` and `VibeApp._desired_agent`).
+/// Agent modes: the runtime snapshot plus the Shift+Tab switch in flight.
 #[derive(Default)]
 pub struct Agents {
     /// Every agent from the runtime snapshot, in the server's discovery order.
     pub all: Vec<crate::server::AgentSummary>,
-    /// The server's active agent (Python `resources.agents.active`).
+    /// The server's active agent.
     pub active: crate::server::AgentSummary,
     /// Session-wide auto-approve (`--yolo` or config), which survives a switch,
-    /// as opposed to the YOLO agent's own (Python `_force_bypass_tool_permissions`).
+    /// as opposed to the YOLO agent's own.
     pub force_bypass_tool_permissions: bool,
     /// Name the last Shift+Tab asked for, painted before the server answers
-    /// and re-used as the base of a coalesced press (Python `_desired_agent`).
+    /// and re-used as the base of a coalesced press.
     pub desired: Option<String>,
-    /// Whether a `session/agent/update` is in flight (Python `_agent_switch_active`).
+    /// The last target the server refused; the next Shift+Tab cycles from it
+    /// so a broken profile does not trap the cycle.
+    pub refused: Option<String>,
+    /// Whether a `session/agent/update` is in flight.
     pub switch_active: bool,
+    /// Whether `/leanstall` or `/unleanstall` is in flight; input is rejected until it finishes.
+    pub installing: bool,
     /// When the prompt spinner is due, or `None` once fired or cancelled.
-    pub spinner_at: Option<Instant>,
-    /// Whether the spinner has replaced the prompt marker (Python `switching_mode`
-    /// with `show_indicator`).
+    pub spinner_at: Option<UiInstant>,
+    /// Whether the spinner has replaced the prompt marker.
     pub switching_indicator: bool,
     /// Spinner frame, advanced on the shared 100 ms tick.
     pub frame: usize,
-    /// Sender carrying `session/agent/update` answers to the main thread.
-    pub tx: Option<Sender<crate::agents::Event>>,
 }
 
-/// A selectable model: `alias` is persisted, `display_name` is shown (Python's `ModelOption`).
+/// A selectable model: `alias` is persisted, `display_name` is shown.
 #[derive(Clone, Default)]
 pub struct ModelOption {
     pub alias: String,
@@ -552,17 +520,13 @@ pub struct ModelOption {
     pub thinking_levels: Vec<String>,
 }
 
-/// `/model` picker state (Python's `ModelPickerApp` bottom-app).
+/// `/model` picker state (a bottom-app).
 #[derive(Default)]
 pub struct ModelPicker {
     /// While set the picker replaces the input box: title, option list, hint.
     pub open: bool,
-    /// Highlighted option index (0 = Default row, then one per model).
-    pub selected: usize,
-    /// Top line offset of the picker option list (Textual `scroll_to_highlight`).
-    pub scroll: usize,
-    /// Scrollbar dragging temporarily detaches the viewport from the highlight.
-    pub free_scroll: bool,
+    /// Highlighted option (0 = Default row, then one per model) and the viewport.
+    pub list: crate::option_list::OptionList<crate::option_list::MultiAction>,
     /// Model snapshot from `runtime/read`, refreshed on `runtime/updated`.
     pub models: Vec<ModelOption>,
     /// The active model's alias (`activeModel.alias`).
@@ -573,75 +537,85 @@ pub struct ModelPicker {
     pub default_display_name: String,
     /// Alias the Default row resolves to (`defaultModelAlias`).
     pub default_alias: String,
-    /// Sender carrying the `config/write` and `config/reload` answers, so the
-    /// commit re-applies the server's config (Python `_reload_config`).
-    pub tx: Option<Sender<crate::model_picker::Event>>,
 }
 
-/// `/log-level` picker state (Python's `LogLevelPickerApp` bottom-app).
+/// The artifacts modal state (a bottom-app): the session's PR/MR links.
+#[derive(Default)]
+pub struct ArtifactsModal {
+    /// The config turns PR monitoring on, so `/pr` is offered.
+    pub enabled: bool,
+    /// While set the modal replaces the input box: title, link rows, hint.
+    pub open: bool,
+    /// Highlighted artifact (latest first) and the viewport; a row has several actions (Enter, `c`, `f`).
+    pub list: crate::option_list::OptionList<crate::option_list::MultiAction>,
+    /// Option rows from the last render; PageUp/PageDown move by its height.
+    pub list_area: ratatui::layout::Rect,
+}
+
+/// `/log-level` picker state (a bottom-app).
 #[derive(Default)]
 pub struct LogLevelPicker {
     /// While set the picker replaces the input box.
     pub open: bool,
     /// Highlighted level index into `LOG_LEVELS`.
-    pub selected: usize,
+    pub list: crate::option_list::OptionList<crate::option_list::SingleAction>,
     /// Draft session-tier level; `None` means no override.
     pub session: Option<String>,
     /// Draft config-tier level; `None` means the field is unset.
     pub config: Option<String>,
     /// Which badge Enter toggles: `session` or `config`.
     pub focused_badge: &'static str,
+    /// Painted badge rectangles from the last frame, for clicks.
+    pub badges: Vec<(Rect, &'static str)>,
     /// The chain as it stood when the picker opened, for the diff on apply.
     pub chain: crate::observability::level::LogLevelChain,
-    /// Sender carrying the `config/write` answer.
-    pub tx: Option<Sender<crate::log_level_picker::Event>>,
 }
 
-/// `/thinking` picker state (Python's `ThinkingPickerApp` bottom-app).
+/// `/thinking` picker state (a bottom-app).
 pub struct ThinkingPicker {
     /// While set the picker replaces the input box.
     pub open: bool,
     /// Highlighted level index into `levels`.
-    pub selected: usize,
-    /// Top line offset of the option list.
-    pub scroll: usize,
+    pub list: crate::option_list::OptionList<crate::option_list::MultiAction>,
     /// The active model's current thinking level (`activeModel.thinking`).
     pub current_level: String,
     /// The levels the active model offers (`activeModel.thinkingLevels`).
     pub levels: Vec<String>,
     /// A `/model` pick held until its chained thinking level is chosen or skipped.
     pub model_pick: Option<crate::thinking_picker::ModelPick>,
-    /// Sender carrying the `config/write` and `config/reload` answers.
-    pub tx: Option<Sender<crate::thinking_picker::Event>>,
 }
 
-/// `/resume` picker state (Python's `SessionPickerApp`).
+/// `/resume` picker state.
 #[derive(Default)]
 pub struct ResumePicker {
     pub open: bool,
     pub sessions: Vec<crate::resume_picker::Session>,
-    pub selected: usize,
-    pub scroll: usize,
-    /// Mouse-wheel scrolling temporarily detaches the viewport from the highlight.
-    pub free_scroll: bool,
+    pub list: crate::option_list::OptionList<crate::option_list::MultiAction>,
     /// Folder the listed sessions belong to, from the server-filtered list. It
-    /// is the attached session's cwd too (Python reads it off the session).
+    /// is the attached session's cwd too.
     pub cwd: Option<String>,
     pub delete_confirm: Option<String>,
     /// Id of the session whose `session/delete` is in flight; keys are blocked
-    /// until it answers (Python `SessionPickerApp` pending delete).
+    /// until it answers.
     pub deleting: Option<String>,
     /// Set once a preview replaced the transcript, so returning to the current
-    /// session reloads it (Python `SessionPickerApp.previewing`).
+    /// session reloads it.
     pub previewing: bool,
     pub preview_request: u64,
     /// A `session/resume` is in flight; the app is busy but shows no spinner.
     pub resuming: bool,
+    /// Sessions whose lease another process holds, drawn with a lock.
+    pub locked: std::collections::HashSet<String>,
+    /// Sessions a lease notification already decided; a late snapshot keeps them.
+    pub lease_notified: std::collections::HashSet<String>,
+    /// The lease watch ended, so a late snapshot must not restore locks.
+    pub lease_ended: bool,
+    /// Whether the lease watch subscription already fired this process.
+    pub subscribed: bool,
     pub transcript: Option<crate::transcript::Snapshot>,
-    pub tx: Option<Sender<crate::resume_picker::Event>>,
 }
 
-/// Rewind bottom-app state (Python's `RewindApp` plus `App._rewind_mode`).
+/// Rewind bottom-app state, including whether rewind mode is on.
 #[derive(Default)]
 pub struct Rewind {
     /// While set the panel replaces the input box and owns every key.
@@ -656,31 +630,26 @@ pub struct Rewind {
     pub step: crate::rewind::Step,
     /// The action step's answer, carried into the persistence step.
     pub restore_files: bool,
-    /// Highlighted option index in the current step.
-    pub selected: usize,
-    /// Sender carrying server answers, applied on the main thread.
-    pub tx: Option<Sender<crate::rewind::Event>>,
+    /// Highlighted option in the current step.
+    pub list: crate::option_list::OptionList<crate::option_list::SingleAction>,
 }
 
-/// `ask_user_question` bottom-app state (Python's `QuestionApp`).
+/// `ask_user_question` bottom-app state.
 #[derive(Default)]
 pub struct QuestionApp {
     /// While set the app replaces the input box and owns every key.
     pub open: bool,
-    /// A delivered question still waiting for a pause in the user's typing
-    /// (Python `_wait_for_typing_pause`), as `(source, request)`.
-    pub pending: Option<(crate::question_app::QuestionSource, UserQuestionRequest)>,
+    /// Delivered questions waiting for the open one to close or for a pause in
+    /// the user's typing, oldest first, as `(source, request)`.
+    pub pending: VecDeque<(crate::question_app::QuestionSource, UserQuestionRequest)>,
     /// Who the open app answers: a `user_input` callback or a local question.
     pub source: Option<crate::question_app::QuestionSource>,
     pub questions: Vec<UserQuestion>,
     pub footer_note: Option<String>,
     pub current_question_idx: usize,
-    /// Cursor row: an option, then the free-text row, then the submit row.
-    pub selected_option: usize,
-    /// Scroll offset and whether the viewport follows the keyboard selection.
-    pub viewport: crate::question_app::Viewport,
-    /// Per-frame hit map `(row, option index)`, used to route a click to a row.
-    pub option_rows: Vec<(u16, usize)>,
+    /// Cursor row (an option, then the free-text row, then the submit row)
+    /// and the box viewport.
+    pub list: crate::option_list::OptionList<crate::option_list::SingleAction>,
     /// Saved answers by question index, as `(answer, is_other)`.
     pub answers: BTreeMap<usize, (String, bool)>,
     /// Ticked option indices per multi-select question.
@@ -694,13 +663,10 @@ pub struct QuestionApp {
     /// Per-frame screen geometry of the free-text field, to map a click to the caret.
     pub other_field: Option<crate::question_app::OtherField>,
     /// When the app opened, so buffered keys cannot answer it instantly.
-    pub mount_time: Option<Instant>,
-    /// Screen row of the in-flight mouse press, so a same-row release can
-    /// click even when the press started no selection gesture.
-    pub mouse_press_row: Option<u16>,
+    pub mount_time: Option<UiInstant>,
 }
 
-/// `/mcp` browser state (Python's `MCPApp` bottom-app).
+/// `/mcp` browser state (a bottom-app).
 #[derive(Default)]
 pub struct MCPApp {
     pub search: crate::search_field::Search,
@@ -713,22 +679,14 @@ pub struct MCPApp {
     /// A refresh is in flight; further refreshes are coalesced into it.
     pub refreshing: bool,
     /// When the open browser next re-discovers sources in the background.
-    pub refresh_at: Option<Instant>,
+    pub refresh_at: Option<UiInstant>,
     /// Source whose tools are listed, or `None` in the source list view.
     pub viewing_name: Option<String>,
     pub viewing_kind: Option<crate::server::MCPSourceKind>,
     /// Highlighted row index; headers and notes are skipped when navigating.
-    pub selected: usize,
-    /// Top line offset of the option list (Textual `scroll_to_highlight`).
-    pub scroll: usize,
-    /// Mouse-wheel scrolling temporarily detaches the viewport from the highlight.
-    pub free_scroll: bool,
-    /// Option-list viewport from the last render, used to route mouse clicks.
-    pub list_area: Rect,
-    /// Row index of each laid-out visual line, so a click maps to its option.
-    pub line_rows: Vec<usize>,
-    /// Sender carrying server answers, applied on the main thread.
-    pub tx: Option<Sender<crate::mcp::Event>>,
+    pub list: crate::option_list::OptionList<crate::option_list::MultiAction>,
+    /// The connector whose `connector_catalog/connect` is in flight, if any.
+    pub connecting: Option<String>,
 }
 
 /// The identity and account reads `/whoami` renders, kept from the post-ready
@@ -738,26 +696,77 @@ pub struct MCPApp {
 pub struct WhoamiCache {
     model: Option<String>,
     reads: AccountReads,
+    /// When the account was last read or asked for, to space the usage gauge's re-reads.
+    read_at: Option<Instant>,
+    /// The model the latest read was asked for, so a model switch asks once
+    /// and an answer for an older ask is dropped.
+    asked: Option<String>,
+    /// When the latest read failed, so a retry waits a little instead of asking every frame.
+    failed_at: Option<Instant>,
 }
 
 impl WhoamiCache {
+    /// Keep `reads` for the `model` they were asked under, unless a later ask superseded it.
     pub fn store(&mut self, model: String, reads: AccountReads) {
+        if self.asked.as_ref().is_some_and(|asked| *asked != model) {
+            return;
+        }
+        self.asked = Some(model.clone());
         self.model = Some(model);
         self.reads = reads;
+        self.failed_at = None;
+        self.read_at.get_or_insert_with(crate::clock::real_now);
+    }
+
+    /// Forget a failed ask for `model` at `at`, so the next frame asks again
+    /// once the retry delay passes; the last stored reads stay.
+    pub fn failed(&mut self, model: &str, at: Instant) {
+        if self.asked.as_deref() != Some(model) || self.model.as_deref() == Some(model) {
+            return;
+        }
+        self.asked = self.model.clone();
+        self.failed_at = Some(at);
+    }
+
+    pub fn failed_at(&self) -> Option<Instant> {
+        self.failed_at
+    }
+
+    /// Record that the account is being read for `model` (startup, `/whoami`).
+    pub fn ask(&mut self, model: String) {
+        self.asked = Some(model);
+    }
+
+    pub fn read_at(&self) -> Option<Instant> {
+        self.read_at
+    }
+
+    pub fn mark_read(&mut self, at: Instant, model: String) {
+        self.read_at = Some(at);
+        self.asked = Some(model);
+    }
+
+    /// Whether any read was asked for; until the post-ready fetch asks, it owns the account.
+    pub fn has_asked(&self) -> bool {
+        self.asked.is_some()
+    }
+
+    pub fn asked_for(&self, model: &str) -> bool {
+        self.asked.as_deref() == Some(model)
     }
 
     pub fn hit(&self, model: &str) -> Option<&AccountReads> {
         (self.model.as_deref() == Some(model)).then_some(&self.reads)
     }
 
-    /// The account read the rate-limit message consults (Python
-    /// `resources.account.current`), independent of the model it was read for.
+    /// The account read the rate-limit message consults, independent of the
+    /// model it was read for.
     pub fn account(&self) -> &serde_json::Value {
         &self.reads.account
     }
 }
 
-/// MCP OAuth bottom-app state (Python's `MCPOAuthApp`).
+/// MCP OAuth bottom-app state.
 #[derive(Default)]
 pub struct MCPOAuthApp {
     /// While set the app replaces the input box and owns every key.
@@ -768,23 +777,19 @@ pub struct MCPOAuthApp {
     pub auth_url: Option<String>,
     /// Whether "Manually show the URL" revealed it under the options.
     pub auth_url_visible: bool,
-    /// Status prefixed to the help line (Python `_status_message`).
+    /// Status prefixed to the help line.
     pub status_message: Option<String>,
     /// Whether an `mcp/login` is in flight, so `R` cannot start a second one.
     pub logging_in: bool,
     /// Whether the last login failed; the list then shows the retry note.
     pub failed: bool,
-    /// Highlighted action option among the three selectable rows.
-    pub selected: usize,
+    /// Highlight among the three selectable action rows.
+    pub list: crate::option_list::OptionList<crate::option_list::SingleAction>,
     /// Login attempt counter, so a stale answer cannot settle a retry.
     pub generation: u64,
-    /// Option-list viewport from the last render, used to route mouse clicks.
-    pub list_area: Rect,
-    /// Sender carrying the `mcp/login` answer, applied on the main thread.
-    pub tx: Option<Sender<crate::mcp_oauth::Event>>,
 }
 
-/// Connector auth bottom-app state (Python's `ConnectorAuthApp`).
+/// Connector auth bottom-app state.
 #[derive(Default)]
 pub struct ConnectorAuthApp {
     /// While set the app replaces the input box and owns every key.
@@ -797,42 +802,42 @@ pub struct ConnectorAuthApp {
     pub auth_url: Option<String>,
     /// Whether "Manually show the URL" revealed it under the options.
     pub auth_url_visible: bool,
-    /// Status prefixed to the help line (Python `_status_message`).
+    /// Status prefixed to the help line.
     pub status_message: Option<String>,
-    /// Highlighted action option among the three selectable rows.
-    pub selected: usize,
+    /// Highlight among the three selectable action rows.
+    pub list: crate::option_list::OptionList<crate::option_list::SingleAction>,
     /// Open-attempt counter, so a stale worker answer cannot land.
     pub generation: u64,
-    /// Option-list viewport from the last render, used to route mouse clicks.
-    pub list_area: Rect,
-    /// Sender carrying the auth-read and refresh answers, applied on the main thread.
-    pub tx: Option<Sender<crate::connector_auth::Event>>,
 }
 
 #[derive(Default)]
 pub struct App {
+    pub credential_client: Option<Arc<crate::server::Client>>,
     pub terminal_notifier: crate::terminal_notifier::TerminalNotifier,
     pub chat_input: ChatInput,
+    pub vim: crate::vim::Vim,
     pub session: Session,
     pub agents: Agents,
     pub view: View,
     pub selection: SelectionState,
     pub overlays: Overlays,
     pub completion: Completion,
+    /// The Ctrl+R prompt-history search the composer holds, if any.
+    pub reverse_search: Option<crate::reverse_search::ReverseSearch>,
     pub paste_image: crate::paste_image::State,
     pub voice: Voice,
     pub voice_app: crate::voice_app::VoiceApp,
+    pub branch_app: crate::branch_app::BranchApp,
     pub proxy_setup: crate::proxy_setup::ProxySetupApp,
     pub config_screen: ConfigScreen,
+    pub release_notes: crate::release_notes::State,
     pub theme_picker: ThemePicker,
     pub model_picker: ModelPicker,
     pub log_level_picker: LogLevelPicker,
     pub thinking_picker: ThinkingPicker,
+    pub artifacts_modal: ArtifactsModal,
     pub resume_picker: ResumePicker,
-    pub vibe_code_project: crate::vibe_code_project::State,
-    /// The running `/teleport` operation, if any.
-    pub teleport: Option<crate::teleport::Operation>,
-    /// The latest written todo list (Python `TodoTracker`), never seeded from history.
+    /// The latest written todo list, never seeded from history.
     pub todo_tracker: crate::todo_tracker::TodoTracker,
     pub todo_sidebar: crate::todo_tracker::TodoSidebar,
     pub rewind: Rewind,
@@ -840,6 +845,9 @@ pub struct App {
     pub question_app: QuestionApp,
     pub mcp: MCPApp,
     pub plugins: crate::plugins::State,
+    pub skills_browser: crate::skills_browser::State,
+    /// The `/context` bottom app.
+    pub context_app: crate::context_app::State,
     pub mcp_oauth: MCPOAuthApp,
     pub connector_auth: ConnectorAuthApp,
     /// The pre-session workspace-trust gate.
@@ -852,6 +860,8 @@ pub struct App {
     pub queue: QueueController,
     /// Ctrl+C / Ctrl+D double-press quit confirmation.
     pub quit: crate::quit_manager::QuitManager,
+    /// Widget answers to async requests, applied by the main event loop.
+    pub events: Option<crate::ui_event::Sender>,
     /// Async slash-command results, reduced by the main event loop.
     pub command_tx: Option<tokio::sync::mpsc::Sender<CommandEvent>>,
     /// Analytics events queued by the reducer, sent by the main event loop.
@@ -859,17 +869,13 @@ pub struct App {
     /// Identity and account reads reused by `/whoami`.
     pub whoami: WhoamiCache,
     /// Handle to the `/stress` firehose task, or `None` when it is off. A second
-    /// `/stress` aborts it (mirrors Python's `_stress_task`).
+    /// `/stress` aborts it.
     pub stress: Option<tokio::task::JoinHandle<()>>,
     /// Whether a `/compact` request is in flight, so the UI shows the spinner
     /// and the `session/compacted` notification can settle it.
     pub compacting: bool,
-    /// Picker commits and slash commands whose server round-trip is still in
-    /// flight. Python keeps the app busy until its queued command finishes, so
-    /// the app is not idle while one is pending.
-    pub pending_commits: Arc<AtomicU32>,
     /// Slash commands submitted while the session is still starting, replayed
-    /// once `apply_ready` settles. Python holds dispatch on `_session_ready.wait()`.
+    /// once `apply_ready` settles.
     pub pending_commands: Vec<String>,
     /// Ctrl+Z requested suspend; the event loop performs the SIGTSTP cycle.
     pub suspend_requested: bool,
@@ -881,21 +887,54 @@ pub struct App {
     pub subagents: crate::subagents::Subagents,
     /// Older history paged in once the transcript is scrolled to its top.
     pub older_history: crate::older_history::OlderHistory,
+    /// Config validation warnings already shown.
+    pub shown_config_warnings: HashSet<String>,
+    /// The startup warnings box, filled until the first turn.
+    pub startup_notices: crate::notices::StartupNotices,
+    /// The `/debug` console: a right-docked live view of the session logs.
+    pub debug_console: crate::debug_console::DebugConsole,
 }
 
 impl App {
     pub fn set_session_id(&mut self, session_id: String) {
         if self.session.session_id.as_deref() != Some(session_id.as_str()) {
-            self.vibe_code_project = Default::default();
-            crate::teleport::reset(self);
+            self.session.deferred_completion = None;
+            self.branch_app = Default::default();
+            crate::program_status::reset_shell(self);
+            self.terminal_notifier.clear_outcome();
+            // The retry offer names the previous session's turn and rows.
+            crate::commands::retry::cancel(self);
+            // A session switch starts a new log: drop the old session's lines
+            // and paging offset so the console repopulates from the new one.
+            crate::debug_console::clear_session(&mut self.debug_console);
+            // The old session's PRs/MRs go with it; `artifacts::follow_session` reads the new ones.
+            self.session.artifacts.clear();
+            self.session.artifacts_session = None;
+            self.session.artifacts_unseen.clear();
+            crate::artifacts_modal::close(self);
+            // The old session's background work is not the new one's.
+            self.session.running_processes = 0;
+            self.session.wait_target = None;
+        }
+        // The console's poll task reads the current id on every tick.
+        if let Some(session_tx) = &self.debug_console.session_tx {
+            let _ = session_tx.send(session_id.clone());
         }
         self.session.session_id = Some(session_id);
+        // Background emitters can queue before the handshake lands.
+        for event in self.session.held_telemetry.drain(..) {
+            crate::telemetry::enqueue(self.telemetry_tx.as_ref(), event.name, event.properties);
+        }
     }
 
     /// Transition status; entering `Generating` resets the spinner, re-entering keeps the original start.
     pub fn set_status(&mut self, status: Status) {
-        self.terminal_notifier
-            .set_running(matches!(status, Status::Generating { .. }));
+        if !matches!(status, Status::Ready) {
+            self.session.deferred_completion = None;
+        }
+        if matches!(status, Status::Generating { .. }) {
+            self.terminal_notifier.clear_outcome();
+        }
         match (self.session.status, status) {
             (Status::Generating { .. }, Status::Generating { .. }) => {}
             (_, Status::Generating { .. }) => {
@@ -911,58 +950,18 @@ impl App {
         self.view.loading = LoadingAnim::default();
     }
 
-    /// `--resume`'s picker owns the screen: it opens on the session list read
-    /// before `session/start`, so the startup spinner above it is only noise.
-    pub fn startup_picker_active(&self) -> bool {
-        matches!(self.session.startup_resume, StartupResume::Picker) || self.resume_picker.open
-    }
-
-    /// True when no turn is running and startup has settled -- the app is waiting
-    /// on the user. Drives the replay-mode idle marker (see main.rs); `Failed` is
-    /// terminal and counts as settled so a broken startup still emits a marker.
-    pub fn is_idle(&self) -> bool {
-        // The gate parks startup on the user, so its frame is already final.
-        if self.trust.open {
-            return true;
-        }
-        self.is_settled()
-            // A pending child-transcript refresh owes the frame a re-fetch.
-            && self.subagents.refresh_at.is_none()
-            && matches!(self.session.status, Status::Ready | Status::Failed)
-            // An accepted prompt the server has not promoted yet is still work
-            // in flight (Python `_is_busy` counts `_queue.has_server_work`).
-            && self.queue.is_empty()
-            // A teleport reports progress by notification, like a turn.
-            && !crate::teleport::busy(self)
-    }
-
-    /// True once client-owned work has landed: startup finished, no request of
-    /// ours in flight, no config screen loading, no armed theme preview (the
-    /// frame is stable while its debounce runs, but the theme has not applied).
-    /// A running turn does not count, so this is what a `settle_busy` capture
-    /// waits for (Python's marker bypasses `_is_busy`, never `_off_thread_work`).
+    /// True once state the replay harness cannot see has landed: startup
+    /// finished, no config screen loading, no coalescing window armed. A running
+    /// turn does not count: the harness releases its events itself.
     pub fn is_settled(&self) -> bool {
         // An open gate counts as settled: nothing of ours is in flight.
         (self.trust.open || !matches!(self.session.status, Status::Starting))
             && (!self.config_screen.open || !self.config_screen.loading)
-            && self.theme_picker.preview_at.is_none()
-            && self.pending_commits.load(Ordering::Relaxed) == 0
             // A debounced theme preview repaints later; stay busy until it lands
-            // so the frame matches Python (whose pending timer defers idle).
+            // so the captured frame shows the applied theme.
             && self.theme_picker.preview_at.is_none()
             // A scheduled child-transcript refresh owes the frame a re-fetch.
             && self.subagents.refresh_at.is_none()
-    }
-
-    /// Mark a picker commit as in flight, keeping the app busy until its answer
-    /// has been applied here on the main thread.
-    pub fn commit_started(&self) -> Arc<AtomicU32> {
-        self.pending_commits.fetch_add(1, Ordering::Relaxed);
-        self.pending_commits.clone()
-    }
-
-    pub fn commit_finished(&self) {
-        self.pending_commits.fetch_sub(1, Ordering::Relaxed);
     }
 
     /// Only the main input ignores the shared blink phase when blinking is disabled.
@@ -977,8 +976,7 @@ impl App {
     }
 
     /// Terminal focus regained only lights the input while the composer owns
-    /// it (Python `on_app_focus`: `viewed_subagent_id is None and not
-    /// SubagentList.has_focus`); a child view or the focused list keeps it off.
+    /// it; a child view or the focused list keeps it off.
     pub fn set_app_focus_from_terminal(&mut self, focused: bool) {
         if !focused || (self.subagents.viewed_subagent_id.is_none() && !self.subagents.list.focused)
         {
@@ -986,16 +984,20 @@ impl App {
         }
     }
 
-    /// Show the hint-free `Loading` spinner while a slash command fetches.
-    pub fn begin_command_loading(&mut self) {
-        if self.session.shell_operation_id.is_some() {
-            return;
+    /// Show the hint-free `Loading` spinner while a slash command fetches; false when another job owns it.
+    pub fn begin_command_loading(&mut self) -> bool {
+        // A running shell command or turn keeps its own loading line.
+        if self.session.shell_operation_id.is_some()
+            || matches!(self.session.status, Status::Generating { .. })
+        {
+            return false;
         }
         self.view.loading = LoadingAnim::default();
         self.view
             .loading
             .set_label(ui::loading::COMMAND_LOADING_STATUS);
         self.view.command_loading = true;
+        true
     }
 
     /// Render the whole UI; layout and per-region drawing live in `ui`.
@@ -1004,20 +1006,19 @@ impl App {
         self.view.mouse_regions.clear();
         crate::mouse::register_region(self, f.area(), crate::mouse::MouseTarget::Blocked);
         ui::draw(self, f);
+        crate::terminal_hyperlinks::mark(
+            self,
+            f.buffer_mut(),
+            crate::mouse::MouseTarget::Transcript,
+        );
     }
 }
 
-/// Seconds a voice error/notice line stays up, matching the copy notice.
+/// Seconds a voice notice line stays up, matching the copy notice.
 const VOICE_NOTICE_SECS: u64 = 4;
 
-/// Seconds a toast stays up (Python `App.NOTIFICATION_TIMEOUT`).
-const TOAST_SECS: u64 = 5;
-
-/// Max toasts kept at once; overflow is reported with the newest toast.
-const MAX_TOASTS: usize = 64;
-
 impl App {
-    /// True whenever a recording is in flight (Python `transcribe_state != IDLE`).
+    /// True whenever a recording is in flight.
     pub fn recording_active(&self) -> bool {
         self.voice.transcribe_state != TranscribeState::Idle
     }
@@ -1027,7 +1028,7 @@ impl App {
         f32::from_bits(self.voice.peak.load(Ordering::Relaxed))
     }
 
-    /// Ctrl+R (Python `_handle_voice_key`): start or stop recording.
+    /// Ctrl+T: start or stop recording.
     pub fn toggle_recording(&mut self) {
         match self.voice.transcribe_state {
             TranscribeState::Idle => self.start_recording(),
@@ -1036,8 +1037,8 @@ impl App {
         }
     }
 
-    /// Ctrl+O (Python `action_toggle_tool`): flip the global fold state and
-    /// apply it to every group and collapsible result body at once.
+    /// Ctrl+O: flip the global fold state and apply it to every group and
+    /// collapsible result body at once.
     pub fn toggle_tools(&mut self) {
         self.view.tools_collapsed = !self.view.tools_collapsed;
         let expand = !self.view.tools_collapsed;
@@ -1049,10 +1050,9 @@ impl App {
                 expanded.insert(id);
             }
         }
-        // Python `action_toggle_tool` flips every mounted section; the viewed
-        // child's transcript is only swapped in at render time, so its ids and
-        // cache are handled here — in both directions, or a collapse keeps the
-        // cached expanded layout.
+        // Every mounted section flips; the viewed child's transcript is only
+        // swapped in at render time, so its ids and cache are handled here — in
+        // both directions, or a collapse keeps the cached expanded layout.
         if let Some(child) = viewed_child
             .as_deref()
             .and_then(|child_id| self.subagents.transcripts.child_mut(child_id))
@@ -1067,14 +1067,14 @@ impl App {
         self.view.scroll_anchor = crate::utils::scroll::bulk_toggle_anchor(
             self.view.scroll_target,
             &self.view.entry_rows,
+            self.view.sticky_prompt.map_or(0, |(_, rows)| rows),
         );
     }
 
-    /// Python consults `_tools_collapsed` whenever history (re)builds mount
-    /// widgets (`build_history_widgets(tools_collapsed=...)`): while expanded,
-    /// every rebuilt group and reasoning row mounts unfolded. Rebuilt tool
-    /// results keep their constructor's collapsed default, so only group keys
-    /// and reasoning ids join `expanded`. True rebuilds (resume, rewind) remount
+    /// History (re)builds consult the bulk fold state: while expanded,
+    /// every rebuilt group, reasoning row and loop prompt mounts unfolded. Rebuilt
+    /// tool results keep their collapsed default, so only group keys, reasoning
+    /// and loop prompt ids join `expanded`. True rebuilds (resume, rewind) remount
     /// every widget fresh, so their callers clear `expanded` first; the
     /// mid-turn snapshot path keeps live widget state and stays insert-only.
     pub fn expand_rebuilt_tools(&mut self) {
@@ -1086,7 +1086,7 @@ impl App {
             if let Some(group) = value.group.as_ref().filter(|group| group.first) {
                 expanded.insert(group.key.clone());
             }
-            if self.view.transcript.is_reasoning(value.id) {
+            if value.fired_loop.is_some() || self.view.transcript.is_reasoning(value.id) {
                 expanded.insert(value.id.to_owned());
             }
         }
@@ -1099,13 +1099,18 @@ impl App {
         else {
             return;
         };
-        match crate::voice::start(&cfg, self.voice.peak.clone(), tx) {
+        match crate::voice::start(
+            &cfg,
+            self.credential_client.clone(),
+            self.voice.peak.clone(),
+            tx,
+        ) {
             Ok(rec) => {
                 self.voice.recording = Some(rec);
                 self.voice.transcribe_state = TranscribeState::Recording;
                 self.voice.tracking.start();
             }
-            Err(msg) => self.show_toast(msg, ToastSeverity::Warning, TOAST_SECS),
+            Err(msg) => ui::notice::show_sticky(self, Severity::Warning, &msg),
         }
     }
 
@@ -1121,7 +1126,7 @@ impl App {
         self.voice.transcribe_state = TranscribeState::Flushing;
     }
 
-    /// Abort recording without a transcript (Python `cancel_recording`).
+    /// Abort recording without a transcript.
     pub fn cancel_recording(&mut self) {
         if self.voice.transcribe_state == TranscribeState::Idle {
             return;
@@ -1152,7 +1157,8 @@ impl App {
                     &mut self.chat_input.cursor,
                     &text,
                 );
-                self.chat_input.record_edit(before, true, Instant::now());
+                self.chat_input
+                    .record_edit(before, true, crate::clock::now());
                 crate::completion_manager::input_changed(self);
             }
             // A cancelled recording already reported; its late session is noise.
@@ -1175,11 +1181,8 @@ impl App {
                 );
                 self.voice.recording = None;
                 self.voice.transcribe_state = TranscribeState::Idle;
-                self.show_toast(
-                    format!("Voice transcription failed: {msg}"),
-                    ToastSeverity::Error,
-                    TOAST_SECS,
-                );
+                let message = format!("Voice transcription failed: {msg}");
+                crate::notices::inline(self, Severity::Error, &message);
             }
             VoiceEvent::Finished => {
                 crate::telemetry::record(
@@ -1194,43 +1197,6 @@ impl App {
     }
 
     fn show_voice_notice(&mut self, text: String) {
-        self.overlays.notice = Some(Notice {
-            text,
-            severity: ToastSeverity::Information,
-            until: Instant::now() + Duration::from_secs(VOICE_NOTICE_SECS),
-        });
-    }
-
-    /// Enqueue a toast for `seconds` (Python `App.notify(timeout=...)`), bounded.
-    pub fn show_toast(&mut self, text: String, severity: ToastSeverity, seconds: u64) {
-        let id = self.overlays.next_toast_id;
-        self.overlays.next_toast_id = id.wrapping_add(1);
-        self.overlays.toasts.push_back(Toast {
-            id,
-            text,
-            severity,
-            duration: Duration::from_secs(seconds),
-            until: None,
-            omitted: 0,
-        });
-        if self.overlays.toasts.len() <= MAX_TOASTS {
-            return;
-        }
-        let mut omitted = self
-            .overlays
-            .toasts
-            .iter()
-            .map(|toast| toast.omitted)
-            .fold(0usize, usize::saturating_add);
-        while self.overlays.toasts.len() > MAX_TOASTS {
-            self.overlays.toasts.pop_front();
-            omitted = omitted.saturating_add(1);
-        }
-        for toast in &mut self.overlays.toasts {
-            toast.omitted = 0;
-        }
-        if let Some(newest) = self.overlays.toasts.back_mut() {
-            newest.omitted = omitted;
-        }
+        ui::notice::show(self, Severity::Information, &text, VOICE_NOTICE_SECS);
     }
 }

@@ -1,8 +1,7 @@
-//! Edit the composer text in `$VISUAL` / `$EDITOR` (Python `ExternalEditor`).
+//! Edit the composer text in `$VISUAL` / `$EDITOR`.
 
 use std::ffi::OsString;
 use std::path::Path;
-use std::time::Instant;
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
@@ -29,7 +28,7 @@ pub fn get_editor(visual: Option<String>, editor: Option<String>) -> String {
         .unwrap_or_else(|| DEFAULT_EDITOR.to_owned())
 }
 
-/// The editor command split like a shell (Python `shlex.split`), then the file.
+/// The editor command split like a shell, then the file.
 pub fn command(editor: &str, path: &Path) -> Vec<OsString> {
     let parts = shlex::split(editor).unwrap_or_else(|| vec![editor.to_owned()]);
     let mut argv: Vec<OsString> = parts.into_iter().map(OsString::from).collect();
@@ -55,7 +54,8 @@ pub fn apply(app: &mut App, text: String) {
     crate::long_paste::load_collapsed(app, text);
     app.chat_input.edit_history = history;
     crate::composer_paths::rewrite_image_paths(&mut app.chat_input);
-    app.chat_input.record_edit(before, true, Instant::now());
+    app.chat_input
+        .record_edit(before, true, crate::clock::now());
     crate::input::reset_history_state(app);
     crate::completion_manager::input_changed(app);
 }

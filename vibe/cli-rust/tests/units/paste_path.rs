@@ -11,6 +11,8 @@ use vibe_rs::paste_path::{
     pasted_image_path_on, rewrite_bare_image_paths_in_text, rewrite_bare_image_paths_in_text_on,
 };
 
+use crate::support::type_text;
+
 /// The `@` mention a lone pasted image path stands for, or the paste unchanged.
 fn maybe_prepend_at_for_image_path(pasted: &str) -> String {
     maybe_prepend_at_for_image_path_on(pasted, cfg!(windows))
@@ -141,6 +143,26 @@ fn inserts_numbered_image_placeholders_with_token_boundaries() {
 
     assert_eq!(app.chat_input.input, "inspect [Image #2] ");
     assert_eq!(pasted_image_path("inspect /tmp/diagram.png"), None);
+}
+
+fn typed(text: &str) -> String {
+    let mut app = App::default();
+    type_text(&mut app, text);
+    app.chat_input.input
+}
+
+#[test]
+fn a_typed_quoted_image_path_becomes_a_mention_once_its_quote_closes() {
+    assert_eq!(typed("'/tmp/vibe/shot.png"), "'/tmp/vibe/shot.png");
+    assert_eq!(typed("'/tmp/vibe/shot.png'"), "@/tmp/vibe/shot.png");
+}
+
+#[test]
+fn a_typed_quoted_image_path_with_spaces_keeps_its_quotes_in_the_mention() {
+    assert_eq!(
+        typed("'/tmp/vibe/has space.png'"),
+        "@'/tmp/vibe/has space.png'"
+    );
 }
 
 #[test]

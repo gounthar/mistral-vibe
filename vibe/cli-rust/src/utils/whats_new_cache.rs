@@ -1,5 +1,5 @@
 //! The what's-new seen-version gate over the shared `[update_cache]` section
-//! of `cache.toml` (Python `update_notifier/whats_new.py`); the update checks
+//! of `cache.toml`; the update checks
 //! that seed the cache live in `update_notifier`.
 
 use super::now_unix;
@@ -7,20 +7,30 @@ use crate::update_notifier::cache::{
     FileSystemUpdateCacheRepository, UpdateCache, UpdateCacheRepository,
 };
 
-/// Python `should_show_whats_new`: show when a stored cache exists and its seen
-/// version is absent or differs from the current one. No cache at all (or a
-/// section missing the required fields) shows nothing and stamps nothing.
-pub fn should_show(current_version: &str) -> bool {
-    let Some(cache) = FileSystemUpdateCacheRepository.get() else {
-        return false;
-    };
-    cache.seen_whats_new_version.as_deref() != Some(current_version)
+/// What the cache says the user last saw.
+#[derive(Debug, PartialEq, Eq)]
+pub enum LastSeen {
+    /// No cache yet (a fresh install): show nothing, stamp nothing.
+    NoCache,
+    /// A cache whose seen version is absent when no banner was ever stamped.
+    Seen(Option<String>),
 }
 
-/// Python `mark_version_as_seen`: stamp the current version as shown, keeping
-/// the stored latest version and dismissal. Python leaves the write's
-/// `OSError` for the caller's task to log; the banner mount does not handle
-/// it, so the log lives here.
+pub fn last_seen() -> LastSeen {
+    match FileSystemUpdateCacheRepository.get() {
+        Some(cache) => LastSeen::Seen(cache.seen_whats_new_version),
+        None => LastSeen::NoCache,
+    }
+}
+
+/// Whether a cache exists and its seen version differs from `current_version`.
+pub fn should_show(current_version: &str) -> bool {
+    matches!(last_seen(), LastSeen::Seen(seen) if seen.as_deref() != Some(current_version))
+}
+
+/// Stamp the current version as shown, keeping the stored latest version and
+/// dismissal. The banner mount does not handle a failed write, so the log
+/// lives here.
 pub fn mark_seen(current_version: &str) {
     let repository = FileSystemUpdateCacheRepository;
     if let Err(err) = repository.modify(&mut |cache| {

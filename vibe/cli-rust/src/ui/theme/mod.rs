@@ -1,16 +1,25 @@
-//! Central color palette, read live from the active Textual theme.
+//! Central color palette, read live from the active theme.
 
 use ratatui::style::{Color, Modifier, Style};
 
+pub mod color_system;
+mod context;
 pub mod fixed;
+mod markdown;
 mod registry;
 pub(crate) mod syntax;
 
+pub use context::{context_buffer, context_palette, context_track};
 pub use fixed::{LOADING_GRADIENT, ORANGE};
+pub use markdown::{
+    code_plain, md_accent, md_code_inline, md_fence_border, md_heading, md_keyline, md_link,
+    md_table_header, md_widget_code_inline, md_widget_fence_bg, md_widget_marker,
+    md_widget_quote_bar,
+};
 
 pub use registry::{
-    active, active_index, ansi_background, resolve, selection_fg, set_active_index,
-    toast_background, ALL, AUTO_NAME,
+    active, active_index, ansi_background, chip_background, resolve, selection_fg,
+    set_active_index, ALL, AUTO_NAME,
 };
 
 /// Seed the detected `auto` palette, then activate the configured name.
@@ -31,7 +40,7 @@ pub fn set_active(name: &str) {
     set_active_index(index);
 }
 
-/// Painted on every cell (Textual fills the whole screen with `$background`).
+/// Painted on every cell: the whole screen fills with `$background`.
 pub fn background() -> Color {
     active().background
 }
@@ -45,7 +54,7 @@ pub fn screen_style() -> Style {
 pub fn text(color: Color) -> Style {
     Style::default().fg(color).remove_modifier(Modifier::DIM)
 }
-/// Textual's reduced-opacity text uses SGR dim only on ANSI themes.
+/// Reduced-opacity text uses SGR dim only on ANSI themes.
 pub fn dim(color: Color) -> Style {
     let style = text(color);
     if is_ansi() {
@@ -54,11 +63,11 @@ pub fn dim(color: Color) -> Style {
         style
     }
 }
-/// Textual's muted labels use the muted color plus ANSI dim.
+/// Muted labels use the muted color plus ANSI dim.
 pub fn muted_style() -> Style {
     dim(muted())
 }
-/// Link cells under the mouse, matching Textual's link hover style.
+/// Link cells under the mouse.
 pub fn link_hover_style() -> Style {
     let style = if is_ansi() {
         Style::default().fg(ansi_background()).bg(Color::LightBlue)
@@ -78,13 +87,17 @@ pub fn foreground() -> Color {
 pub fn secondary() -> Color {
     active().secondary
 }
-/// $text-muted — the muted blend Textual computes for dim/secondary labels.
+/// $text-muted — the muted blend for dim/secondary labels.
 pub fn muted() -> Color {
     blend(background(), auto_contrast(), 0.6)
 }
 /// $foreground-muted — the completion popup's border (60% foreground over bg).
 pub fn popup_border() -> Color {
     active().popup_border
+}
+/// Border lines in `popup_border`, SGR-dimmed on ANSI themes to match the truecolor blend.
+pub fn border_style() -> Style {
+    dim(popup_border())
 }
 /// Text-selection highlight background (`$screen-selection-background`).
 pub fn selection_bg() -> Color {
@@ -95,7 +108,7 @@ pub fn selection_bg() -> Color {
 pub fn warning() -> Color {
     active().warning
 }
-/// $success — a safe agent's input border, completed effects, added diff lines.
+/// $success — a safe agent's mode label, completed effects, added diff lines.
 pub fn success() -> Color {
     active().success
 }
@@ -104,6 +117,13 @@ pub fn status_ready() -> Color {
 }
 pub fn error() -> Color {
     active().error
+}
+/// A merged PR/MR: GitHub's purple, magenta on ANSI themes.
+pub fn merged() -> Color {
+    if is_ansi() {
+        return Color::Magenta;
+    }
+    fixed::MERGED
 }
 
 // Completed-effect row: dim $primary verb and muted grey message.
@@ -121,7 +141,7 @@ pub fn effect_message() -> Color {
 pub fn primary() -> Color {
     active().primary
 }
-/// $surface — the `/config` modal background (Textual `background: $surface`).
+/// $surface — the `/config` modal background.
 pub fn surface() -> Color {
     active().surface
 }
@@ -141,12 +161,19 @@ pub fn block_cursor_bg() -> Color {
 pub fn block_cursor_fg() -> Color {
     active().block_cursor_fg
 }
+/// OptionList hover over `base`: contrast text at 10%, `$ansi-background` on ANSI themes (Textual shows none on ansi-dark).
+pub fn block_hover_bg(base: Color) -> Color {
+    match is_ansi() {
+        true => ansi_background(),
+        false => blend(base, auto_contrast(), 0.1),
+    }
+}
 /// A text field's block caret (and its selection) over `base`, in block-cursor colors.
 pub fn block_caret(base: Style) -> Style {
     base.fg(block_cursor_fg()).bg(block_cursor_bg())
 }
 
-/// Input caret block, including Textual's light-theme `$foreground 70%` rule.
+/// Input caret block, including the light-theme `$foreground 70%` rule.
 pub fn input_cursor_bg() -> Color {
     if !is_ansi() && !is_dark() {
         blend(background(), foreground(), 0.7)
@@ -154,7 +181,7 @@ pub fn input_cursor_bg() -> Color {
         active().input_cursor_bg
     }
 }
-/// TextArea's current-line `$boost`; only Textual's default dark theme sets it.
+/// The composer's current-line `$boost`; only the default dark theme sets it.
 pub fn input_cursor_line_bg() -> Color {
     if active().name == "textual-dark" {
         blend(background(), Color::Rgb(0xFF, 0xFF, 0xFF), 10.0 / 255.0)
@@ -162,17 +189,33 @@ pub fn input_cursor_line_bg() -> Color {
         background()
     }
 }
-/// ANSI themes render the caret as reverse-video (Textual's `:ansi` TextArea rule),
+/// ANSI themes render the caret as reverse-video,
 /// identified by their terminal-default (Reset) background.
 pub fn input_cursor_reverse() -> bool {
     is_ansi()
 }
 
-/// True for the `ansi-dark`/`ansi-light` themes, which Textual renders with raw
-/// terminal colors (their background is the terminal default, `Reset`). Several
-/// `:ansi` TCSS rules differ from truecolor themes (fence margin, code color).
+/// True for the `ansi-dark`/`ansi-light` themes, which render with raw
+/// terminal colors (their background is the terminal default, `Reset`). Some
+/// styles differ from truecolor themes (fence margin, code color).
 pub fn is_ansi() -> bool {
     active().background == Color::Reset
+}
+
+/// A footer gauge's fill and the track it fills: white on bright black on ANSI themes, else the text on a faint tint.
+pub fn gauge_fill() -> Color {
+    match (is_ansi(), is_dark()) {
+        (true, true) => Color::White,
+        (true, false) => Color::Black,
+        (false, _) => foreground(),
+    }
+}
+pub fn gauge_track() -> Color {
+    match (is_ansi(), is_dark()) {
+        (true, true) => Color::DarkGray,
+        (true, false) => Color::Gray,
+        (false, _) => blend(background(), auto_contrast(), 0.22),
+    }
 }
 
 /// Scrollbar thumb ($scrollbar) and track ($scrollbar-background).
@@ -183,106 +226,11 @@ pub fn scrollbar_bg() -> Color {
     active().scrollbar_bg
 }
 
-// Markdown constructs in assistant messages, matching Textual's `Markdown` widget.
+// Blends computed at render time rather than stored in the theme table.
 
-/// Heading text. Truecolor themes use $primary for every level; ANSI themes map
-/// each level to a raw terminal color (Textual's `design.py` ANSI palette).
-pub fn md_heading(level: u8) -> Color {
-    if !is_ansi() {
-        return active().primary;
-    }
-    match level {
-        1 => Color::Magenta,
-        2 => Color::LightBlue,
-        3 => Color::Blue,
-        _ => Color::Cyan,
-    }
-}
-/// Inline code (`x`) — vibe overrides the widget default to $success.
-pub fn md_code_inline() -> Color {
-    active().success
-}
-/// Unstyled highlighted text inherits `$text`: terminal default or theme contrast.
-pub fn code_plain() -> Color {
-    if is_ansi() {
-        foreground()
-    } else {
-        auto_contrast()
-    }
-}
-/// Blockquote bar `▌` — $foreground-muted (60% foreground over background).
-pub fn md_quote_bar() -> Color {
-    active().popup_border
-}
-/// Link label — the dimmed foreground Textual paints link text with.
-pub fn md_link() -> Color {
-    if is_ansi() {
-        return primary();
-    }
-    blend(background(), auto_contrast(), 0.87)
-}
-/// Table keyline border — $foreground 20% over background.
-pub fn md_table_border() -> Color {
-    blend(background(), foreground(), 0.2)
-}
-/// Horizontal rule — Textual's `MarkdownHorizontalRule` border, `$secondary`.
-pub fn md_rule() -> Color {
-    secondary()
-}
-
-// Colors of a standalone `Markdown` widget (Textual defaults, no vibe overrides).
-
-/// MarkdownBullet — $text-primary (dark) / $text-secondary (light).
-pub fn md_widget_marker() -> Color {
-    if is_dark() {
-        text_primary()
-    } else {
-        text_secondary()
-    }
-}
-/// MarkdownBlockQuote border-left — $text-primary 50% (dark) / $text-secondary (light).
-pub fn md_widget_quote_bar() -> Color {
-    if is_ansi() || !is_dark() {
-        return md_widget_marker();
-    }
-    blend(background(), text_primary(), 0.5)
-}
-/// Standalone `.code_inline` — $text-warning 95% over $warning 10% (dark),
-/// $text-error 95% over $error 5% (light); ANSI keeps the raw tint, no bg.
-pub fn md_widget_code_inline() -> (Color, Color) {
-    if is_ansi() {
-        let fg = if is_dark() { warning() } else { error() };
-        return (fg, background());
-    }
-    let dark = is_dark();
-    let wash = if dark { warning() } else { error() };
-    let tint = if dark { text_warning() } else { text_error() };
-    let alpha = if dark { 0.10 } else { 0.05 };
-    let bg = blend(background(), wash, alpha);
-    (blend(bg, tint, 0.95), bg)
-}
-/// Standalone MarkdownFence background — black 10% (dark) / white 30% (light).
-pub fn md_widget_fence_bg() -> Option<Color> {
-    if is_ansi() {
-        return None;
-    }
-    let wash = if is_dark() {
-        Color::Rgb(0, 0, 0)
-    } else {
-        Color::Rgb(255, 255, 255)
-    };
-    Some(blend(
-        background(),
-        wash,
-        if is_dark() { 0.10 } else { 0.30 },
-    ))
-}
-
-// Blends Textual computes at render time rather than storing in the theme table.
-
-/// Textual's `DimFilter` factor: a `dim` style blends its color toward the cell background.
+/// Dim factor: a `dim` style blends its color toward the cell background.
 pub const DIM_FACTOR: f32 = 0.66;
-/// Textual's `Color.blend`: `base` moved `alpha` of the way toward `other`.
+/// `base` moved `alpha` of the way toward `other`.
 pub fn blend(base: Color, other: Color, alpha: f32) -> Color {
     let (Color::Rgb(r1, g1, b1), Color::Rgb(r2, g2, b2)) = (base, other) else {
         return base;
@@ -291,12 +239,12 @@ pub fn blend(base: Color, other: Color, alpha: f32) -> Color {
     Color::Rgb(mix(r1, r2), mix(g1, g2), mix(b1, b2))
 }
 
-/// Whether the active theme is a dark one (drives Textual's contrast and band alphas).
+/// Whether the active theme is a dark one (drives contrast and band alphas).
 pub fn is_dark() -> bool {
     active().dark
 }
 
-/// Textual's `auto` color: the contrast text of the theme background.
+/// The `auto` color: the contrast text of the theme background.
 pub fn auto_contrast() -> Color {
     if is_dark() {
         Color::Rgb(0xFF, 0xFF, 0xFF)
@@ -305,7 +253,7 @@ pub fn auto_contrast() -> Color {
     }
 }
 
-/// `$text-muted` as Textual's markup resolves it: the bare contrast text (terminal default on ANSI).
+/// `$text-muted` as markup resolves it: the bare contrast text (terminal default on ANSI).
 pub fn text_muted() -> Color {
     if is_ansi() {
         muted()
@@ -314,8 +262,8 @@ pub fn text_muted() -> Color {
     }
 }
 
-/// `$text-success` / `$text-error`, stored because Textual's own compositing
-/// lands a channel off the `tint` below on some themes.
+/// `$text-success` / `$text-error`, stored because the reference values sit a
+/// channel off the `tint` below on some themes.
 pub fn text_success() -> Color {
     active().text_success
 }
@@ -323,7 +271,7 @@ pub fn text_error() -> Color {
     active().text_error
 }
 
-/// The remaining `$text-*` tints Textual computes as `contrast_text.tint(color 66%)`;
+/// The remaining `$text-*` tints, computed as `contrast_text.tint(color 66%)`;
 /// ANSI themes use the raw color instead.
 pub fn text_primary() -> Color {
     tint(primary())

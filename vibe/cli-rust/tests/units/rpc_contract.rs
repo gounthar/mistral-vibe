@@ -3,17 +3,12 @@
 use serde_json::{json, Value};
 use vibe_rs::server::{
     method, notification, AgentSafety, AgentSummary, AgentSwitchParams, AgentType,
-    ApprovalCallback, ApprovalDecisionType, ContentBlock, FeedbackAction, FeedbackRecordParams,
-    FeedbackShouldShowParams, FeedbackShouldShowResponse, HistoryEntry, Incoming, InitializeParams,
-    MCPSourceKind, MCPSourceStatus, MCPState, Request, SessionStartParams, SessionStartResponse,
+    ApprovalCallback, ContentBlock, FeedbackAction, FeedbackRecordParams, FeedbackShouldShowParams,
+    FeedbackShouldShowResponse, HistoryEntry, Incoming, InitializeParams, MCPSourceKind,
+    MCPSourceStatus, MCPState, Request, SessionStartParams, SessionStartResponse,
     TelemetryRecordParams, TurnEnqueueParams, TurnInputEntry, UserAnswer, UserQuestionRequest,
     UserQuestionResult, WorkspaceTrustDetails, WorkspaceTrustStatusResponse, HISTORY_LIMIT,
 };
-
-#[test]
-fn history_limit_matches_the_python_default() {
-    assert_eq!(HISTORY_LIMIT, 200);
-}
 
 #[test]
 fn method_names_pin_the_wire_contract() {
@@ -49,17 +44,6 @@ fn incoming_frames_parse_with_missing_and_extra_fields() {
     assert_eq!(loaded.id, Some(3));
     assert_eq!(loaded.method.as_deref(), Some("history/entryAdded"));
     assert!(loaded.params.is_some());
-}
-
-#[test]
-fn error_codes_accept_strings_and_numbers_with_extra_fields() {
-    let string: Incoming =
-        serde_json::from_str(r#"{"id":1,"error":{"code":"conflict","message":"m"}}"#).unwrap();
-    let numeric: Incoming =
-        serde_json::from_str(r#"{"id":2,"error":{"code":-32000,"message":"m","data":{"a":1}}}"#)
-            .unwrap();
-    assert_eq!(string.error.unwrap().code(), "conflict");
-    assert_eq!(numeric.error.unwrap().code(), "-32000");
 }
 
 #[test]
@@ -153,6 +137,9 @@ fn session_start_params_serialize_history_limit() {
     let params = SessionStartParams {
         agent_config: Default::default(),
         history_limit: HISTORY_LIMIT,
+        model: None,
+        session_only: false,
+        kind: None,
     };
     let value: Value = serde_json::to_value(&params).unwrap();
     assert_eq!(value["historyLimit"], 200);
@@ -167,14 +154,6 @@ fn agent_switch_params_serialize_camel_case() {
     let value: Value = serde_json::to_value(&params).unwrap();
     assert_eq!(value["sessionId"], "s");
     assert_eq!(value["agentName"], "code");
-}
-
-#[test]
-fn approval_decisions_serialize_snake_case() {
-    let value: Value = serde_json::to_value(ApprovalDecisionType::ApproveForSession).unwrap();
-    assert_eq!(value, "approve_for_session");
-    let deny: Value = serde_json::to_value(ApprovalDecisionType::Deny).unwrap();
-    assert_eq!(deny, "deny");
 }
 
 #[test]
@@ -226,8 +205,8 @@ fn history_entries_deserialize_leniently() {
 fn approval_callbacks_default_every_field() {
     let callback: ApprovalCallback =
         serde_json::from_value(json!({"callbackId": "c1", "futureField": 1})).unwrap();
-    assert_eq!(callback.callback_id, "c1");
-    assert_eq!(callback.session_id, "");
+    assert_eq!(callback.address.callback_id, "c1");
+    assert_eq!(callback.address.session_id, None);
     assert_eq!(callback.detail.effect.tool_name, "");
     assert!(callback.detail.required_permissions.is_empty());
 
@@ -267,6 +246,12 @@ fn agent_summaries_default_and_tolerate_unknown_enums() {
     .unwrap();
     assert_eq!(known.safety, AgentSafety::Yolo);
     assert_eq!(known.agent_type, AgentType::Subagent);
+
+    let smart: AgentSummary = serde_json::from_value(json!({
+        "name": "smart-approve", "safety": "smart"
+    }))
+    .unwrap();
+    assert_eq!(smart.safety, AgentSafety::Smart);
 }
 
 #[test]

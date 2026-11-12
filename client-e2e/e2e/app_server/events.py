@@ -5,6 +5,7 @@ from __future__ import annotations
 from collections.abc import Sequence
 import json
 from typing import Any
+from urllib.parse import urlparse
 import uuid
 
 from e2e.app_server.config import FIXTURE_PATH
@@ -99,6 +100,13 @@ def cleared_state() -> dict[str, Any]:
     return state
 
 
+def live_snapshot(*events: AppServerEvent) -> AppServerEvent:
+    """A same-session `session/snapshot` whose history holds the given added entries."""
+    state = json.loads(json.dumps(_fixture["handshake"]["session/start"]["state"]))
+    state["history"] = [event["params"]["entry"] for event in events]
+    return _event("session/snapshot", {"sessionId": SESSION_ID, "state": state})
+
+
 def paste(text: str) -> str:
     """Wrap clipboard text in terminal bracketed-paste markers."""
     return f"\x1b[200~{text}\x1b[201~"
@@ -113,6 +121,13 @@ def turn_completed(
 ) -> AppServerEvent:
     """Build a `turn/completed`, optionally stopped for a reason (e.g. `limit`)."""
     return _turn(completed=True, stop_reason=stop_reason, session_id=session_id)
+
+
+def turn_interrupted() -> AppServerEvent:
+    """A turn/completed the user interrupted (Esc)."""
+    event = _turn(completed=True)
+    event["params"]["turn"]["status"] = "interrupted"
+    return event
 
 
 def turn_failed(
@@ -271,6 +286,60 @@ def complete_entry(entry_id: str) -> AppServerEvent:
     )
 
 
+def discard_entry(entry_id: str, cause: str = "failure") -> AppServerEvent:
+    """Settle one streaming entry as output the model never kept, as an ended turn does."""
+    return _updated(
+        entry_id,
+        [
+            {"op": "replace", "path": "/generationStatus", "value": "completed"},
+            {
+                "op": "add",
+                "path": "/outcome",
+                "value": {"type": "discarded", "cause": cause},
+            },
+        ],
+    )
+
+
+COMPACTION_ENTRY_ID = "checkpoint-compaction-00000000-0000-4000-8000-0000000000c1"
+
+
+def compaction_started(trigger: str = "automatic") -> AppServerEvent:
+    """Open a compaction checkpoint as the harness projects its running attempt."""
+    entry = _entry(
+        "checkpoint",
+        entry_id=COMPACTION_ENTRY_ID,
+        generation_status="in_progress",
+        kind="compaction",
+        message="Compacting context",
+        details={"trigger": trigger, "attempt": 1},
+    )
+    if trigger == "manual":
+        entry["turnId"] = None
+    return _added(entry)
+
+
+def compaction_settled(
+    trigger: str = "automatic", *, failed: bool = False
+) -> AppServerEvent:
+    """Settle the open compaction checkpoint as a compacted or failed attempt."""
+    details: dict[str, Any] = {"trigger": trigger, "attempt": 1}
+    if failed:
+        details["error"] = {"code": "invalid_compaction_summary"}
+        details["reason"] = "empty_summary"
+    else:
+        details["summaryLength"] = 42
+    message = "Context compaction failed" if failed else "Context compacted"
+    return _updated(
+        COMPACTION_ENTRY_ID,
+        [
+            {"op": "replace", "path": "/generationStatus", "value": "completed"},
+            {"op": "replace", "path": "/message", "value": message},
+            {"op": "replace", "path": "/details", "value": details},
+        ],
+    )
+
+
 def notice(message: str, detail: dict[str, Any]) -> AppServerEvent:
     """Build a completed notice entry; `detail` carries its discriminating kind."""
     return _added(_entry("notice", level="info", message=message, detail=detail))
@@ -311,9 +380,21 @@ def hook_completed(
     )
 
 
-def server_warning(message: str) -> AppServerEvent:
+def server_warning(message: str, *, code: str = "warning") -> AppServerEvent:
     """Build a server-pushed operational warning (Python `ServerWarning`)."""
-    return _event("warning", {"warning": {"code": "warning", "message": message}})
+    return _event("warning", {"warning": {"code": code, "message": message}})
+
+
+def runtime_updated(
+    validation_warnings: list[str] | None = None, *, session_id: str | None = None
+) -> AppServerEvent:
+    """Build a `runtime/updated` notification over the fixture runtime."""
+    runtime = json.loads(json.dumps(_fixture["handshake"]["runtime/read"]["runtime"]))
+    if validation_warnings is not None:
+        runtime["config"]["validationWarnings"] = validation_warnings
+    return _event(
+        "runtime/updated", {"sessionId": session_id or SESSION_ID, "runtime": runtime}
+    )
 
 
 def reasoning(text: str, *, generation_status: str = "completed") -> AppServerEvent:
@@ -670,6 +751,62 @@ def subagent_wait_started() -> AppServerEvent:
     )
 
 
+def model_wait_started() -> AppServerEvent:
+    """Build the running standalone `wait` the model calls for its background work."""
+    return _added(
+        _entry(
+            "effect",
+            entry_id="effect-model-wait",
+            generation_status="in_progress",
+            title="self.wait",
+            detail={
+                "toolName": "self.wait",
+                "display": {
+                    "summary": "Waiting for background work",
+                    "content": None,
+                    "suffix": "",
+                    "verb": "Waiting",
+                    "message": "for background work",
+                    "settledVerb": "Waited",
+                    "settledMessage": "for background work",
+                    "statusText": "Waiting for background work",
+                },
+                "kind": "tool",
+                "input": {"timeout_ms": 3_600_000},
+            },
+            state={"status": "running", "outputText": ""},
+        )
+    )
+
+
+def model_wait_completed() -> AppServerEvent:
+    """Settle the standalone `wait` once new input reached the model."""
+    return _updated(
+        "effect-model-wait",
+        [
+            {
+                "op": "replace",
+                "path": "/state",
+                "value": {
+                    "status": "completed",
+                    "output": {
+                        "type": "success",
+                        "content": [],
+                        "structured_content": {"reason": "input_available"},
+                    },
+                    "outputText": "",
+                    "display": {
+                        "success": True,
+                        "verb": "Waited",
+                        "message": "for background work",
+                    },
+                },
+            },
+            {"op": "replace", "path": "/generationStatus", "value": "completed"},
+        ],
+    )
+
+
 def subagent_wait_completed(response: str) -> AppServerEvent:
     """Complete the wait after the Harness has injected its notification."""
     return _updated(
@@ -1013,12 +1150,16 @@ def web_fetch_without_output(url: str) -> AppServerEvent:
 
 
 def _callback_entry(
-    questions: list[dict[str, Any]], footer_note: str | None, callback_id: str
+    questions: list[dict[str, Any]],
+    footer_note: str | None,
+    callback_id: str,
+    session_id: str | None = None,
 ) -> dict[str, Any]:
     return _entry(
         "callback",
         entry_id=callback_id,
         generation_status="in_progress",
+        session_id=session_id,
         callbackId=callback_id,
         title="User input required",
         detail={
@@ -1035,9 +1176,10 @@ def ask_user_question_added(
     *,
     footer_note: str | None = None,
     callback_id: str = "callback-ask_user_question",
+    session_id: str | None = None,
 ) -> AppServerEvent:
     """Build the callback history entry the projector broadcasts alongside the call."""
-    return _added(_callback_entry(questions, footer_note, callback_id))
+    return _added(_callback_entry(questions, footer_note, callback_id, session_id))
 
 
 def ask_user_question_answered(
@@ -1069,9 +1211,10 @@ def ask_user_question(
     footer_note: str | None = None,
     callback_id: str = "callback-ask_user_question",
     request_id: int = 9001,
+    session_id: str | None = None,
 ) -> AppServerEvent:
     """Build the server-to-client `callback/call` an `ask_user_question` tool opens."""
-    entry = _callback_entry(questions, footer_note, callback_id)
+    entry = _callback_entry(questions, footer_note, callback_id, session_id)
     event = _event("callback/call", {"callback": entry})
     event["id"] = request_id
     return event
@@ -1303,45 +1446,98 @@ def web_search_completed(
 
 
 def web_connector_call(
-    tool: str,
-    arguments: dict[str, Any],
-    structured_content: dict[str, Any],
-    *,
-    label: tuple[str, str, str],
+    tool: str, arguments: dict[str, Any], structured_content: dict[str, Any]
 ) -> AppServerEvent:
-    """Build a completed Unified `connector_web_search.<tool>` effect as the app server labels it."""
-    verb, noun, settled_verb = label
-    return _added(
-        _entry(
-            "effect",
-            title=f"connector_web_search.{tool}",
-            detail={
-                "toolName": f"connector_web_search.{tool}",
-                "display": {
-                    "summary": f"{verb} {noun}",
-                    "verb": verb,
-                    "message": noun,
-                    "settledVerb": settled_verb,
-                    "settledMessage": noun,
-                    "statusText": f"{verb} {noun}",
-                },
-                "kind": "tool",
-                "input": arguments,
-            },
-            state={
-                "status": "completed",
-                "output": {
-                    "type": "success",
-                    "content": [
-                        {"type": "text", "text": json.dumps(structured_content)}
-                    ],
-                    "structured_content": structured_content,
-                    "_meta": {"approval": {"decision": "execute"}},
-                },
-                "display": {"success": True, "verb": settled_verb, "message": noun},
-            },
+    """Build a completed Unified `connector_web_search.<tool>` effect as the app server projects it.
+
+    The app server classifies the web-search connector's `web_search` and
+    `open_url` tools into the built-in web kinds, so a connector call renders
+    exactly like the built-in it replaced: the detail carries the semantic
+    kind/input and the state carries the semantic output projected from the
+    connector's structured content (result cards keyed by reference id, or a
+    page object).
+    """
+    if tool == "web_search":
+        query = str(arguments.get("query", ""))
+        cards = sorted(
+            structured_content.values(), key=lambda card: card.get("rank", 0)
         )
-    )
+        sources = [
+            {"title": str(card.get("title", "")), "url": str(card.get("url", ""))}
+            for card in cards
+        ]
+        plural = "" if len(sources) == 1 else "s"
+        return _added(
+            _entry(
+                "effect",
+                title=f"connector_web_search.{tool}",
+                detail={
+                    "toolName": f"connector_web_search.{tool}",
+                    "display": {
+                        "summary": f"Searching the web: '{query}'",
+                        "content": None,
+                        "suffix": "",
+                        "verb": "Searching",
+                        "message": f"the web: '{query}'",
+                        "settledVerb": "Searched",
+                        "settledMessage": f"the web: '{query}'",
+                        "statusText": "Searching the web",
+                    },
+                    "kind": "web_search",
+                    "input": {"query": query},
+                },
+                state={
+                    "status": "completed",
+                    "output": {"query": query, "answer": "", "sources": sources},
+                    "display": {
+                        "success": True,
+                        "verb": "Searched",
+                        "message": f"'{query}' ({len(sources)} source{plural})",
+                    },
+                },
+            )
+        )
+    if tool == "open_url":
+        url = str(arguments.get("url", ""))
+        content = str(structured_content.get("content", ""))
+        domain = urlparse(url).netloc or url[:50]
+        return _added(
+            _entry(
+                "effect",
+                title=f"connector_web_search.{tool}",
+                detail={
+                    "toolName": f"connector_web_search.{tool}",
+                    "display": {
+                        "summary": f"Fetching: {domain}",
+                        "content": None,
+                        "suffix": "",
+                        "verb": "Fetching",
+                        "message": domain,
+                        "settledVerb": "Fetched",
+                        "settledMessage": domain,
+                        "statusText": "Fetching URL",
+                    },
+                    "kind": "web_fetch",
+                    "input": {"url": url, "timeout": None},
+                },
+                state={
+                    "status": "completed",
+                    "output": {
+                        "url": str(structured_content.get("url", url)),
+                        "content": content,
+                        "contentType": "",
+                        "wasTruncated": False,
+                    },
+                    "display": {
+                        "success": True,
+                        "verb": "Fetched",
+                        "message": f"{structured_content.get('url', url)} ({len(content):,} chars)",
+                        "suffix": "",
+                    },
+                },
+            )
+        )
+    raise ValueError(f"unsupported connector tool for golden fabrication: {tool}")
 
 
 def worktree_settled(
@@ -1456,4 +1652,66 @@ def worktree(
             },
         ),
         session_id,
+    )
+
+
+def artifact(
+    artifact_id: str,
+    *,
+    number: int,
+    url: str,
+    discovered_at: str,
+    provider: str = "github",
+    display_title: str | None = None,
+    session_id: str | None = None,
+) -> dict[str, Any]:
+    """One session artifact (PublicSessionArtifact) as the server sends it."""
+    details: dict[str, Any]
+    if provider == "gitlab":
+        details = {
+            "kind": "pull_request",
+            "schemaVersion": 1,
+            "repoHost": "gitlab.com",
+            "repoId": 42,
+            "projectPath": "mistral-ai/vibe",
+            "mergeRequestIid": number,
+        }
+        external_key = f"gitlab.com/42/merge_requests/{number}"
+    else:
+        details = {
+            "kind": "pull_request",
+            "schemaVersion": 1,
+            "repoHost": "github.com",
+            "repoOwner": "mistral-ai",
+            "repoName": "vibe",
+            "pullRequestNumber": number,
+        }
+        external_key = f"github.com/mistral-ai/vibe/pull/{number}"
+    return {
+        "id": artifact_id,
+        "sessionId": session_id or SESSION_ID,
+        "kind": "pull_request",
+        "provider": provider,
+        "externalKey": external_key,
+        "externalUrl": url,
+        "displayTitle": display_title,
+        "discoveredAt": discovered_at,
+        "viewedAt": None,
+        "details": details,
+    }
+
+
+def artifact_created(artifact: dict[str, Any]) -> AppServerEvent:
+    """The `artifacts/created` notification announcing a discovered artifact."""
+    return _event(
+        "artifacts/created",
+        {"sessionId": SESSION_ID, "emittedAt": _TIMESTAMP, "artifact": artifact},
+    )
+
+
+def artifact_updated(artifact: dict[str, Any]) -> AppServerEvent:
+    """The `artifacts/updated` notification carrying a synced artifact."""
+    return _event(
+        "artifacts/updated",
+        {"sessionId": SESSION_ID, "emittedAt": _TIMESTAMP, "artifact": artifact},
     )

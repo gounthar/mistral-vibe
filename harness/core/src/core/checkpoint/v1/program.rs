@@ -5,11 +5,14 @@ use crate::core::action_id;
 use crate::core::features::permissions::GrantKey;
 use crate::core::features::programmatic_tool_calling::RUN_TYPESCRIPT_NAME;
 use crate::core::features::programmatic_tool_calling::{
-    PendingProgramRecord, ProgramCapture, ProgramExecution, ProgramFunctionRecord,
+    PendingProgramOperation, ProgramCapture, ProgramClock, ProgramExecution, ProgramFunctionRecord,
     ProgramOperationRecord,
 };
 use crate::core::hooks::HookPoint;
 use crate::core::hooks::hook_action_id;
+use crate::core::tools::execution::external_call::{
+    ApprovalName, ExternalCallStage, PendingExternalCall,
+};
 use crate::core::tools::external::{ExternalToolCall, ToolOrigin};
 use crate::core::wire::content::ContentBlock;
 use crate::core::wire::tool::ToolCall;
@@ -28,6 +31,19 @@ use super::tool::{
 pub(super) struct CheckpointProgramExecution {
     operations: Vec<CheckpointProgramOperation>,
     round: u32,
+    // Earlier V1 checkpoints start the time budget on the next program round.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    started_at_unix_ms: Option<u64>,
+    /// Time-budget pauses that finished: approval and hook waits.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    paused_ms: u64,
+    /// Start of the current pause while an operation waits for an approval or a hook.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    paused_since_unix_ms: Option<u64>,
+}
+
+fn is_zero(value: &u64) -> bool {
+    *value == 0
 }
 
 impl CheckpointProgramExecution {
@@ -45,6 +61,9 @@ impl CheckpointProgramExecution {
         Ok(Self {
             operations,
             round: capture.round(),
+            started_at_unix_ms: capture.clock().started_at_unix_ms,
+            paused_ms: capture.clock().paused_ms,
+            paused_since_unix_ms: capture.clock().paused_since_unix_ms,
         })
     }
 
@@ -55,7 +74,16 @@ impl CheckpointProgramExecution {
             .into_iter()
             .map(CheckpointProgramOperation::restore)
             .collect::<Result<Vec<_>, _>>()?;
-        ProgramExecution::restore(source, operations, self.round)
+        ProgramExecution::restore(
+            source,
+            operations,
+            self.round,
+            ProgramClock {
+                started_at_unix_ms: self.started_at_unix_ms,
+                paused_ms: self.paused_ms,
+                paused_since_unix_ms: self.paused_since_unix_ms,
+            },
+        )
     }
 }
 
@@ -211,6 +239,10 @@ enum CheckpointProgramExternalExecution {
     },
     Pending {
         call: CheckpointExternalTool,
+        /// For a sleep: its length after pre-tool hooks, before Core fit it to
+        /// the time budget. Earlier V1 checkpoints do not record it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        requested_sleep_seconds: Option<f64>,
     },
     AwaitingPostHook {
         hook_binding_ids: Vec<String>,
@@ -229,100 +261,85 @@ enum CheckpointProgramExternalExecution {
 
 impl CheckpointProgramExternalExecution {
     fn capture(
-        pending: &PendingProgramRecord,
+        pending: &PendingProgramOperation,
         operation_id: &str,
         function: &ProgramFunctionRecord,
     ) -> Result<Self, String> {
         Self::validate(pending, operation_id, function)?;
-        Ok(match pending {
-            PendingProgramRecord::AwaitingPreHook {
-                call,
-                hook_binding_ids,
-                ..
+        let call = CheckpointExternalTool::capture(&pending.external.call.call);
+        Ok(match &pending.external.stage {
+            ExternalCallStage::AwaitingPreHook {
+                hook_binding_ids, ..
             } => Self::AwaitingPreHook {
                 hook_binding_ids: hook_binding_ids.clone(),
-                call: CheckpointExternalTool::capture(&call.call),
-            },
-            PendingProgramRecord::AwaitingApproval {
                 call,
-                grant_key,
-                programmatic_name,
-                ..
-            } => Self::AwaitingApproval {
-                grant_key: grant_key.as_str().to_owned(),
-                programmatic_name: CheckpointProgrammaticName::capture(programmatic_name),
-                call: CheckpointExternalTool::capture(&call.call),
             },
-            PendingProgramRecord::Pending { call } => Self::Pending {
-                call: CheckpointExternalTool::capture(&call.call),
-            },
-            PendingProgramRecord::AwaitingPostHook {
+            ExternalCallStage::AwaitingApproval {
+                grant_key, name, ..
+            } => {
+                let ApprovalName::Programmatic(programmatic_name) = name else {
+                    return Err("program approval must use a programmatic name".to_string());
+                };
+                Self::AwaitingApproval {
+                    grant_key: grant_key.as_str().to_owned(),
+                    programmatic_name: CheckpointProgrammaticName::capture(programmatic_name),
+                    call,
+                }
+            }
+            ExternalCallStage::Pending => Self::Pending {
                 call,
+                requested_sleep_seconds: pending.requested_sleep_seconds,
+            },
+            ExternalCallStage::AwaitingPostHook {
                 hook_binding_ids,
                 result,
                 ..
             } => Self::AwaitingPostHook {
                 hook_binding_ids: hook_binding_ids.clone(),
-                call: CheckpointExternalTool::capture(&call.call),
+                call,
                 result: CheckpointToolResult::capture(result),
             },
         })
     }
 
     fn validate(
-        pending: &PendingProgramRecord,
+        pending: &PendingProgramOperation,
         operation_id: &str,
         function: &ProgramFunctionRecord,
     ) -> Result<(), String> {
-        match pending {
-            PendingProgramRecord::AwaitingPreHook {
-                call,
-                hook_action_id,
-                ..
-            } => {
-                validate_program_function_target(function, call)?;
-                capture_external_tool_call(call, operation_id, ToolOrigin::Programmatic)?;
+        let call = &pending.external.call;
+        validate_program_function_target(function, call)?;
+        capture_external_tool_call(call, operation_id, ToolOrigin::Programmatic)?;
+        match &pending.external.stage {
+            ExternalCallStage::AwaitingPreHook { hook_action_id, .. } => {
                 validate_tool_hook_action_id(
                     hook_action_id,
                     operation_id,
                     ToolOrigin::Programmatic,
                     HookPoint::PreToolCall,
-                )?;
+                )
             }
-            PendingProgramRecord::AwaitingApproval {
-                call,
-                approval_action_id,
-                ..
+            ExternalCallStage::AwaitingApproval {
+                approval_action_id, ..
             } => {
-                validate_program_function_target(function, call)?;
-                capture_external_tool_call(call, operation_id, ToolOrigin::Programmatic)?;
                 let expected_action_id = action_id::approval(&call.action_id);
                 if approval_action_id != &expected_action_id {
                     return Err(format!(
                         "checkpoint approval action ID {approval_action_id:?} does not match derived action ID {expected_action_id:?}"
                     ));
                 }
+                Ok(())
             }
-            PendingProgramRecord::Pending { call } => {
-                validate_program_function_target(function, call)?;
-                capture_external_tool_call(call, operation_id, ToolOrigin::Programmatic)?;
-            }
-            PendingProgramRecord::AwaitingPostHook {
-                call,
-                hook_action_id,
-                ..
-            } => {
-                validate_program_function_target(function, call)?;
-                capture_external_tool_call(call, operation_id, ToolOrigin::Programmatic)?;
+            ExternalCallStage::Pending => Ok(()),
+            ExternalCallStage::AwaitingPostHook { hook_action_id, .. } => {
                 validate_tool_hook_action_id(
                     hook_action_id,
                     operation_id,
                     ToolOrigin::Programmatic,
                     HookPoint::PostToolCall,
-                )?;
+                )
             }
         }
-        Ok(())
     }
 
     fn restore(
@@ -330,107 +347,75 @@ impl CheckpointProgramExternalExecution {
         id: String,
         function: ProgramFunctionRecord,
     ) -> Result<ProgramOperationRecord, String> {
-        let invocation_name = function.name.clone();
-        let operation = match self {
+        let restore_call = |call| {
+            restore_external_tool_call(call, &id, ToolOrigin::Programmatic, function.name.clone())
+        };
+        let (external, requested_sleep_seconds) = match self {
             Self::AwaitingPreHook {
                 hook_binding_ids,
                 call,
-            } => {
-                let call = restore_external_tool_call(
-                    call,
-                    &id,
-                    ToolOrigin::Programmatic,
-                    invocation_name.clone(),
-                );
-                let hook_action_id = hook_action_id(&call.action_id, HookPoint::PreToolCall);
-                ProgramOperationRecord::ExternalPending {
-                    id,
-                    function,
-                    pending: Box::new(PendingProgramRecord::AwaitingPreHook {
-                        call,
-                        hook_action_id,
-                        hook_binding_ids,
-                    }),
-                }
-            }
+            } => (
+                PendingExternalCall::awaiting_pre_hook(restore_call(call), hook_binding_ids),
+                None,
+            ),
             Self::AwaitingApproval {
                 grant_key,
                 programmatic_name,
                 call,
-            } => {
-                let call = restore_external_tool_call(
-                    call,
-                    &id,
-                    ToolOrigin::Programmatic,
-                    invocation_name.clone(),
-                );
-                ProgramOperationRecord::ExternalPending {
-                    id,
-                    function,
-                    pending: Box::new(PendingProgramRecord::AwaitingApproval {
-                        approval_action_id: action_id::approval(&call.action_id),
-                        grant_key: GrantKey::try_from(grant_key)?,
-                        programmatic_name: programmatic_name.restore(),
-                        call,
-                    }),
-                }
-            }
-            Self::Pending { call } => ProgramOperationRecord::ExternalPending {
-                pending: Box::new(PendingProgramRecord::Pending {
-                    call: restore_external_tool_call(
-                        call,
-                        &id,
-                        ToolOrigin::Programmatic,
-                        invocation_name.clone(),
-                    ),
-                }),
-                id,
-                function,
-            },
+            } => (
+                PendingExternalCall::awaiting_approval(
+                    restore_call(call),
+                    GrantKey::try_from(grant_key)?,
+                    ApprovalName::Programmatic(programmatic_name.restore()),
+                ),
+                None,
+            ),
+            Self::Pending {
+                call,
+                requested_sleep_seconds,
+            } => (
+                PendingExternalCall::pending(restore_call(call)),
+                requested_sleep_seconds,
+            ),
             Self::AwaitingPostHook {
                 hook_binding_ids,
                 call,
                 result,
             } => {
-                let call = restore_external_tool_call(
-                    call,
-                    &id,
-                    ToolOrigin::Programmatic,
-                    invocation_name,
-                );
-                let hook_action_id = hook_action_id(&call.action_id, HookPoint::PostToolCall);
-                ProgramOperationRecord::ExternalPending {
+                let call = restore_call(call);
+                let stage = ExternalCallStage::AwaitingPostHook {
+                    hook_action_id: hook_action_id(&call.action_id, HookPoint::PostToolCall),
+                    hook_binding_ids,
+                    result: result.restore(),
+                };
+                (PendingExternalCall { call, stage }, None)
+            }
+            Self::Resolved { value, content } => {
+                return Ok(ProgramOperationRecord::ExternalResolved {
                     id,
                     function,
-                    pending: Box::new(PendingProgramRecord::AwaitingPostHook {
-                        call,
-                        hook_action_id,
-                        hook_binding_ids,
-                        result: result.restore(),
-                    }),
-                }
+                    value,
+                    content,
+                });
             }
-            Self::Resolved { value, content } => ProgramOperationRecord::ExternalResolved {
-                id,
-                function,
-                value,
-                content,
-            },
-            Self::Rejected { error, content } => ProgramOperationRecord::ExternalRejected {
-                id,
-                function,
-                error,
-                content,
-            },
+            Self::Rejected { error, content } => {
+                return Ok(ProgramOperationRecord::ExternalRejected {
+                    id,
+                    function,
+                    error,
+                    content,
+                });
+            }
         };
-        if let ProgramOperationRecord::ExternalPending {
+        let pending = PendingProgramOperation {
+            external,
+            requested_sleep_seconds,
+        };
+        Self::validate(&pending, &id, &function)?;
+        Ok(ProgramOperationRecord::ExternalPending {
             id,
             function,
-            pending,
-        } = &operation
-        {
-            Self::validate(pending, id, function)?;
-        }
-        Ok(operation)
+            pending: Box::new(pending),
+        })
     }
 }

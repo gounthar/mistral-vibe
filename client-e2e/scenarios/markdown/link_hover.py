@@ -3,15 +3,16 @@
 from __future__ import annotations
 
 from e2e.app_server.events import assistant_msg, turn_completed, turn_started, user_msg
-from e2e.app_server.scenario import Timeline
+from e2e.app_server.scenario import Timeline, take_snapshot
 
 _PROMPT = "give me Paul Vezia's profile"
 _ANSWER = "• Paul Vezia — Senior AI Engineer at Publicis. [LinkedIn profile](https://www.linkedin.com)"
 
 # SGR button 35 is pointer motion with no button held. LinkedIn starts at the
-# one-based terminal cell (50, 15) after this turn settles.
-_ROW, _COL = 15, 50
+# one-based terminal cell (50, 11) after this turn settles.
+_ROW, _COL = 11, 50
 _HOVER = f"\x1b[<35;{_COL};{_ROW}M"
+screen_hyperlinks = (("LinkedIn profile", "https://www.linkedin.com"),)
 
 timeline: Timeline = [
     f"{_PROMPT}\r",
@@ -19,5 +20,7 @@ timeline: Timeline = [
     user_msg(_PROMPT),
     assistant_msg(_ANSWER),
     turn_completed(),
+    take_snapshot(),
     _HOVER,
+    take_snapshot(),
 ]

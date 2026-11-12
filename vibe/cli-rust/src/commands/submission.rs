@@ -10,20 +10,17 @@ use crate::server::{
 use serde_json::json;
 use tokio::sync::mpsc;
 
-use super::{dispatch, is_side_channel, parse};
-use crate::app::{App, QueuedPrompt, Status, ToastSeverity};
-use crate::input_modes::{classify, classify_submitted, submitted_value, ClassifiedInput};
+use super::{dispatch, is_side_channel, parse, waits_for_jobs};
+use crate::app::{App, QueuedPrompt, Severity, Status};
+use crate::input_modes::{classify_submitted, submitted_value, ClassifiedInput};
 use crate::startup::banners;
 use crate::telemetry::TelemetrySender;
 use crate::transcript::local;
 use crate::{completion_manager, config, message_queue};
 
 pub(super) const NOTICE_TIMEOUT_SECS: u64 = 4;
-/// Toast timeout, Python `App.NOTIFICATION_TIMEOUT` (5s).
-const TOAST_SECS: u64 = 5;
 
-/// Replay slash commands deferred while the session was starting (Python
-/// releases `_session_ready.wait()` and dispatches the held input).
+/// Replay slash commands deferred while the session was starting.
 /// Returns true if a deferred `/exit` was replayed, so the caller can quit.
 pub fn flush_pending(
     app: &mut App,
@@ -31,7 +28,7 @@ pub fn flush_pending(
     config_tx: &mpsc::Sender<config::Loaded>,
 ) -> bool {
     // Nothing was deferred: leave input and completions untouched so a bare
-    // Ready does not reopen a dismissed popup (Python dispatches nothing).
+    // Ready does not reopen a dismissed popup.
     if app.pending_commands.is_empty() {
         return false;
     }
@@ -49,29 +46,20 @@ pub fn flush_pending(
             saved_input = value;
             restore_rejected = true;
         }
-        app.show_toast(message, ToastSeverity::Warning, TOAST_SECS);
+        crate::ui::notice::show_sticky(app, Severity::Warning, &message);
     };
     for value in pending {
-        if let ClassifiedInput::Teleport { target } = classify(&value, &[]) {
-            match reject_hint(app) {
-                Some(hint) => reject(app, value, teleport_rejection(hint)),
-                None => crate::teleport::submit(app, client, target),
-            }
-            continue;
-        }
         let Some(command) = parse(&value) else {
             continue;
         };
         // A queued prompt may have started a turn before deferred commands replay.
-        if !is_side_channel(command) {
-            if let Some(hint) = reject_hint(app) {
-                reject(
-                    app,
-                    value,
-                    format!("Slash commands cannot be queued — {hint}"),
-                );
-                continue;
-            }
+        if let Some(hint) = command_hint(app, command) {
+            reject(
+                app,
+                value,
+                format!("Slash commands cannot be queued — {hint}"),
+            );
+            continue;
         }
         if dispatch::run_command(app, client, config_tx, command, &value) {
             return true;
@@ -100,11 +88,11 @@ pub fn submit(
         return false;
     }
     // A held queue takes a bare Enter as "send it now"; an active turn takes it
-    // as "steer the accepted queue into this turn" (Python `_handle_paused_submit`).
+    // as "steer the accepted queue into this turn".
     if value.is_empty() {
         if app.queue.paused {
-            // Python drops the what's-new body past its empty-input early
-            // return, so releasing a held queue with Enter dismisses it too.
+            // Releasing a held queue with Enter dismisses the what's-new body,
+            // as any non-empty submission does.
             banners::dismiss_whats_new(app);
             message_queue::resume(app, client);
         } else {
@@ -131,57 +119,30 @@ pub fn submit(
         if reject_while_shell_runs(app, &value) {
             return false;
         }
-        if app.vibe_code_project.pending {
-            reject_input(
-                app,
-                &value,
-                "Wait for the project request to finish.".into(),
-            );
-            return false;
-        }
-        if app.teleport.is_some()
-            && matches!(
-                &classified,
-                ClassifiedInput::Prompt { .. } | ClassifiedInput::Skill { .. }
-            )
-        {
-            reject_input(app, &value, "Wait for the teleport to finish.".into());
+        if app.agents.installing {
+            reject_input(app, &value, "Wait for the agent install to finish.".into());
             return false;
         }
     }
     match classified {
-        ClassifiedInput::Teleport { target } => {
-            if matches!(app.session.status, Status::Starting) {
-                clear_and_remember(app, &value);
-                app.pending_commands.push(value);
-            } else if let Some(hint) = reject_hint(app) {
-                reject_input(app, &value, teleport_rejection(hint));
-            } else {
-                clear_and_remember(app, &value);
-                crate::teleport::submit(app, client, target);
-            }
-        }
         ClassifiedInput::SlashCommand { command } => {
-            // Defer every slash command until the session is ready, matching
-            // Python's `_dispatch_idle_input` which awaits `_session_ready` before
-            // any dispatch.
+            // Defer every slash command until the session is ready: nothing
+            // dispatches before it.
             if matches!(app.session.status, Status::Starting) {
                 clear_and_remember(app, &value);
                 app.pending_commands.push(value);
                 return false;
             }
-            if !is_side_channel(command) {
-                if reject_while_shell_runs(app, &value) {
-                    return false;
-                }
-                if let Some(hint) = reject_hint(app) {
-                    reject_input(
-                        app,
-                        &value,
-                        format!("Slash commands cannot be queued — {hint}"),
-                    );
-                    return false;
-                }
+            if !is_side_channel(command) && reject_while_shell_runs(app, &value) {
+                return false;
+            }
+            if let Some(hint) = command_hint(app, command) {
+                reject_input(
+                    app,
+                    &value,
+                    format!("Slash commands cannot be queued — {hint}"),
+                );
+                return false;
             }
             return dispatch::run_command(app, client, config_tx, command, &value);
         }
@@ -238,8 +199,13 @@ pub fn submit(
     false
 }
 
+/// A `!` shell command is waiting for the session or still running.
+fn shell_in_flight(app: &App) -> bool {
+    app.session.shell_operation_id.is_some() || app.session.pending_shell.is_some()
+}
+
 fn reject_while_shell_runs(app: &mut App, value: &str) -> bool {
-    if app.session.shell_operation_id.is_none() && app.session.pending_shell.is_none() {
+    if !shell_in_flight(app) {
         return false;
     }
     reject_input(
@@ -259,26 +225,37 @@ fn record_loop_usage(app: &App, value: &str) {
 }
 
 fn reject_input(app: &mut App, value: &str, message: String) {
-    app.show_toast(message, ToastSeverity::Warning, TOAST_SECS);
+    crate::ui::notice::show_sticky(app, Severity::Warning, &message);
     remember(app, value);
     app.chat_input.cursor = 0;
     completion_manager::input_changed(app);
 }
 
-fn teleport_rejection(hint: &str) -> String {
-    format!("Teleport cannot be queued — {hint}")
+/// Why this slash command cannot run now.
+fn command_hint(app: &App, command: &str) -> Option<&'static str> {
+    if !is_side_channel(command) {
+        return reject_hint(app);
+    }
+    let job_running = app.compacting || app.agents.installing;
+    (job_running && waits_for_jobs(command)).then_some("wait for the current job to finish.")
 }
 
-/// Why a non-side-channel command cannot run now (Python `_REJECT_HINT_*`).
+/// Whether a typed non-side-channel command such as `/model` would run at once: `submit`'s gates, without deferring or rejecting.
+pub(crate) fn accepts_idle_command(app: &App) -> bool {
+    !matches!(app.session.status, Status::Starting | Status::Failed)
+        && !shell_in_flight(app)
+        && reject_hint(app).is_none()
+}
+
+/// Why a non-side-channel command cannot run now.
 fn reject_hint(app: &App) -> Option<&'static str> {
     if app.queue.paused {
         return Some("clear the queue first or remove this input.");
     }
-    // Compaction runs in Python's `_agent_task`, so it counts as a busy job too.
+    // Compaction runs as an agent job, so it counts as busy too.
     if matches!(app.session.status, Status::Generating { .. })
         || app.compacting
-        || app.vibe_code_project.pending
-        || app.teleport.is_some()
+        || app.agents.installing
         || !app.queue.is_empty()
     {
         return Some("wait for the current job to finish.");
@@ -287,9 +264,9 @@ fn reject_hint(app: &App) -> Option<&'static str> {
 }
 
 pub(super) fn clear_and_remember(app: &mut App, value: &str) {
-    // Python's text-changed watcher drops the loaded-entry state whenever the
-    // text changes; a submitted recall must not leave the composer pretending
-    // it still shows a history entry, or every later Down feeds the recall.
+    // Any text change drops the loaded-entry state: a submitted recall must not
+    // leave the composer pretending it still shows a history entry, or every
+    // later Down feeds the recall.
     crate::input::reset_history_state(app);
     app.chat_input.clear();
     completion_manager::input_changed(app);
@@ -304,7 +281,7 @@ fn remember(app: &mut App, value: &str) {
     app.chat_input.history.persist();
 }
 
-/// Escape while a turn runs (Python `_interrupt_turn`): cancel the active turn,
+/// Escape while a turn runs: cancel the active turn,
 /// drop the loading spinner, and mount the local interrupt marker. A turn the
 /// server has not started yet has no id: interrupt it once it starts.
 pub fn interrupt_turn(app: &mut App, client: &Arc<Client>) {
@@ -314,7 +291,10 @@ pub fn interrupt_turn(app: &mut App, client: &Arc<Client>) {
         return;
     }
     crate::telemetry::user_cancelled_action(app, "interrupt_agent");
-    local::add_interrupt(&mut app.view.transcript, &new_message_id());
+    let marker = new_message_id();
+    local::add_interrupt(&mut app.view.transcript, &marker);
+    // A `/retry` of the interrupted turn replaces the marker with its reply.
+    super::retry::track_interrupt(app, marker);
     if unstarted {
         crate::message_queue::interrupt_on_start(app);
         return;
@@ -331,7 +311,7 @@ pub fn send_interrupt(app: &mut App, client: &Arc<Client>) {
         return;
     };
     let client = client.clone();
-    tokio::spawn(async move {
+    crate::work::spawn(async move {
         let params = TurnInterruptParams {
             session_id,
             expected_turn_id: turn_id,
@@ -342,10 +322,9 @@ pub fn send_interrupt(app: &mut App, client: &Arc<Client>) {
     });
 }
 
-/// Prepare the prompt (mentions, auto-title) then start the turn, as Python's
-/// `_send_prompt` does before `session.start_turn`. When `injected` is true,
-/// use `turn/start` with `injected=true` so the projection suppresses the
-/// user-message entry (Python `session.act(injected=True)`).
+/// Prepare the prompt (mentions, auto-title) then start the turn. When
+/// `injected` is true, use `turn/start` with `injected=true` so the projection
+/// suppresses the user-message entry.
 pub(super) async fn start_turn(
     client: Arc<Client>,
     session_id: String,
@@ -355,9 +334,9 @@ pub(super) async fn start_turn(
     let _ = start_turn_with(client, session_id, prompt, false, telemetry).await;
 }
 
-/// Like `start_turn` but marks the prompt as injected, matching Python's
-/// `_retry` → `session.act(injected=True)`. Returns the request outcome so the
-/// caller can recover the busy state when the RPC never reaches the server.
+/// Like `start_turn` but marks the prompt as injected (as `/retry` does).
+/// Returns the request outcome so the caller can recover the busy state when
+/// the RPC never reaches the server.
 pub(super) async fn start_injected_turn(
     client: Arc<Client>,
     session_id: String,

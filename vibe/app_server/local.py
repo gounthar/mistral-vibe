@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from vibe.app_server._process_services import ProcessServices
 from vibe.app_server._runtime import (
     ClientDescriptor,
     ContinueSessionIntent,
@@ -50,9 +51,19 @@ class LocalHarness:
 class LocalHarnessHost:
     def __init__(self, *, shared: bool = True) -> None:
         self._shared = shared
+        # The entry point of an in-process app server: it owns the services.
+        self._services = ProcessServices.create()
         self._process: HarnessProcess | None = None
         # The options the process was started with; later sessions must match.
         self._process_options: LocalHarnessOptions | None = None
+
+    @property
+    def services(self) -> ProcessServices:
+        """The process services every session runs on. Exported for the
+        entry point owning this host; sessions read them through the app
+        server.
+        """
+        return self._services
 
     async def start(self, options: LocalHarnessOptions) -> AppServerSession:
         host = await self.connect(options)
@@ -95,29 +106,25 @@ class LocalHarnessHost:
         )
 
     async def close(self) -> None:
-        if self._process is not None:
-            await self._process.close()
+        try:
+            if self._process is not None:
+                await self._process.close()
+        finally:
+            await self._services.close()
 
     def _process_for(self, options: LocalHarnessOptions) -> HarnessProcess:
         if self._process is None or self._process_options is None:
             self._process = HarnessProcess(
-                experimental_harness=options.experimental_harness,
-                legacy_harness=options.legacy_harness,
+                services=self._services,
                 shared=self._shared,
                 sandbox=options.sandbox,
                 client_tools=options.client_tools,
+                user_config=options.user_config,
                 project_instructions=options.project_instructions,
             )
             self._process_options = options
             return self._process
         started = self._process_options
-        if (
-            started.experimental_harness != options.experimental_harness
-            or started.legacy_harness != options.legacy_harness
-        ):
-            raise RuntimeError(
-                "A LocalHarnessHost cannot mix legacy and Unified Harness backends"
-            )
         if (
             options.sandbox is not started.sandbox
             or options.client_tools is not started.client_tools
@@ -127,4 +134,6 @@ class LocalHarnessHost:
                 "A LocalHarnessHost serves one sandbox, one set of client tools "
                 "and one set of project instructions"
             )
+        if options.user_config is not started.user_config:
+            raise RuntimeError("A LocalHarnessHost serves one user config")
         return self._process

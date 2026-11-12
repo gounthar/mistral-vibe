@@ -1,4 +1,4 @@
-//! MCP server and connector wire types (Python `vibe/app_server/models.py`).
+//! MCP server and connector wire types (app server `vibe/app_server/models.py`).
 
 use std::collections::BTreeMap;
 
@@ -29,6 +29,7 @@ pub enum MCPSourceStatus {
     Enabled,
     NeedsAuth,
     NeedsSetup,
+    NeedsConnect,
     Unavailable,
 }
 
@@ -40,6 +41,7 @@ impl MCPSourceStatus {
             Self::Enabled => "enabled",
             Self::NeedsAuth => "needs_auth",
             Self::NeedsSetup => "needs_setup",
+            Self::NeedsConnect => "needs_connect",
             Self::Unavailable => "unavailable",
         }
     }
@@ -89,7 +91,7 @@ impl MCPSourceSummary {
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct MCPState {
-    #[serde(default, deserialize_with = "deserialize_sources")]
+    #[serde(default, deserialize_with = "crate::utils::json::lenient")]
     pub sources: Vec<MCPSourceSummary>,
     #[serde(default)]
     pub discovery_errors: BTreeMap<String, String>,
@@ -97,18 +99,9 @@ pub struct MCPState {
     pub connector_error: Option<String>,
     #[serde(default)]
     pub manage_connectors_url: Option<String>,
-}
-
-/// Skip a malformed source instead of failing the whole state (ADR 0014).
-fn deserialize_sources<'de, D>(deserializer: D) -> Result<Vec<MCPSourceSummary>, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    let values = Vec::<serde_json::Value>::deserialize(deserializer)?;
-    Ok(values
-        .into_iter()
-        .filter_map(|value| serde_json::from_value(value).ok())
-        .collect())
+    /// The API key is `shared_only`, so private connectors are missing from the list.
+    #[serde(default)]
+    pub private_connectors_hidden: bool,
 }
 
 impl MCPState {

@@ -1,8 +1,8 @@
-//! Speaker playback via cpal (Python `AudioPlayer`).
+//! Speaker playback via cpal.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{FromSample, SampleFormat, SizedSample};
@@ -12,7 +12,7 @@ use super::source::Source;
 use super::wav::Pcm;
 use super::AudioError;
 
-/// Python `DEFAULT_BUFFER_MS`: the device drains its buffer before the stream closes.
+/// The device drains its buffer before the stream closes.
 const TAIL: Duration = Duration::from_millis(200);
 const POLL: Duration = Duration::from_millis(20);
 /// Slack past the clip's length before a stalled device counts as done.
@@ -22,7 +22,7 @@ const BUFFER_SAMPLES: usize = 16_384;
 
 type Done = oneshot::Receiver<Result<(), AudioError>>;
 
-/// Python `check_audio_available`; blocking, so run it off the async runtime.
+/// Whether an output device is usable; blocking, so run it off the async runtime.
 pub fn check_available() -> Result<(), AudioError> {
     cpal::default_host()
         .default_output_device()
@@ -49,12 +49,12 @@ pub async fn play(pcm: Pcm, stop: Arc<AtomicBool>) -> Result<Done, AudioError> {
             }
         };
         let _ = ready_tx.send(Ok(()));
-        let deadline = Instant::now() + length + STALL_MARGIN;
+        let deadline = crate::clock::real_now() + length + STALL_MARGIN;
         let failed = || failure.lock().is_ok_and(|failure| failure.is_some());
         while !stop.load(Ordering::Relaxed)
             && !ended.load(Ordering::Relaxed)
             && !failed()
-            && Instant::now() < deadline
+            && crate::clock::real_now() < deadline
         {
             std::thread::sleep(POLL);
         }

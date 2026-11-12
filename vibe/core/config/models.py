@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from enum import StrEnum, auto
+import json
 import logging
 import os
 from pathlib import Path
@@ -15,12 +16,14 @@ from pydantic import (
     ConfigDict,
     Field,
     HttpUrl,
+    ValidationError,
     field_validator,
     model_validator,
 )
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from vibe.config_values import (
+    DEFAULT_THINKING_LEVELS,
     THINKING_LEVELS as THINKING_LEVELS,
     SpeechOutputFormat,
     ThinkingLevel,
@@ -29,19 +32,26 @@ from vibe.config_values import (
 from vibe.core.config._defaults import (
     DEFAULT_MISTRAL_BROWSER_AUTH_API_BASE_URL,
     DEFAULT_MISTRAL_BROWSER_AUTH_BASE_URL,
-    UNSET_AUTO_COMPACT_THRESHOLD,
 )
 from vibe.core.paths import SESSION_LOG_DIR
 from vibe.core.types import Backend
+from vibe.utils.platform import is_windows
 
 logger = logging.getLogger(__name__)
 
 
 class MissingAPIKeyError(RuntimeError):
-    def __init__(self, env_key: str, provider_name: str) -> None:
-        super().__init__(
-            f"Missing {env_key} environment variable for {provider_name} provider"
-        )
+    def __init__(
+        self, env_key: str, provider_name: str, *, keyring_error: str | None = None
+    ) -> None:
+        message = f"Missing {env_key} environment variable for {provider_name} provider"
+        if keyring_error:
+            message = (
+                f"Can't read {env_key} from the system keyring for {provider_name} "
+                f"provider ({keyring_error}). Approve the keyring prompt or set "
+                f"the {env_key} environment variable"
+            )
+        super().__init__(message)
         self.env_key = env_key
         self.provider_name = provider_name
 
@@ -107,8 +117,8 @@ class SessionLoggingConfig(BaseSettings):
     session_prefix: str = "session"
     enabled: bool = True
     # Background LLM-generated session titles (shown in --resume and the
-    # terminal tab) for CLI and Desktop clients. False falls back to the
-    # first-message preview.
+    # terminal tab) for CLI, Desktop, and ACP (VS Code extension) clients.
+    # False falls back to the first-message preview.
     generate_titles: bool = True
 
     @field_validator("save_dir", mode="before")
@@ -136,6 +146,11 @@ class ProviderConfig(BaseModel):
     # returned URLs are re-homed onto the configured browser auth base URLs
     # instead of being rejected for an origin mismatch.
     browser_auth_allow_origin_rewrite: bool = False
+    # When True, tenant-domain resolution and reconciliation never overwrite the
+    # configured api_base with the /whoami-advertised one. For split-horizon
+    # deployments (e.g. an SAP Cloud Connector proxying the real API host) the
+    # CLI-reachable api_base differs from the tenant's public API host on purpose.
+    preserve_api_base: bool = False
     api_style: str = "openai"
     backend: Backend = Backend.GENERIC
     reasoning_field_name: str = "reasoning_content"
@@ -180,6 +195,14 @@ class ProviderConfig(BaseModel):
             and bool(self.browser_auth_api_base_url)
         )
 
+    @property
+    def uses_vertex(self) -> bool:
+        """Whether this provider authenticates through Google ADC.
+
+        The Mistral backend ignores ``api_style``, so the backend decides first.
+        """
+        return self.backend != Backend.MISTRAL and self.api_style == "vertex-anthropic"
+
 
 class TranscribeClient(StrEnum):
     MISTRAL = auto()
@@ -213,8 +236,8 @@ class _MCPBase(BaseModel):
         default=60.0, gt=0, description="Timeout in seconds for tool execution."
     )
     sampling_enabled: bool = Field(
-        default=True,
-        description="Allow this MCP server to request LLM completions via sampling/createMessage.",
+        default=False,
+        description="Opt this MCP server into sampling/createMessage when the host provides a sampling completion.",
     )
     disabled: bool = Field(
         default=False,
@@ -434,11 +457,23 @@ class MCPStdio(_MCPBase):
 
     def argv(self) -> list[str]:
         base = (
-            shlex.split(self.command)
+            _split_command(self.command)
             if isinstance(self.command, str)
             else list(self.command or [])
         )
         return [*base, *self.args] if self.args else base
+
+
+def _split_command(command: str) -> list[str]:
+    if not is_windows():
+        return shlex.split(command)
+    # Backslash is the Windows path separator, not an escape: keep it literal and
+    # let quotes alone group a path that contains spaces.
+    lexer = shlex.shlex(command, posix=True)
+    lexer.whitespace_split = True
+    lexer.commenters = ""
+    lexer.escape = ""
+    return list(lexer)
 
 
 MCPServer = Annotated[
@@ -468,6 +503,22 @@ def _default_alias_to_name(data: Any) -> Any:
     return data
 
 
+def refuse_zero_auto_compact_threshold(value: Any) -> Any:
+    """Refuse ``auto_compact_threshold = 0`` with an error that says why.
+
+    Older versions read 0 as "compaction off". Compaction is now always on, so
+    0 is a config error rather than a silent switch to the default threshold.
+    Other values go on to the field's own checks.
+    """
+    if value == 0 and not isinstance(value, bool):
+        raise ValueError(
+            'auto_compact_threshold: 0 is not allowed. There is no "off" value: '
+            "set a positive threshold, or remove the setting to use the model's "
+            "default."
+        )
+    return value
+
+
 class ModelConfig(BaseModel):
     name: str
     provider: str
@@ -478,26 +529,46 @@ class ModelConfig(BaseModel):
     # agent loop does not send them.
     # Nucleus sampling; None leaves it to the provider's default.
     top_p: float | None = Field(default=None, gt=0, le=1)
-    # Cap on output tokens per model request; None leaves it to the provider.
-    # A session's own ``max_tokens`` limit, when set, takes precedence.
+    # The model's max output, sent as Anthropic's required max_tokens; other
+    # providers get no cap. None takes the known max output, else 32,768.
+    # A session's own ``max_tokens`` limit, ``agent_max_output_tokens`` and
+    # ``compaction_max_output_tokens`` take precedence and reach every provider.
     max_output_tokens: int | None = Field(default=None, ge=1)
-    input_price: float = 0.0  # Price per million input tokens
-    output_price: float = 0.0  # Price per million output tokens
-    cached_input_price: float | None = (
-        None  # Price per million cached input tokens; None bills them at input_price
+    input_price: float = Field(
+        default=0.0, ge=0, allow_inf_nan=False
+    )  # Price per million input tokens
+    output_price: float = Field(
+        default=0.0, ge=0, allow_inf_nan=False
+    )  # Price per million output tokens
+    cached_input_price: float | None = Field(
+        default=None,
+        ge=0,
+        allow_inf_nan=False,
+        description=(
+            "Price per million cached input tokens; unset bills them at input_price"
+        ),
     )
     thinking: ThinkingLevel = "off"
     # The levels this model offers, in display order. Defaults to the CLI's
-    # five; a narrowed set resets a stored level that falls outside it.
+    # five, which say nothing about the model; a narrowed set is the model's
+    # levels. A `thinking` outside it is still sent, and offered beside them.
     thinking_levels: list[ThinkingLevel] = Field(
-        default_factory=lambda: list(THINKING_LEVELS)
+        default_factory=lambda: list(DEFAULT_THINKING_LEVELS)
     )
-    supports_images: bool = False
-    # None when the window is unknown; 0 or a negative would silently disable
-    # compaction by deriving an unreachable threshold, so it must be rejected.
+    # None when unset: Vibe offers the model no images, while its completion
+    # facts take their input modalities from the catalogue or the known-model
+    # table. True states text and image input, false text only.
+    supports_images: bool | None = None
+    # None when the window is unknown: the session then uses the window it
+    # knows for the model, or a default one with a warning.
     max_context_length: int | None = Field(default=None, ge=1)
-    auto_compact_threshold: int = UNSET_AUTO_COMPACT_THRESHOLD
+    # Token count before automatic compaction. None takes the global setting,
+    # or else the default for the model's window.
+    auto_compact_threshold: int | None = Field(default=None, gt=0)
     _default_alias_to_name = model_validator(mode="before")(_default_alias_to_name)
+    _refuse_zero_threshold = field_validator("auto_compact_threshold", mode="before")(
+        refuse_zero_auto_compact_threshold
+    )
 
     @field_validator("thinking_levels", mode="after")
     @classmethod
@@ -506,11 +577,16 @@ class ModelConfig(BaseModel):
         # distinct from unset, which keeps the five. The catalog mapping relies
         # on the distinction (unspecified vs explicitly none). Duplicates are
         # dropped in first-seen order: the picker renders one row per level.
-        return list(dict.fromkeys(value)) or ["off"]
+        return list(dict.fromkeys(map(_standard_case, value))) or ["off"]
+
+    @field_validator("thinking", mode="after")
+    @classmethod
+    def _thinking_in_standard_case(cls, value: ThinkingLevel) -> ThinkingLevel:
+        return _standard_case(value)
 
     @property
     def default_thinking(self) -> ThinkingLevel:
-        """The level a model lands on when its stored one is not offered.
+        """The level a catalog model starts on: its set's default.
 
         ``high`` when the set offers it, else the set's last entry: rank comes
         from list order, the same order the pickers render, so a level the CLI
@@ -521,6 +597,15 @@ class ModelConfig(BaseModel):
         return self.thinking_levels[-1]
 
     @property
+    def thinking_is_set(self) -> bool:
+        """Whether the config chose a thinking level.
+
+        An unset level is not a request for off: the session thinks at the
+        model's lowest setting, which is off only where the model can stop.
+        """
+        return "thinking" in self.model_fields_set
+
+    @property
     def thinking_levels_curated(self) -> bool:
         """Whether the offered set was narrowed from the CLI's default five.
 
@@ -528,22 +613,16 @@ class ModelConfig(BaseModel):
         (e.g. the Mistral backend's reasoning-effort mapping) treat it
         differently from a set someone deliberately wrote.
         """
-        return set(self.thinking_levels) != set(THINKING_LEVELS)
+        return set(self.thinking_levels) != set(DEFAULT_THINKING_LEVELS)
 
-    @model_validator(mode="after")
-    def _reset_thinking_outside_levels(self) -> ModelConfig:
-        # Curation can narrow a set under a level the user already stored.
-        # Re-derived on every load, like the active-model fallback: the stored
-        # value stays in the user's file and applies again if the set widens.
-        if self.thinking not in self.thinking_levels:
-            # "low" was the historical no-reasoning pick; a curated set that
-            # dropped it carries that intent in "off" instead of re-enabling
-            # reasoning through default_thinking.
-            if self.thinking == "low" and "off" in self.thinking_levels:
-                self.thinking = "off"
-            else:
-                self.thinking = self.default_thinking
-        return self
+
+def _standard_case(level: ThinkingLevel) -> ThinkingLevel:
+    """A standard word in any case is the standard level, as the harness reads it;
+    a model's own level keeps its case.
+    """
+    written = level.strip()
+    standard = written.lower()
+    return standard if standard in THINKING_LEVELS else written
 
 
 def normalize_model_configs(value: Any) -> Any:
@@ -564,6 +643,48 @@ def normalize_model_configs(value: Any) -> Any:
     return value
 
 
+def parse_routed_model_payload(payload: Any) -> ModelConfig | None:
+    """One routed-model payload (a model table or its JSON string), or None."""
+    if isinstance(payload, str):
+        try:
+            payload = json.loads(payload)
+        except ValueError:
+            return None
+    if isinstance(payload, ModelConfig):
+        return payload
+    if not isinstance(payload, Mapping):
+        return None
+    try:
+        return ModelConfig.model_validate(payload)
+    except ValidationError:
+        return None
+
+
+def routed_model_keys(data: Mapping[str, Any]) -> set[str]:
+    """The model keys the routed-model fields inject into ``models``.
+
+    Mirrors the injection validators: the routed config counts only when it is
+    the routed default.
+    """
+    keys: set[str] = set()
+    default = data.get("routed_default_model")
+    config = parse_routed_model_payload(data.get("routed_model_config"))
+    if config is not None and config.alias and config.alias == default:
+        keys.add(config.alias)
+    extra = data.get("routed_extra_models")
+    if isinstance(extra, str):
+        try:
+            extra = json.loads(extra)
+        except ValueError:
+            extra = None
+    if isinstance(extra, list):
+        for entry in extra:
+            model = parse_routed_model_payload(entry)
+            if model is not None and model.alias:
+                keys.add(model.alias)
+    return keys
+
+
 def serialize_model_configs(value: Any) -> Any:
     """Write the internal model map back as legacy [[models]] TOML entries.
 
@@ -577,37 +698,10 @@ def serialize_model_configs(value: Any) -> Any:
 
 def _serialize_model_entry(model: Any) -> Any:
     if isinstance(model, ModelConfig):
-        entry = model.model_dump(exclude_none=True)
-    elif isinstance(model, Mapping):
-        entry = {key: value for key, value in model.items() if value is not None}
-    else:
-        return model
-    # The unset sentinel is merge-internal; it must never reach a TOML file.
-    if entry.get("auto_compact_threshold") == UNSET_AUTO_COMPACT_THRESHOLD:
-        del entry["auto_compact_threshold"]
-    return entry
-
-
-def normalize_model_configs_with_defaults(value: Any, defaults: Any) -> Any:
-    """Normalize models and fill sparse default-model overrides when required."""
-    normalized = normalize_model_configs(value)
-    if not isinstance(normalized, Mapping):
-        return normalized
-
-    default_models = normalize_model_configs(defaults)
-    if not isinstance(default_models, Mapping):
-        return normalized
-
-    if not _needs_default_model_payloads(normalized, default_models):
-        return normalized
-
-    return merge_model_payloads(
-        {
-            alias: _model_payload_for_merge(model)
-            for alias, model in default_models.items()
-        },
-        normalized,
-    )
+        return model.model_dump(exclude_none=True)
+    if isinstance(model, Mapping):
+        return {key: value for key, value in model.items() if value is not None}
+    return model
 
 
 def _model_alias_from_payload(payload: Any) -> str:
@@ -648,27 +742,6 @@ def _model_payload_with_alias(alias: Any, payload: Any) -> Any:
             f"Model key '{alias}' does not match model alias '{existing_alias}'."
         )
     return model_payload
-
-
-def _needs_default_model_payloads(
-    models: Mapping[str, Any], defaults: Mapping[str, Any]
-) -> bool:
-    """Return whether a known default model is missing required identity fields."""
-    for alias, payload in models.items():
-        if alias not in defaults or not isinstance(payload, Mapping):
-            continue
-        if "name" not in payload or "provider" not in payload:
-            return True
-    return False
-
-
-def _model_payload_for_merge(model: Any) -> dict[str, Any]:
-    """Convert a default model entry into a plain mapping for deep merge."""
-    if isinstance(model, ModelConfig):
-        return model.model_dump(mode="json")
-    if isinstance(model, Mapping):
-        return dict(model)
-    return {}
 
 
 def merge_model_payloads(

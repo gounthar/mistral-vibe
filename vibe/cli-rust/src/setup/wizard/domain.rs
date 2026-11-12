@@ -1,25 +1,45 @@
 //! The custom-domain screen: input handling, live validation, and the
-//! Mistral-default reset (Python `CustomDomainScreen`).
+//! Mistral-default reset.
 
 use crossterm::event::{KeyCode, KeyEvent};
 
 use super::context::{
     browser_auth_account_base, browser_auth_requires_origin_rewrite, configured_custom_api_base,
     configured_custom_domain, default_provider, is_likely_mistral_private_cloud_domain,
-    is_valid_custom_domain, resolve_browser_auth_urls, OnboardingContext, DEFAULT_CONSOLE_BASE_URL,
-    DEFAULT_VIBE_BASE_URL,
+    is_valid_custom_domain, pinned_console_api_base, resolve_browser_auth_urls, OnboardingContext,
+    DEFAULT_CONSOLE_BASE_URL, DEFAULT_VIBE_BASE_URL,
 };
 use super::screens::edit_key;
 use super::{Action, OnboardingState, Screen, ValidationState};
 
 pub(super) fn handle_custom_domain(state: &mut OnboardingState, key: KeyEvent) -> Option<Action> {
+    // An administrator-pinned console renders locked: the only moves are
+    // Enter (start the sign-in) and Esc (back to the auth method).
+    if let Some(pin) = state.context.pinned_console_url.clone() {
+        return match key.code {
+            KeyCode::Esc => {
+                state.screen = Screen::AuthMethod;
+                None
+            }
+            KeyCode::Enter => {
+                // A split-horizon API base configured for the pinned console
+                // (read from the launch snapshot) is preserved; otherwise the
+                // API base derives from the pin.
+                let api_base = pinned_console_api_base(&state.config.provider, &pin);
+                apply_custom_domain(&mut state.context, &pin, api_base.as_deref());
+                state.screen = Screen::BrowserSignIn;
+                Some(Action::StartBrowserSignIn)
+            }
+            _ => None,
+        };
+    }
     match key.code {
         KeyCode::Esc => {
             state.screen = Screen::SignInTarget;
             None
         }
-        // Python moves focus between the two inputs with Textual's Tab,
-        // which wraps: the last input focuses the first again. Shift+Tab
+        // Tab moves focus between the two inputs and wraps: the last input
+        // focuses the first again. Shift+Tab
         // arrives as BackTab, so one arm covers both.
         KeyCode::Tab | KeyCode::BackTab => {
             state.custom_domain_focus = (state.custom_domain_focus + 1) % 2;
@@ -39,18 +59,7 @@ pub(super) fn handle_custom_domain(state: &mut OnboardingState, key: KeyEvent) -
                 state.custom_domain_feedback = 1;
                 None
             } else {
-                let (browser_base, api) =
-                    resolve_browser_auth_urls(&domain, (!api_base.is_empty()).then_some(&api_base));
-                state.context.provider.browser_auth_base_url = Some(browser_base.clone());
-                state.context.provider.browser_auth_api_base_url = Some(api.clone());
-                state.context.provider.browser_auth_allow_origin_rewrite =
-                    browser_auth_requires_origin_rewrite(&browser_base, &api);
-                // In a split-horizon setup the browser console origin is not
-                // CLI-reachable, so account calls move to the API base origin.
-                state.context.console_base_url = browser_auth_account_base(
-                    &browser_base,
-                    (!api_base.is_empty()).then_some(&api),
-                );
+                apply_custom_domain(&mut state.context, &domain, Some(&api_base));
                 state.screen = Screen::BrowserSignIn;
                 Some(Action::StartBrowserSignIn)
             }
@@ -68,14 +77,27 @@ pub(super) fn handle_custom_domain(state: &mut OnboardingState, key: KeyEvent) -
     }
 }
 
-/// Reset the custom-domain inputs to the configured seeds (Python
-/// `CustomDomainScreen._reset_input`, run on every mount and resume): the
-/// domain, and only a distinct split-horizon API base. Python reads the
-/// launch snapshot here, so a domain the wizard configured and then backed
+/// Reset the custom-domain inputs to the configured seeds (on every mount and
+/// resume): the domain, and only a distinct split-horizon API base. This reads
+/// the launch snapshot, so a domain the wizard configured and then backed
 /// out of never pre-fills. Unconfigured fields reset to empty, both
 /// validations drop to `None` so a seeded screen shows no feedback and no
 /// colored borders, and focus returns to the domain.
 pub(super) fn reset_custom_domain_inputs(state: &mut OnboardingState) {
+    // A pinned console seeds and locks the domain; the API base input stays
+    // empty (a split base configured for the pin is preserved on Enter) and
+    // the card shows valid, so the hint paints.
+    if let Some(pin) = state.context.pinned_console_url.clone() {
+        state.custom_domain.value = pin;
+        state.custom_domain.cursor = state.custom_domain.value.len();
+        state.custom_domain.validation = ValidationState::Valid;
+        state.custom_domain_api.value = String::new();
+        state.custom_domain_api.cursor = 0;
+        state.custom_domain_api.validation = ValidationState::None;
+        state.custom_domain_focus = 0;
+        state.custom_domain_feedback = 0;
+        return;
+    }
     let domain = configured_custom_domain(&state.config.provider).unwrap_or_default();
     let api = configured_custom_api_base(&state.config.provider).unwrap_or_default();
     state.custom_domain.value = domain;
@@ -90,7 +112,7 @@ pub(super) fn reset_custom_domain_inputs(state: &mut OnboardingState) {
 
 pub(super) fn validate_custom_domain_input(state: &mut OnboardingState) {
     // The edited (focused) input owns the feedback row; switching focus
-    // never re-renders it (Python's feedback is change-driven).
+    // never re-renders it (feedback is change-driven).
     state.custom_domain_feedback = state.custom_domain_focus;
     let value = state.custom_domain.value.trim().to_owned();
     state.custom_domain.validation = if value.is_empty() {
@@ -118,7 +140,7 @@ pub(super) fn validate_custom_domain_input(state: &mut OnboardingState) {
     };
 }
 
-/// Reset to the default Mistral domain (Python `apply_mistral_default_domain`):
+/// Reset to the default Mistral domain:
 /// the provider URLs, the rewrite flag, and the account/vibe bases — all
 /// rebuilt from the same defaults `default_provider()` uses, so the wizard
 /// and the config layer cannot drift.
@@ -130,4 +152,18 @@ pub(super) fn apply_mistral_default(context: &mut OnboardingContext) {
     context.provider.api_base = provider.api_base;
     context.console_base_url = DEFAULT_CONSOLE_BASE_URL.into();
     context.vibe_base_url = DEFAULT_VIBE_BASE_URL.into();
+}
+
+/// Apply a custom domain: the provider's browser-auth URLs and the account
+/// base derive from it (an empty API base means the console's own `/api`).
+/// The administrator pin rides the same path, minus the choice of domain.
+fn apply_custom_domain(context: &mut OnboardingContext, domain: &str, api_base_url: Option<&str>) {
+    let (browser_base, api) = resolve_browser_auth_urls(domain, api_base_url);
+    context.provider.browser_auth_base_url = Some(browser_base.clone());
+    context.provider.browser_auth_api_base_url = Some(api.clone());
+    context.provider.browser_auth_allow_origin_rewrite =
+        browser_auth_requires_origin_rewrite(&browser_base, &api);
+    // In a split-horizon setup the browser console origin is not
+    // CLI-reachable, so account calls move to the API base origin.
+    context.console_base_url = browser_auth_account_base(&browser_base, Some(&api));
 }

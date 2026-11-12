@@ -4,7 +4,7 @@ import asyncio
 from collections.abc import AsyncIterator
 import json
 import sys
-from typing import Any, Protocol
+from typing import Any, Protocol, runtime_checkable
 
 
 class InvalidJsonRpcMessage(RuntimeError):
@@ -17,6 +17,13 @@ class JsonRpcTransport(Protocol):
     def messages(self) -> AsyncIterator[dict[str, Any]]: ...
 
     async def close(self) -> None: ...
+
+
+@runtime_checkable
+class ClientLossAwareTransport(Protocol):
+    """A transport that can end while its client is still there."""
+
+    client_lost: bool
 
 
 class BinaryLineReader(Protocol):
@@ -59,7 +66,7 @@ class StdioJsonRpcTransport:
 
     async def messages(self) -> AsyncIterator[dict[str, Any]]:
         while raw := await asyncio.to_thread(self._reader.readline):
-            yield _decode_message(raw)
+            yield decode_json_rpc_message(raw)
 
     async def close(self) -> None:
         if self._close_task is None:
@@ -161,7 +168,7 @@ class MemoryJsonRpcTransport:
 
     async def messages(self) -> AsyncIterator[dict[str, Any]]:
         while (raw := await self._incoming.get()) is not None:
-            yield _decode_message(raw)
+            yield decode_json_rpc_message(raw)
 
     async def close(self) -> None:
         if self._closed:
@@ -179,7 +186,8 @@ def memory_transport_pair() -> tuple[MemoryJsonRpcTransport, MemoryJsonRpcTransp
     )
 
 
-def _decode_message(raw: str | bytes) -> dict[str, Any]:
+def decode_json_rpc_message(raw: str | bytes) -> dict[str, Any]:
+    """One framed line as a JSON-RPC message object."""
     try:
         value = json.loads(raw)
     except (json.JSONDecodeError, UnicodeDecodeError) as exc:

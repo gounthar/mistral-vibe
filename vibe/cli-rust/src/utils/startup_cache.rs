@@ -8,7 +8,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use super::now_unix;
-use crate::server::{AgentSafety, AgentSummary};
+use crate::server::{AgentSafety, AgentSummary, RuntimeSnapshot};
+use crate::skill::Skill;
 use crate::utils::paths;
 
 const SCHEMA_VERSION: u32 = 9;
@@ -18,16 +19,16 @@ const MAX_CACHED_SKILLS: usize = 256;
 pub const MAX_AGE_SECONDS: i64 = 7 * 24 * 3600;
 /// Caches larger than this are ignored before parsing.
 const MAX_FILE_BYTES: usize = 1024 * 1024;
-/// Agent a fresh install starts on (Python `VibeConfig.default_agent`).
+/// Agent a fresh install starts on (the config's `default_agent` default).
 const DEFAULT_AGENT: &str = "accept-edits";
 
 /// Cycleable builtins in discovery order, used until the server's snapshot
-/// lands (Python `BUILTIN_AGENTS` minus the subagents).
+/// lands (the builtin agents minus the subagents).
 fn builtin_agents() -> Vec<AgentSummary> {
     [
         ("ask", "Ask", AgentSafety::Neutral),
-        ("plan", "Plan", AgentSafety::Safe),
         (DEFAULT_AGENT, "Accept Edits", AgentSafety::Destructive),
+        ("smart-approve", "Smart Approve", AgentSafety::Smart),
         ("auto-approve", "Auto Approve", AgentSafety::Yolo),
     ]
     .into_iter()
@@ -40,28 +41,17 @@ fn builtin_agents() -> Vec<AgentSummary> {
     .collect()
 }
 
-pub fn read_skills(response: &Value) -> Vec<(String, String)> {
+pub fn read_skills(response: &Value) -> Vec<Skill> {
     let Some(skills) = response
         .pointer("/runtime/skills")
         .and_then(Value::as_array)
     else {
         return Vec::new();
     };
-    skills
-        .iter()
-        .filter(|skill| skill.get("userInvocable").and_then(Value::as_bool) == Some(true))
-        .filter_map(|skill| {
-            let name = skill.get("name").and_then(Value::as_str)?;
-            let description = skill
-                .get("description")
-                .and_then(Value::as_str)
-                .unwrap_or("");
-            Some((name.to_owned(), description.to_owned()))
-        })
-        .collect()
+    skills.iter().filter_map(Skill::from_wire).collect()
 }
 
-fn cached_skills(response: &Value) -> Vec<(String, String)> {
+fn cached_skills(response: &Value) -> Vec<Skill> {
     read_skills(response)
         .into_iter()
         .take(MAX_CACHED_SKILLS)
@@ -77,30 +67,32 @@ pub struct StartupConfig {
     pub disable_welcome_banner_animation: bool,
     /// Whether a mouse selection copies itself on release.
     pub autocopy_to_clipboard: bool,
+    /// Whether the TUI captures the mouse; older caches keep capturing.
+    #[serde(default = "default_enable_mouse_capture")]
+    pub enable_mouse_capture: bool,
+    /// Whether `@` completion runs; older caches keep it on (ADR 0014).
+    #[serde(default = "default_enable_file_autocomplete")]
+    pub enable_file_autocomplete: bool,
+    /// Whether the file index watches the filesystem; older caches keep watching.
+    #[serde(default = "default_file_watcher_for_autocomplete")]
+    pub file_watcher_for_autocomplete: bool,
     /// Main input blink preference; older caches keep the default blinking caret.
     #[serde(default = "default_cursor_blink")]
     pub cursor_blink: bool,
     pub active_model: String,
     pub active_model_display_name: String,
-    /// Python `config.images_supported`: model vision or a backend image describer.
+    /// Whether images are supported: model vision or a backend image describer.
     pub images_supported: bool,
-    pub models_count: usize,
     /// Configured default used to choose the startup label from `agents`.
     pub default_agent: String,
     /// The cycleable agents, so Shift+Tab works before the snapshot lands.
     pub agents: Vec<AgentSummary>,
     /// Bounded user-invocable skill metadata for `/` completion before readiness.
-    pub skills: Vec<(String, String)>,
-    pub skills_count: usize,
-    pub hooks_count: usize,
-    pub connectors_connected: usize,
-    pub connectors_total: usize,
-    pub mcp_servers_enabled: usize,
-    pub mcp_servers_total: usize,
+    pub skills: Vec<Skill>,
     pub context_window: u64,
-    /// Whether the narrator requests turn summaries (Python `narrator_enabled`).
+    /// Whether the narrator requests turn summaries.
     pub narrator_enabled: bool,
-    /// Whether update checks run (Python `enable_update_checks`). Additive:
+    /// Whether update checks run (`enable_update_checks`). Additive:
     /// entries from before this field default to checking.
     #[serde(default = "default_enable_update_checks")]
     pub enable_update_checks: bool,
@@ -120,20 +112,16 @@ impl Default for StartupConfig {
             theme: "auto".into(),
             disable_welcome_banner_animation: false,
             autocopy_to_clipboard: true,
+            enable_mouse_capture: default_enable_mouse_capture(),
+            enable_file_autocomplete: default_enable_file_autocomplete(),
+            file_watcher_for_autocomplete: default_file_watcher_for_autocomplete(),
             cursor_blink: default_cursor_blink(),
             active_model: String::new(),
             active_model_display_name: String::new(),
             images_supported: false,
-            models_count: 0,
             default_agent: DEFAULT_AGENT.into(),
             agents: builtin_agents(),
             skills: Vec::new(),
-            skills_count: 0,
-            hooks_count: 0,
-            connectors_connected: 0,
-            connectors_total: 0,
-            mcp_servers_enabled: 0,
-            mcp_servers_total: 0,
             context_window: 0,
             narrator_enabled: false,
             enable_update_checks: true,
@@ -144,6 +132,18 @@ impl Default for StartupConfig {
 }
 
 fn default_cursor_blink() -> bool {
+    true
+}
+
+fn default_enable_mouse_capture() -> bool {
+    true
+}
+
+fn default_enable_file_autocomplete() -> bool {
+    true
+}
+
+fn default_file_watcher_for_autocomplete() -> bool {
     true
 }
 
@@ -216,111 +216,37 @@ impl StartupConfig {
     }
 
     pub fn from_runtime(server_version: &str, response: &Value) -> Option<Self> {
-        let runtime = response.get("runtime")?;
-        let config = runtime.get("config")?;
-        let model = config.get("activeModel")?;
-        let model_name = model.get("displayName")?.as_str()?;
-        let thinking = model.get("thinking")?.as_str()?;
-        let sources = runtime.pointer("/mcp/sources").and_then(Value::as_array);
-        let mcp_servers = sources
-            .into_iter()
-            .flatten()
-            .filter(|source| source.get("kind").and_then(Value::as_str) == Some("server"));
-        let (mcp_servers_enabled, mcp_servers_total) =
-            mcp_servers.fold((0, 0), |(enabled, total), source| {
-                let disabled = source.get("status").and_then(Value::as_str) == Some("disabled");
-                (enabled + usize::from(!disabled), total + 1)
-            });
+        let runtime = RuntimeSnapshot::read(response)?;
+        let config = runtime.config?;
+        let model = config.active_model?;
+        let model_name = model.display_name?;
+        let thinking = model.thinking?;
         Some(Self {
             schema_version: SCHEMA_VERSION,
             server_version: server_version.to_owned(),
             cached_at: now_unix(),
-            theme: config.get("theme")?.as_str()?.to_owned(),
-            disable_welcome_banner_animation: config
-                .get("disableWelcomeBannerAnimation")
-                .and_then(Value::as_bool)
-                .unwrap_or(false),
-            autocopy_to_clipboard: config
-                .get("autocopyToClipboard")
-                .and_then(Value::as_bool)
-                .unwrap_or(true),
-            cursor_blink: config
-                .get("cursorBlink")
-                .and_then(Value::as_bool)
-                .unwrap_or_else(default_cursor_blink),
+            theme: config.theme?,
+            disable_welcome_banner_animation: config.disable_welcome_banner_animation,
+            autocopy_to_clipboard: config.autocopy_to_clipboard,
+            enable_mouse_capture: config.enable_mouse_capture,
+            enable_file_autocomplete: config.enable_file_autocomplete,
+            file_watcher_for_autocomplete: config.file_watcher_for_autocomplete,
+            cursor_blink: config.cursor_blink,
             active_model: format!("{model_name}[{thinking}]"),
-            active_model_display_name: model_name.to_owned(),
+            active_model_display_name: model_name,
             images_supported: config
-                .get("imagesSupported")
-                .or_else(|| model.get("supportsImages"))
-                .and_then(Value::as_bool)
+                .images_supported
+                .or(model.supports_images)
                 .unwrap_or(false),
-            models_count: config
-                .get("models")
-                .and_then(Value::as_array)
-                .map_or(0, Vec::len),
-            default_agent: config
-                .get("defaultAgent")
-                .and_then(Value::as_str)
-                .unwrap_or(DEFAULT_AGENT)
-                .to_owned(),
-            agents: runtime
-                .get("agents")
-                .and_then(Value::as_array)
-                .map(|agents| {
-                    agents
-                        .iter()
-                        .filter_map(|agent| serde_json::from_value(agent.clone()).ok())
-                        .collect()
-                })
-                .unwrap_or_else(builtin_agents),
+            default_agent: config.default_agent.unwrap_or_else(|| DEFAULT_AGENT.into()),
+            agents: runtime.agents.unwrap_or_else(builtin_agents),
             skills: cached_skills(response),
-            skills_count: runtime
-                .get("skills")
-                .and_then(Value::as_array)
-                .map_or(0, |skills| {
-                    skills
-                        .iter()
-                        .filter(|skill| {
-                            skill.get("source").and_then(Value::as_str) != Some("builtin")
-                        })
-                        .count()
-                }),
-            hooks_count: usize_at(runtime, "/hooksCount"),
-            connectors_connected: usize_at(runtime, "/connectors/connected"),
-            connectors_total: runtime
-                .pointer("/connectors/total")
-                .and_then(Value::as_u64)
-                .and_then(|value| usize::try_from(value).ok())
-                .unwrap_or(0),
-            mcp_servers_enabled,
-            mcp_servers_total,
-            context_window: runtime
-                .get("contextWindow")
-                .and_then(Value::as_u64)
-                .unwrap_or(0),
-            narrator_enabled: config
-                .get("narratorEnabled")
-                .and_then(Value::as_bool)
-                .unwrap_or(false),
-            enable_update_checks: config
-                .get("enableUpdateChecks")
-                .and_then(Value::as_bool)
-                .unwrap_or(true),
-            enable_system_trust_store: config
-                .get("enableSystemTrustStore")
-                .and_then(Value::as_bool)
-                .unwrap_or(false),
+            context_window: runtime.context_window,
+            narrator_enabled: config.narrator_enabled,
+            enable_update_checks: config.enable_update_checks,
+            enable_system_trust_store: config.enable_system_trust_store,
         })
     }
-}
-
-fn usize_at(value: &Value, pointer: &str) -> usize {
-    value
-        .pointer(pointer)
-        .and_then(Value::as_u64)
-        .and_then(|value| usize::try_from(value).ok())
-        .unwrap_or(0)
 }
 
 fn cache_file() -> Option<PathBuf> {

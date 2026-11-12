@@ -7,7 +7,7 @@ from e2e.app_server.events import (
     turn_started,
     user_msg,
 )
-from e2e.app_server.scenario import Timeline
+from e2e.app_server.scenario import Timeline, take_snapshot
 
 _PROMPT = "count the python lines"
 
@@ -17,8 +17,8 @@ _COMMAND = (
     "| xargs wc -l | sort -rn | head -20 | tee /tmp/python-line-counts.txt"
 )
 
-# The settled bash disclosure header lands on SGR row 15.
-_CLICK = "\x1b[<0;1;15M\x1b[<0;1;15m"
+# The settled bash disclosure header lands on SGR row 11.
+_CLICK = "\x1b[<0;1;11M\x1b[<0;1;11m"
 
 timeline: Timeline = [
     f"{_PROMPT}\r",
@@ -28,4 +28,5 @@ timeline: Timeline = [
     assistant_msg("Done."),
     turn_completed(),
     _CLICK,
+    take_snapshot(),
 ]

@@ -1,28 +1,37 @@
-use std::collections::BTreeSet;
-
+use serde::de::IgnoredAny;
 use serde::{Deserialize, Serialize};
 
 use crate::core::features::compaction::{
-    CompactionBudget, CompactionProjection, CompactionProjectionFit, CompactionTrigger,
-    PendingCompaction,
+    CompactionBudget, CompactionPhase, CompactionProjection, CompactionProjectionFit,
+    CompactionTrigger, PendingCompaction, Prompts as CompactionPrompts,
 };
 use crate::core::hooks::{HookPoint, hook_action_id};
 use crate::core::model_context::ModelContext;
-use crate::core::state::{ActivePhase, ActiveTurn, QueuedTurn, TurnState};
+use crate::core::state::{ActivePhase, ActiveTurn, TurnState};
 use crate::core::step_protocol::ToolDefinition;
-use crate::core::turn::{PendingLifecycleHook, SuspendedTurn, TurnOutcome};
+use crate::core::turn::{PendingLifecycleHook, TurnOutcome};
 use crate::core::wire::content::{ContentBlock, validate_non_empty_content};
 use crate::core::wire::message::StoredMessage;
+use crate::core::wire::user_message::OutputType;
 
 use super::context::CheckpointStoredMessage;
 use super::schema::{CheckpointCompletionCandidate, CheckpointProtocolError};
 use super::tool::CheckpointToolBatch;
 use super::validate_derived_hook_action_id;
 
+/// What restoring a pending compaction needs from the restored session.
+pub(super) struct CompactionRestore<'a> {
+    pub generated_system: StoredMessage,
+    pub tools: &'a [ToolDefinition],
+    pub budget: CompactionBudget,
+    pub prompts: &'a CompactionPrompts,
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 #[serde(transparent)]
 pub(super) struct CheckpointTurnState(CheckpointTurnStateRepr);
 
+#[allow(clippy::large_enum_variant)] // A short-lived serialization form; boxing would only add indirection.
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 enum CheckpointTurnStateRepr {
@@ -36,9 +45,17 @@ enum CheckpointTurnStateRepr {
         turn_id: String,
         iterations: u32,
         phase: CheckpointActivePhase,
+        /// Retained for V1 compatibility; new checkpoints always write Empty.
         queued: CheckpointQueuedTurn,
         pending_steer: Vec<CheckpointStoredMessage>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        pending_context: Vec<CheckpointStoredMessage>,
         model_input_ready: bool,
+        #[serde(default, skip_serializing_if = "is_zero")]
+        output_limit_retries: u32,
+        /// Absent when the Turn has none, as in checkpoints written before it existed.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        output_type: Option<OutputType>,
     },
     Terminal {
         turn_id: String,
@@ -71,9 +88,12 @@ impl CheckpointTurnState {
                         &active.turn_id,
                         active.iterations,
                     )?,
-                    queued: CheckpointQueuedTurn::capture(&active.queued)?,
+                    queued: CheckpointQueuedTurn::Empty,
                     pending_steer: capture_pending_steer(&active.pending_steer)?,
+                    pending_context: capture_pending_context(&active.pending_context)?,
                     model_input_ready: active.model_input_ready,
+                    output_limit_retries: active.output_limit_retries,
+                    output_type: active.output_type.clone(),
                 }))
             }
             TurnState::Terminal { turn_id, outcome } => {
@@ -89,9 +109,7 @@ impl CheckpointTurnState {
     pub(super) fn restore(
         self,
         context: &ModelContext,
-        generated_system: StoredMessage,
-        tools: &[ToolDefinition],
-        budget: CompactionBudget,
+        compaction: CompactionRestore<'_>,
     ) -> Result<TurnState, String> {
         match self.0 {
             CheckpointTurnStateRepr::Idle => Ok(TurnState::Idle),
@@ -105,7 +123,7 @@ impl CheckpointTurnState {
                     pending: PendingCompaction::between_turns(
                         compaction_id,
                         trigger.restore(),
-                        projection.restore(generated_system.clone(), tools, budget)?,
+                        projection.restore(compaction)?,
                     ),
                 })
             }
@@ -115,26 +133,28 @@ impl CheckpointTurnState {
                 phase,
                 queued,
                 pending_steer,
+                pending_context,
                 model_input_ready,
+                output_limit_retries,
+                output_type,
             } => {
+                if !matches!(queued, CheckpointQueuedTurn::Empty) {
+                    return Err("checkpoint contains pending queued requests; resume with the previous build before upgrading".to_string());
+                }
+
                 if turn_id.trim().is_empty() {
                     return Err("active checkpoint turn ID must not be empty".to_string());
                 }
-                let phase = phase.restore(
-                    &turn_id,
-                    iterations,
-                    context,
-                    generated_system,
-                    tools,
-                    budget,
-                )?;
+                let phase = phase.restore(&turn_id, iterations, context, compaction)?;
                 Ok(TurnState::Active(ActiveTurn {
                     turn_id,
                     iterations,
                     phase,
                     pending_steer: restore_pending_steer(pending_steer)?,
+                    pending_context: restore_pending_context(pending_context)?,
                     model_input_ready,
-                    queued: queued.restore()?,
+                    output_limit_retries,
+                    output_type,
                 }))
             }
             CheckpointTurnStateRepr::Terminal { turn_id, outcome } => {
@@ -152,7 +172,93 @@ impl CheckpointTurnState {
 #[serde(deny_unknown_fields)]
 struct CheckpointCompactionProjection {
     attempt: u32,
+    /// Absent for the in-context phase. Checkpoints captured before the
+    /// phases existed name it `request`.
+    #[serde(
+        default,
+        alias = "request",
+        skip_serializing_if = "CheckpointCompactionPhase::is_in_context"
+    )]
+    phase: CheckpointCompactionPhase,
+    /// Present only in the cut-off retry phase.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    cut_off_retry: Option<CheckpointCutOffRetry>,
+    /// After a refusal as too long in this compaction, the estimate every
+    /// later summary request stays under.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    refit_limit: Option<u64>,
+    /// What the summary covers, without the generated system message. A
+    /// checkpoint written before the summary scope ended at the last reply
+    /// holds the fitted request instead, which restores the same way.
     messages: Vec<CheckpointStoredMessage>,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq)]
+enum CheckpointCompactionPhase {
+    #[default]
+    #[serde(rename = "in_context")]
+    InContext,
+    #[serde(rename = "standalone")]
+    Standalone,
+    #[serde(rename = "cut_off_retry")]
+    CutOffRetry,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+struct CheckpointCutOffRetry {
+    attempt: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    partial: Option<String>,
+}
+
+impl CheckpointCompactionPhase {
+    fn is_in_context(&self) -> bool {
+        *self == Self::InContext
+    }
+}
+
+fn capture_phase(
+    phase: &CompactionPhase,
+) -> (CheckpointCompactionPhase, Option<CheckpointCutOffRetry>) {
+    match phase {
+        CompactionPhase::InContext => (CheckpointCompactionPhase::InContext, None),
+        CompactionPhase::Standalone => (CheckpointCompactionPhase::Standalone, None),
+        CompactionPhase::CutOffRetry { attempt, partial } => (
+            CheckpointCompactionPhase::CutOffRetry,
+            Some(CheckpointCutOffRetry {
+                attempt: *attempt,
+                partial: partial.clone(),
+            }),
+        ),
+    }
+}
+
+fn restore_phase(
+    phase: CheckpointCompactionPhase,
+    cut_off_retry: Option<CheckpointCutOffRetry>,
+) -> Result<CompactionPhase, String> {
+    match (phase, cut_off_retry) {
+        (CheckpointCompactionPhase::InContext, None) => Ok(CompactionPhase::InContext),
+        (CheckpointCompactionPhase::Standalone, None) => Ok(CompactionPhase::Standalone),
+        (CheckpointCompactionPhase::CutOffRetry, Some(retry)) => {
+            if retry
+                .partial
+                .as_ref()
+                .is_some_and(|partial| partial.trim().is_empty())
+            {
+                return Err("cut-off retry partial summary must not be empty".to_string());
+            }
+            Ok(CompactionPhase::CutOffRetry {
+                attempt: retry.attempt,
+                partial: retry.partial,
+            })
+        }
+        (CheckpointCompactionPhase::CutOffRetry, None) => {
+            Err("cut-off retry phase is missing its attempt".to_string())
+        }
+        (_, Some(_)) => Err("only the cut-off retry phase records a cut-off retry".to_string()),
+    }
 }
 
 impl CheckpointCompactionProjection {
@@ -163,35 +269,40 @@ impl CheckpointCompactionProjection {
             .filter(|message| !message.is_generated_system())
             .map(CheckpointStoredMessage::capture)
             .collect::<Result<Vec<_>, _>>()?;
+        let (phase, cut_off_retry) = capture_phase(projection.phase());
         Ok(Self {
             attempt: projection.attempt(),
+            phase,
+            cut_off_retry,
+            refit_limit: projection.refit_limit(),
             messages,
         })
     }
 
-    fn restore(
-        self,
-        generated_system: StoredMessage,
-        tools: &[ToolDefinition],
-        budget: CompactionBudget,
-    ) -> Result<CompactionProjection, String> {
-        let mut messages = vec![generated_system];
+    fn restore(self, compaction: CompactionRestore<'_>) -> Result<CompactionProjection, String> {
+        let phase = restore_phase(self.phase, self.cut_off_retry)?;
+        let mut messages = vec![compaction.generated_system];
         messages.extend(
             self.messages
                 .into_iter()
                 .map(CheckpointStoredMessage::restore)
                 .collect::<Result<Vec<_>, _>>()?,
         );
-        let projection = CompactionProjection::restore(messages, self.attempt)
-            .map_err(|error| error.detail().to_string())?;
-        match projection
-            .fit_to_budget(tools, budget)
-            .map_err(|error| error.detail().to_string())?
+        match CompactionProjection::restore(
+            messages,
+            self.attempt,
+            phase,
+            self.refit_limit,
+            compaction.tools,
+            compaction.budget,
+            compaction.prompts,
+        )
+        .map_err(|error| error.detail().to_string())?
         {
             CompactionProjectionFit::Fitted(projection) => Ok(projection),
-            CompactionProjectionFit::TooLarge => Err(
-                "token threshold cannot fit the generated system prompt, latest user message, tool catalog, and compaction prompt".to_string(),
-            ),
+            CompactionProjectionFit::TooLarge => {
+                Err("token threshold cannot fit the smallest compaction request".to_string())
+            }
         }
     }
 }
@@ -230,8 +341,6 @@ enum CheckpointActivePhase {
     AwaitingCompaction {
         compaction_id: String,
         projection: CheckpointCompactionProjection,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        context_keys: Option<Vec<String>>,
     },
     AwaitingToolBatch {
         batch: CheckpointToolBatch,
@@ -262,8 +371,6 @@ impl CheckpointActivePhase {
                 Ok(Self::AwaitingCompaction {
                     compaction_id: pending.compaction_id().to_string(),
                     projection: CheckpointCompactionProjection::capture(pending.projection())?,
-                    context_keys: (!pending.context_keys().is_empty())
-                        .then(|| pending.context_keys().to_vec()),
                 })
             }
             ActivePhase::AwaitingToolBatch { batch } => Ok(Self::AwaitingToolBatch {
@@ -280,9 +387,7 @@ impl CheckpointActivePhase {
         turn_id: &str,
         iterations: u32,
         context: &ModelContext,
-        generated_system: StoredMessage,
-        tools: &[ToolDefinition],
-        budget: CompactionBudget,
+        compaction: CompactionRestore<'_>,
     ) -> Result<ActivePhase, String> {
         match self {
             Self::AwaitingCompletion { action_id } => {
@@ -291,14 +396,12 @@ impl CheckpointActivePhase {
             Self::AwaitingCompaction {
                 compaction_id,
                 projection,
-                context_keys,
             } => Ok(ActivePhase::AwaitingCompaction {
                 pending: PendingCompaction::in_turn(
                     compaction_id,
                     turn_id.to_string(),
                     iterations,
-                    restore_context_keys(context_keys, context)?,
-                    projection.restore(generated_system, tools, budget)?,
+                    projection.restore(compaction)?,
                 ),
             }),
             Self::AwaitingToolBatch { batch } => Ok(ActivePhase::AwaitingToolBatch {
@@ -311,43 +414,12 @@ impl CheckpointActivePhase {
     }
 }
 
-/// Restores the keys of the current pre-LLM hook result that a pending
-/// compaction leaves room for.
-fn restore_context_keys(
-    context_keys: Option<Vec<String>>,
-    context: &ModelContext,
-) -> Result<Vec<String>, String> {
-    let Some(context_keys) = context_keys else {
-        return Ok(Vec::new());
-    };
-    if context_keys.is_empty() {
-        return Err("checkpoint compaction context keys must not be empty".to_string());
-    }
-    let mut unique = BTreeSet::new();
-    for key in &context_keys {
-        if key.is_empty() {
-            return Err("checkpoint context key must not be empty".to_string());
-        }
-        if !unique.insert(key.as_str()) {
-            return Err(format!(
-                "duplicate checkpoint compaction context key {key:?}"
-            ));
-        }
-        if context.latest_keyed_message(key).is_none() {
-            return Err(format!(
-                "checkpoint compaction context key {key:?} has no keyed message"
-            ));
-        }
-    }
-    Ok(context_keys)
-}
-
 fn capture_pending_steer(
     messages: &[StoredMessage],
 ) -> Result<Vec<CheckpointStoredMessage>, String> {
     messages
         .iter()
-        .map(|message| CheckpointStoredMessage::capture_visible_user(message, "pending steering"))
+        .map(|message| CheckpointStoredMessage::capture_steering(message, "pending steering"))
         .collect()
 }
 
@@ -356,7 +428,27 @@ fn restore_pending_steer(
 ) -> Result<Vec<StoredMessage>, String> {
     messages
         .into_iter()
-        .map(|message| message.restore_visible_user("pending steering"))
+        .map(|message| message.restore_steering("pending steering"))
+        .collect()
+}
+
+fn capture_pending_context(
+    messages: &[StoredMessage],
+) -> Result<Vec<CheckpointStoredMessage>, String> {
+    messages
+        .iter()
+        .map(|message| {
+            CheckpointStoredMessage::capture_injected_context(message, "pending context")
+        })
+        .collect()
+}
+
+fn restore_pending_context(
+    messages: Vec<CheckpointStoredMessage>,
+) -> Result<Vec<StoredMessage>, String> {
+    messages
+        .into_iter()
+        .map(|message| message.restore_injected_context("pending context"))
         .collect()
 }
 
@@ -364,52 +456,11 @@ fn restore_pending_steer(
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 enum CheckpointQueuedTurn {
     Empty,
+    /// Decoded so restore can explain how to recover these requests.
     Pending {
         turn_id: String,
         messages: Vec<CheckpointStoredMessage>,
     },
-}
-
-impl CheckpointQueuedTurn {
-    fn capture(queued: &QueuedTurn) -> Result<Self, String> {
-        match queued {
-            QueuedTurn::Empty => Ok(Self::Empty),
-            QueuedTurn::Pending { turn_id, messages } => {
-                validate_identity(turn_id, "queued checkpoint turn ID")?;
-                if messages.is_empty() {
-                    return Err("queued turn must contain at least one message".to_string());
-                }
-                Ok(Self::Pending {
-                    turn_id: turn_id.clone(),
-                    messages: messages
-                        .iter()
-                        .map(|message| {
-                            CheckpointStoredMessage::capture_visible_user(message, "queued turn")
-                        })
-                        .collect::<Result<_, _>>()?,
-                })
-            }
-        }
-    }
-
-    fn restore(self) -> Result<QueuedTurn, String> {
-        match self {
-            Self::Empty => Ok(QueuedTurn::Empty),
-            Self::Pending { turn_id, messages } => {
-                validate_identity(&turn_id, "queued checkpoint turn ID")?;
-                if messages.is_empty() {
-                    return Err("queued turn must contain at least one message".to_string());
-                }
-                Ok(QueuedTurn::Pending {
-                    turn_id,
-                    messages: messages
-                        .into_iter()
-                        .map(|message| message.restore_visible_user("queued turn"))
-                        .collect::<Result<_, _>>()?,
-                })
-            }
-        }
-    }
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
@@ -458,7 +509,10 @@ enum CheckpointPendingLifecycleHook {
     PreAgentTurn {
         hook_binding_ids: Vec<String>,
         user_content: Vec<ContentBlock>,
-        previous_turn: CheckpointInactiveTurnState,
+        /// Deprecated: still written by `mistralai-vibe-harness` 0.1.9. Accepted
+        /// so those checkpoints restore; the value is ignored and never written.
+        #[serde(default, skip_serializing)]
+        previous_turn: IgnoredAny,
     },
     PreLlmCall {
         hook_binding_ids: Vec<String>,
@@ -484,7 +538,6 @@ impl CheckpointPendingLifecycleHook {
                 hook_binding_ids,
                 turn_id,
                 user_content,
-                suspended,
             } => {
                 validate_non_empty_content(user_content, "pre-agent user content")
                     .map_err(|error| error.detail().to_string())?;
@@ -501,7 +554,7 @@ impl CheckpointPendingLifecycleHook {
                 Ok(Self::PreAgentTurn {
                     hook_binding_ids: hook_binding_ids.clone(),
                     user_content: user_content.clone(),
-                    previous_turn: CheckpointInactiveTurnState::capture(suspended)?,
+                    previous_turn: IgnoredAny,
                 })
             }
             PendingLifecycleHook::PreLlmCall {
@@ -561,7 +614,7 @@ impl CheckpointPendingLifecycleHook {
             Self::PreAgentTurn {
                 hook_binding_ids,
                 user_content,
-                previous_turn,
+                previous_turn: _,
             } => {
                 validate_non_empty_content(&user_content, "pre-agent user content")
                     .map_err(|error| error.detail().to_string())?;
@@ -570,7 +623,6 @@ impl CheckpointPendingLifecycleHook {
                     hook_binding_ids,
                     turn_id: active_turn_id.to_string(),
                     user_content,
-                    suspended: previous_turn.restore()?,
                 })
             }
             Self::PreLlmCall {
@@ -612,40 +664,6 @@ fn validate_identity(id: &str, label: &str) -> Result<(), String> {
     Ok(())
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
-#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
-enum CheckpointInactiveTurnState {
-    Idle,
-    Terminal {
-        turn_id: String,
-        outcome: CheckpointTurnOutcome,
-    },
-}
-
-impl CheckpointInactiveTurnState {
-    fn capture(turn: &SuspendedTurn) -> Result<Self, String> {
-        match turn {
-            SuspendedTurn::Idle => Ok(Self::Idle),
-            SuspendedTurn::Terminal { turn_id, outcome } => {
-                validate_identity(turn_id, "previous terminal checkpoint turn ID")?;
-                Ok(Self::Terminal {
-                    turn_id: turn_id.clone(),
-                    outcome: CheckpointTurnOutcome::capture(outcome),
-                })
-            }
-        }
-    }
-
-    fn restore(self) -> Result<SuspendedTurn, String> {
-        match self {
-            Self::Idle => Ok(SuspendedTurn::Idle),
-            Self::Terminal { turn_id, outcome } => {
-                validate_identity(&turn_id, "previous terminal checkpoint turn ID")?;
-                Ok(SuspendedTurn::Terminal {
-                    turn_id,
-                    outcome: outcome.restore(),
-                })
-            }
-        }
-    }
+fn is_zero(value: &u32) -> bool {
+    *value == 0
 }

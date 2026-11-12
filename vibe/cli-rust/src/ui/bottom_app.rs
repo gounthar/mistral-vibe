@@ -11,24 +11,27 @@ use crate::selection::RegionId;
 /// The two border columns plus the `padding: 0 1` every bottom-app box uses.
 const BORDER_WIDTH: u16 = 4;
 
-/// Which bottom app replaces the input box (Python's `BottomApp`).
+/// Which bottom app replaces the input box.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Kind {
     Approval,
     Question,
     Voice,
+    Branch,
     ProxySetup,
     Theme,
     Model,
     LogLevel,
     Thinking,
+    Artifacts,
     Resume,
     Rewind,
     Mcp,
     Plugins,
+    Skills,
+    Context,
     McpOAuth,
     ConnectorAuth,
-    RemoteProject,
 }
 
 impl Kind {
@@ -37,7 +40,6 @@ impl Kind {
         match self {
             Kind::Approval => MouseTarget::Approval,
             Kind::Question => MouseTarget::Question,
-            Kind::RemoteProject => MouseTarget::RemoteProject,
             Kind::ProxySetup => MouseTarget::ProxySetup,
             _ => MouseTarget::BottomApp,
         }
@@ -70,6 +72,7 @@ pub(crate) fn draw(
     let content = content(box_area);
     app.view.bottom_app_selection_region = selection::frame_region(content);
     app.view.bottom_app_selection_chrome.clear();
+    app.view.bottom_app_selection_halves = None;
     app.view.bottom_app_selection_folds = crate::selection::Folds::default();
     draw_box(app, f, box_area);
     for track in mouse::scrollbar_tracks(app, content) {
@@ -81,8 +84,8 @@ pub(crate) fn draw(
     bottom_bar::draw(app, f, bar);
 }
 
-/// The text rectangle inside the box border and padding (Python selects
-/// everything its widgets paint, but never the container's border).
+/// The text rectangle inside the box border and padding (selection covers
+/// everything painted inside, never the border).
 pub(crate) fn content(area: Rect) -> Rect {
     Rect {
         x: area.x.saturating_add(BORDER_WIDTH / 2),
@@ -97,7 +100,7 @@ pub(crate) fn content(area: Rect) -> Rect {
 fn chunks(app: &App, area: Rect, box_height: u16) -> [Rect; 5] {
     let chunks = Layout::vertical([
         Constraint::Min(1),
-        Constraint::Length(super::loading_height(app)),
+        Constraint::Length(super::loading_height(app, area.width)),
         Constraint::Length(todo::row_height(app)),
         Constraint::Length(box_height),
         Constraint::Length(1),

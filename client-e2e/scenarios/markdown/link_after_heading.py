@@ -3,18 +3,15 @@
 from __future__ import annotations
 
 from e2e.app_server.events import assistant_msg, turn_completed, turn_started, user_msg
-from e2e.app_server.scenario import Action, Timeline
+from e2e.app_server.scenario import Action, Timeline, take_snapshot
 
 _PROMPT = "show docs"
 _URL = "https://docs.example.com"
 _ANSWER = f"## Docs\n\nOpen [Docs]({_URL})."
-_ROW, _COL = 19, 8
+_ROW, _COL = 15, 8
 _CLICK = f"\x1b[<0;{_COL};{_ROW}M\x1b[<0;{_COL};{_ROW}m"
 
-expected_actions = {
-    "python": [Action("open_url", _URL)],
-    "rust": [Action("open_url", _URL)],
-}
+expected_actions = [Action("open_url", _URL)]
 
 timeline: Timeline = [
     f"{_PROMPT}\r",
@@ -22,5 +19,7 @@ timeline: Timeline = [
     user_msg(_PROMPT),
     assistant_msg(_ANSWER),
     turn_completed(),
+    take_snapshot(),
     _CLICK,
+    take_snapshot(),
 ]

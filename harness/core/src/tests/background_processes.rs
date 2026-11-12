@@ -133,7 +133,7 @@ fn run_typescript_completion(action_id: &str, call_id: &str, source: &str) -> Va
                 "arguments_json": json!({"code": source}).to_string(),
             }],
             "finish_reason": "tool_call",
-            "usage": null,
+            "usage": {"input_tokens": 100, "output_tokens": 20, "total_tokens": 120, "cached_input_tokens": 0, "cache_write_tokens": 0, "reasoning_tokens": 0},
         },
     })
 }
@@ -217,7 +217,8 @@ fn programmatic_background_process_route_matrix_survives_restore() {
     for (index, (action, case)) in actions.iter().zip(&expected).enumerate() {
         let command = structured_tool_success(action, &case.result);
         let live = accepted_value(session.apply(input(3 + index as u64, command.clone())));
-        let restored_result = accepted_value(restored.apply(input(1 + index as u64, command)));
+        let restored_result =
+            accepted_value(restored.apply(input_at(1 + index as u64, 3 + index as u64, command)));
 
         assert_eq!(
             live["transition"]["observations"],

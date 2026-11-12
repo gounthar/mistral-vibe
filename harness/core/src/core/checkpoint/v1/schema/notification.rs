@@ -1,11 +1,21 @@
 use serde::{Deserialize, Serialize};
 
+use super::agent_result::CheckpointAgentResultTermination;
 use crate::core::features::notifications::Notification;
 use crate::core::features::notifications::{
     AsyncToolNotificationStatus, NotificationLevel, NotificationSource, ProcessTerminalStatus,
     SubagentNotificationStatus,
 };
 use crate::core::wire::content::ContentBlock;
+
+/// The kind that earlier checkpoints record for queued agent input. Only messages are queued
+/// now, so a saved queued task restores as a message from the same sender.
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq)]
+#[serde(rename_all = "snake_case")]
+enum SavedAgentMessageKind {
+    Task,
+    Message,
+}
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq)]
 #[serde(rename_all = "snake_case")]
@@ -88,6 +98,15 @@ impl CheckpointAsyncToolNotificationStatus {
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 enum CheckpointNotificationSource {
+    AgentMessage {
+        sender_agent_path: String,
+        #[serde(default, skip_serializing)]
+        kind: Option<SavedAgentMessageKind>,
+    },
+    AgentResult {
+        sender_agent_path: String,
+        termination: CheckpointAgentResultTermination,
+    },
     BackgroundProcess {
         process_id: String,
         status: CheckpointProcessTerminalStatus,
@@ -107,6 +126,17 @@ enum CheckpointNotificationSource {
 impl CheckpointNotificationSource {
     fn capture(source: &NotificationSource) -> Self {
         match source {
+            NotificationSource::AgentMessage { sender_agent_path } => Self::AgentMessage {
+                sender_agent_path: sender_agent_path.clone(),
+                kind: None,
+            },
+            NotificationSource::AgentResult {
+                sender_agent_path,
+                termination,
+            } => Self::AgentResult {
+                sender_agent_path: sender_agent_path.clone(),
+                termination: CheckpointAgentResultTermination::capture(termination),
+            },
             NotificationSource::BackgroundProcess {
                 process_id,
                 status,
@@ -129,6 +159,17 @@ impl CheckpointNotificationSource {
 
     fn restore(self) -> NotificationSource {
         match self {
+            Self::AgentMessage {
+                sender_agent_path,
+                kind: _,
+            } => NotificationSource::AgentMessage { sender_agent_path },
+            Self::AgentResult {
+                sender_agent_path,
+                termination,
+            } => NotificationSource::AgentResult {
+                sender_agent_path,
+                termination: termination.restore(),
+            },
             Self::BackgroundProcess {
                 process_id,
                 status,

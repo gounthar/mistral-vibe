@@ -1,30 +1,25 @@
-//! MCP OAuth bottom-app state (Python `MCPOAuthApp`).
+//! MCP OAuth bottom-app state.
 
 use std::sync::Arc;
 
 use serde_json::json;
 
-use crate::app::{App, ToastSeverity};
+use crate::app::App;
 use crate::clipboard;
 use crate::external_url;
 use crate::hints::{self, action};
 
 use crate::server::{method, Client};
 
-/// Shortcut line of the app (Python `_HELP`).
+/// Shortcut line of the app.
 const HELP: &[hints::Hint] = &[
     hints::NAVIGATE,
     hints::SELECT,
     ("r", action::RETRY),
     hints::BACK,
 ];
-/// Indent of the three action options (Python `_OPTION_PADDING`).
+/// Indent of the three action options.
 const OPTION_PADDING: &str = "  ";
-/// Seconds the copy toast stays up (Python `copy_text_to_clipboard` timeout).
-const COPY_TOAST_SECS: u64 = 2;
-/// Native-copy hint appended when the clipboard write is unverified.
-const NATIVE_COPY_HINT: &str = "if paste fails, hold Shift (Option in iTerm2, Fn in Terminal.app) \
-     while selecting for native copy";
 
 /// The answer of one `mcp/login` round-trip, applied on the main thread.
 pub struct Event {
@@ -33,7 +28,7 @@ pub struct Event {
     pub error: Option<String>,
 }
 
-/// The three selectable options, in Python's order.
+/// The three selectable options, in display order.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum OptionId {
     Open,
@@ -54,7 +49,7 @@ impl Row {
     }
 }
 
-/// Open the app for `server_name` and start its login (Python `MCPOAuthRequested`).
+/// Open the app for `server_name` and start its login.
 pub fn open(app: &mut App, client: &Arc<Client>, server_name: String) {
     app.mcp.open = false;
     app.mcp.viewing_name = None;
@@ -64,13 +59,13 @@ pub fn open(app: &mut App, client: &Arc<Client>, server_name: String) {
     start_login(app, client);
 }
 
-/// Esc (Python `MCPOAuthClosed()`).
+/// Esc: close the app and re-open the browser.
 pub fn close(app: &mut App, client: &Arc<Client>) {
     dismiss(app);
     crate::mcp::reopen(app, client, false, String::new());
 }
 
-/// The login succeeded: stay up while the browser re-discovers, as Python awaits `_refresh_mcp_browser` first.
+/// The login succeeded: stay up while the browser re-discovers.
 fn connect(app: &mut App, client: &Arc<Client>) {
     app.mcp_oauth.status_message = Some("Connecting...".to_owned());
     let server_name = app.mcp_oauth.server_name.clone();
@@ -97,22 +92,17 @@ fn start_login(app: &mut App, client: &Arc<Client>) {
     app.mcp_oauth.auth_url = None;
     app.mcp_oauth.auth_url_visible = false;
     app.mcp_oauth.failed = false;
-    app.mcp_oauth.selected = 0;
+    app.mcp_oauth.list.select(0);
     app.mcp_oauth.logging_in = true;
     app.mcp_oauth.status_message = Some("Preparing authentication...".to_owned());
     app.mcp_oauth.generation += 1;
     let generation = app.mcp_oauth.generation;
     let name = app.mcp_oauth.server_name.clone();
-    let (Some(session_id), Some(tx)) = (app.session.session_id.clone(), app.mcp_oauth.tx.clone())
-    else {
+    let Some(session_id) = app.session.session_id.clone() else {
         return;
     };
     let client = client.clone();
-    // The login answer repaints the bottom app, so hold the replay marker with a
-    // commit until it lands (mirrors `connector_auth`), else the capture races
-    // the "Preparing authentication..." placeholder.
-    let pending = app.commit_started();
-    tokio::spawn(async move {
+    crate::ui_event::spawn(app, async move {
         let error = client
             .request(
                 method::MCP_LOGIN,
@@ -121,7 +111,7 @@ fn start_login(app: &mut App, client: &Arc<Client>) {
             .await
             .err()
             .map(|error| error.to_string());
-        crate::input::deliver(Some(tx), Event { generation, error }, &pending).await;
+        Event { generation, error }
     });
 }
 
@@ -136,13 +126,12 @@ pub fn apply_event(app: &mut App, client: &Arc<Client>, event: Event) {
             }
         }
     }
-    app.commit_finished();
 }
 
 /// The `mcp/authUrl` notification of the running login.
 pub fn on_auth_url(app: &mut App, url: &str) {
     app.mcp_oauth.auth_url = Some(url.to_owned());
-    app.mcp_oauth.selected = 0;
+    app.mcp_oauth.list.select(0);
     app.mcp_oauth.status_message = Some("Waiting for browser sign-in...".to_owned());
 }
 
@@ -154,10 +143,10 @@ fn on_login_failed(app: &mut App, message: String) {
 /// Move the highlight, wrapping at the ends.
 pub fn navigate(app: &mut App, down: bool) {
     let count = rows(app).iter().filter(|row| row.selectable()).count();
-    app.mcp_oauth.selected = crate::list_nav::wrap(app.mcp_oauth.selected, count, down);
+    app.mcp_oauth.list.step(down, count, true, |_| true);
 }
 
-/// Enter on the highlighted option (Python `on_option_list_option_selected`).
+/// Enter on the highlighted option.
 pub fn select(app: &mut App) {
     match selected_id(app) {
         Some(OptionId::Open) => open_browser(app),
@@ -167,37 +156,6 @@ pub fn select(app: &mut App) {
     }
 }
 
-/// Mouse press: highlight the option under the cursor (Textual `OptionList`).
-pub fn press(app: &mut App, at: (u16, u16)) {
-    if let Some(index) = action_at(app, at) {
-        app.mcp_oauth.selected = index;
-    }
-}
-
-/// Mouse release: a click on the highlighted option activates it, like Enter.
-pub fn release(app: &mut App, at: (u16, u16)) {
-    if action_at(app, at) == Some(app.mcp_oauth.selected) {
-        select(app);
-    }
-}
-
-/// The action option under a screen cell, from the last render's geometry.
-fn action_at(app: &App, at: (u16, u16)) -> Option<usize> {
-    let area = app.mcp_oauth.list_area;
-    let inside = at.0 >= area.x && at.0 < area.right() && at.1 >= area.y && at.1 < area.bottom();
-    if !inside {
-        return None;
-    }
-    let line = (at.1 - area.y) as usize;
-    rows(app)
-        .iter()
-        .take(line + 1)
-        .filter(|row| row.selectable())
-        .count()
-        .checked_sub(1)
-        .filter(|_| rows(app).get(line).is_some_and(Row::selectable))
-}
-
 fn selected_id(app: &App) -> Option<OptionId> {
     rows(app)
         .into_iter()
@@ -205,7 +163,7 @@ fn selected_id(app: &App) -> Option<OptionId> {
             Row::Action(id, _) => Some(id),
             _ => None,
         })
-        .nth(app.mcp_oauth.selected)
+        .nth(app.mcp_oauth.list.selected())
 }
 
 fn open_browser(app: &mut App) {
@@ -220,12 +178,13 @@ fn copy_url(app: &mut App) {
     let Some(url) = app.mcp_oauth.auth_url.clone() else {
         return;
     };
-    let message = if clipboard::copy_to_clipboard(&url) {
-        "Auth URL copied to clipboard".to_owned()
-    } else {
-        format!("Auth URL copied to clipboard · {NATIVE_COPY_HINT}")
-    };
-    app.show_toast(message, ToastSeverity::Information, COPY_TOAST_SECS);
+    let verified = clipboard::copy_to_clipboard(&url);
+    crate::ui::notice::copied_as(
+        app,
+        "Auth URL copied to clipboard",
+        "Auth URL copied",
+        verified,
+    );
 }
 
 fn toggle_url(app: &mut App) {
@@ -263,7 +222,7 @@ pub fn rows(app: &App) -> Vec<Row> {
     ]
 }
 
-/// The static under the options (Python `_update_detail_text`).
+/// The detail text under the options.
 pub fn detail(app: &App) -> String {
     let url = app.mcp_oauth.auth_url.as_deref();
     if app.mcp_oauth.failed || url.is_none() {
@@ -278,7 +237,7 @@ pub fn detail(app: &App) -> String {
     parts.join("\n")
 }
 
-/// The help line, prefixed with the current status (Python `_set_help_text`).
+/// The help line, prefixed with the current status.
 pub fn help_text(app: &App) -> Vec<(String, bool)> {
     let status = app.mcp_oauth.status_message.as_ref();
     let status = status.map(|status| (format!("{status}  "), false));

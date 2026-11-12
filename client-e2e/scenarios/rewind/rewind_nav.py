@@ -1,12 +1,7 @@
 from __future__ import annotations
 
 from e2e.app_server.events import assistant_msg, turn_completed, turn_started, user_msg
-from e2e.app_server.scenario import Timeline
-
-skip = (
-    "Python repaints the rewind highlight one step late: its selection worker is "
-    "not awaited before the frame settles, so ←/→ lag by one capture."
-)
+from e2e.app_server.scenario import Timeline, take_snapshot
 
 timeline: Timeline = [
     "hi\r",
@@ -24,6 +19,7 @@ timeline: Timeline = [
     "\x1b[C",
     "\x1b[B",
     "q",
+    take_snapshot(),
 ]
 
 handshake = {"session/rewind/read": {"hasFileChanges": False, "paths": []}}

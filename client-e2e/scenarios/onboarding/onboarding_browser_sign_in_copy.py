@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from e2e.app_server.scenario import Action, Timeline
+from e2e.app_server.scenario import Action, Timeline, take_snapshot
 
 client_args = ("--setup",)
 request_methods = {"setup/status"}
@@ -10,7 +10,17 @@ request_methods = {"setup/status"}
 _SIGN_IN_URL = "https://console.mistral.ai/codestral/cli/authenticate?process_id=replay"
 
 # Reaching the sign-in screen opens the browser; `c` then copies the same URL.
-expected_actions = {"rust": [Action("open_url", _SIGN_IN_URL)]}
-clipboard_clients = {"rust"}
+expected_actions = [Action("open_url", _SIGN_IN_URL)]
 expected_clipboard = _SIGN_IN_URL
-timeline: Timeline = ["\r", "\r", "\r", "\r", "c"]
+timeline: Timeline = [
+    "\r",
+    take_snapshot(),
+    "\r",
+    take_snapshot(),
+    "\r",
+    take_snapshot(),
+    "\r",
+    take_snapshot(),
+    "c",
+    take_snapshot(),
+]

@@ -19,9 +19,8 @@ handshake = {
     "runtime/read": {"runtime": {"config": {"models": models}}},
 }
 
-capture_startup = False
-screen_contains = {"rust": ("Model 28",)}
-screen_excludes = {"rust": ("Model 29", "default (currently")}
+screen_contains = ("Model 28",)
+screen_excludes = ("Model 29", "default (currently")
 timeline: Timeline = [
     "/config\r",
     "\r",

@@ -1,5 +1,61 @@
 use super::*;
 
+#[test]
+fn rejects_new_turn_when_pre_agent_or_pre_llm_hook_is_pending() {
+    for point in ["pre_agent_turn", "pre_llm_call"] {
+        let turn_id = "turn-hook-busy";
+        let mut config = config();
+        config.capabilities.hook_bindings = serde_json::from_value(json!([{
+            "id": "pending-hook",
+            "point": point,
+            "order": 0,
+            "selector": {"type": "always"},
+        }]))
+        .unwrap();
+        let mut runtime = SynchronousRuntime::new(config);
+        let input = if point == "pre_agent_turn" {
+            json!({"user_content": [{"type": "text", "text": "first request"}]})
+        } else {
+            Value::Null
+        };
+        let mut expected = running(turn_id).dispatch(hook_call(point, &["pending-hook"], input));
+
+        if point == "pre_llm_call" {
+            expected = expected.observe(turn_started(turn_id, "first request"));
+        }
+        let hook = runtime
+            .apply(user_message(turn_id, "first request", "queue"), expected)
+            .only_action();
+
+        runtime.reject(
+            user_message("turn-follow-up", "next request", "queue"),
+            json!({
+                "code": "invalid_state",
+                "command_type": "user_message",
+                "state": "running",
+            }),
+        );
+
+        let mut output = json!({"type": "continue"});
+        let mut expected = running(turn_id).dispatch(llm_call(0));
+
+        if point == "pre_agent_turn" {
+            output["user_content"] = json!([{"type": "text", "text": "first request"}]);
+            expected = expected.observe(turn_started(turn_id, "first request"));
+        }
+        let completion = runtime
+            .apply(hook_completed(&hook, point, output), expected)
+            .only_action();
+
+        runtime.assert_last_model_message_update(
+            &completion,
+            "replace",
+            &[model_system(), model_user_text("first request")],
+        );
+        runtime.finish_turn_with_text(turn_id, &completion, "first answer");
+    }
+}
+
 ///
 /// *Prepare*: One session configures pre-agent, pre-LLM, post-LLM, pre-tool, post-tool, and post-agent hooks.
 /// *Do*: Drive a tool-using turn through every hook and a final model completion.
@@ -247,6 +303,88 @@ fn all_hook_points_execute_in_one_tool_using_turn() {
 }
 
 ///
+/// *Prepare*: One session binds a post-LLM hook and a post-agent hook.
+/// *Do*: Complete the model call with every provider token counter, then accept the candidate at each hook.
+/// *Assert*: Both hooks and the committed message receive every token counter unchanged.
+///
+#[test]
+fn completion_hooks_receive_every_token_counter() {
+    // Prepare
+    let turn_id = "turn-hook-usage";
+    let mut config = config();
+    config.capabilities.hook_bindings = serde_json::from_value(json!([
+        {"id": "usage-post-llm", "point": "post_llm_call", "order": 0, "selector": {"type": "always"}},
+        {"id": "usage-post-agent", "point": "post_agent_turn", "order": 1, "selector": {"type": "always"}}
+    ]))
+    .expect("completion hook bindings configure");
+    let mut runtime = SynchronousRuntime::new(config);
+    let completion = runtime.start_turn(turn_id, "count my tokens");
+    let usage = json!({
+        "input_tokens": 120,
+        "output_tokens": 30,
+        "total_tokens": 150,
+        "cached_input_tokens": 80,
+        "cache_write_tokens": 25,
+        "reasoning_tokens": 12,
+    });
+    let mut candidate = text_candidate("counted");
+    candidate["usage"] = usage.clone();
+    let mut model_result = text_completion(&completion, "counted");
+    model_result["result"]["usage"] = usage;
+
+    // Do
+    let post_llm = runtime
+        .apply(
+            model_result,
+            running(turn_id).dispatch(hook_call(
+                "post_llm_call",
+                &["usage-post-llm"],
+                json!({"candidate": candidate}),
+            )),
+        )
+        .only_action();
+    let post_agent = runtime
+        .apply(
+            hook_completed(
+                &post_llm,
+                "post_llm_call",
+                json!({"type": "accept", "acceptance": {"type": "candidate"}}),
+            ),
+            running(turn_id).dispatch(hook_call(
+                "post_agent_turn",
+                &["usage-post-agent"],
+                json!({"candidate": candidate}),
+            )),
+        )
+        .only_action();
+    runtime.apply(
+        hook_completed(
+            &post_agent,
+            "post_agent_turn",
+            json!({"type": "accept", "acceptance": {"type": "candidate"}}),
+        ),
+        completed(turn_id, vec![json!({"type": "text", "text": "counted"})])
+            .observe(json!({
+                "type": "assistant_message_committed",
+                "turn_id": turn_id,
+                "action_id": action_id(&completion),
+                "candidate": candidate,
+            }))
+            .observe(turn_completed(turn_id, "counted")),
+    );
+
+    // Assert
+    assert_eq!(
+        post_llm["input"]["candidate"]["usage"]["cache_write_tokens"],
+        25
+    );
+    assert_eq!(
+        post_agent["input"]["candidate"]["usage"]["reasoning_tokens"],
+        12
+    );
+}
+
+///
 /// *Prepare*: An always binding and a filesystem-specific binding both observe the same direct read call.
 /// *Do*: Run both Runtime hook handlers in order, return their final transformed arguments, execute the tool, and finish the turn.
 /// *Assert*: The second handler receives the first handler's output and every Core transition has the expected observation and turn state.
@@ -458,275 +596,616 @@ fn interrupting_hooks_discards_only_an_existing_completion_candidate() {
     assert_eq!(post_hook["hook"], "post_llm_call");
 }
 
-fn context_hook_config() -> HarnessConfig {
-    let mut config = config();
-    config.capabilities.hook_bindings = serde_json::from_value(json!([
-        {"id": "context-pre-llm", "point": "pre_llm_call", "order": 0, "selector": {"type": "always"}}
-    ]))
-    .expect("pre-LLM hook configures");
-    config
-}
-
-/// Completes `completion` with one `read_file` call for `path`. Returns the
-/// next pre-LLM hook and the model messages the tool round trip adds.
-fn read_file_then_next_hook(
-    runtime: &mut SynchronousRuntime,
-    turn_id: &str,
-    completion: &Value,
-    path: &str,
-) -> (Value, [Value; 2]) {
-    let contents = format!("contents of {path}");
-    let calls = vec![tool_call(path, "read_file", json!({"path": path}))];
-    let tool = runtime
-        .complete_with_tool_calls(
-            turn_id,
-            completion,
-            &calls,
-            [runtime_tool("file_system.read_file", json!({"path": path}))],
-        )
-        .only_action();
-    let result = text_tool_success(&tool, &contents);
-    let hook = runtime
-        .apply(
-            result.clone(),
-            running(turn_id)
-                .dispatch(hook_call("pre_llm_call", &["context-pre-llm"], Value::Null))
-                .observe_completed_tool_result(&tool, &result),
-        )
-        .only_action();
-    (
-        hook,
-        [
-            model_assistant_tool_calls(&calls),
-            model_tool_text(path, "read_file", &contents),
-        ],
-    )
-}
-
 ///
-/// *Prepare*: One pre-LLM hook returns keyed context before every agent completion.
-/// *Do*: Return the same context across a tool loop, then change one key and add another.
-/// *Assert*: Core appends context before the completion only when its content changed, and emits no Observation for it.
+/// *Prepare*: A pre-agent hook is bound and a queued turn waits on it.
+/// *Do*: Skip the turn, send a late interrupt for it, then queue and run another turn.
+/// *Assert*: The skip starts and completes the turn with the hook's reason, the late interrupt changes nothing, and the next turn's model input omits the skipped request.
 ///
 #[test]
-fn pre_llm_context_is_delivered_before_the_completion_only_when_it_changes() {
+fn pre_agent_skip_completes_the_turn_and_the_next_turn_runs() {
     // Prepare
-    let turn_id = "turn-keyed-context";
-    let mut runtime = SynchronousRuntime::new(context_hook_config());
-    let initial_hook = runtime
+    let skipped_turn_id = "turn-skip";
+    let mut config = config();
+    config.capabilities.hook_bindings = serde_json::from_value(json!([{
+        "id": "skip-pre-agent",
+        "point": "pre_agent_turn",
+        "order": 0,
+        "selector": {"type": "always"},
+    }]))
+    .expect("pre-agent hook config deserializes");
+    let mut runtime = SynchronousRuntime::new(config);
+    let skip_hook = runtime
         .apply(
-            user_message(turn_id, "inspect the repository", "queue"),
-            running(turn_id)
-                .dispatch(hook_call("pre_llm_call", &["context-pre-llm"], Value::Null))
-                .observe(turn_started(turn_id, "inspect the repository")),
+            user_message(skipped_turn_id, "skip this request", "queue"),
+            running(skipped_turn_id)
+                .dispatch(pre_agent_hook_call("skip-pre-agent", "skip this request")),
         )
         .only_action();
+    let reason = vec![json!({"type": "text", "text": "disabled"})];
 
     // Do
-    let delivered_completion = runtime
+    runtime.apply(
+        hook_completed(
+            &skip_hook,
+            "pre_agent_turn",
+            json!({"type": "skip", "reason": reason.clone()}),
+        ),
+        completed(skipped_turn_id, reason.clone())
+            .observe(turn_started(skipped_turn_id, "skip this request"))
+            .observe(turn_completed_skipped(skipped_turn_id, reason.clone())),
+    );
+    runtime.apply(
+        json!({
+            "type": "interrupt",
+            "expected_turn_id": skipped_turn_id,
+            "reason": "late stop",
+        }),
+        completed(skipped_turn_id, reason),
+    );
+    let next_turn_id = "turn-next";
+    let next_hook = runtime
         .apply(
-            hook_completed(
-                &initial_hook,
-                "pre_llm_call",
-                pre_llm_continue_with_context(&[("github", "GitHub is not connected.")]),
-            ),
-            running(turn_id).dispatch(llm_call(0)),
+            user_message(next_turn_id, "continue", "queue"),
+            running(next_turn_id).dispatch(pre_agent_hook_call("skip-pre-agent", "continue")),
         )
         .only_action();
-    runtime.assert_last_model_message_update(
-        &delivered_completion,
-        "replace",
-        &[
-            model_system(),
-            model_user_text("inspect the repository"),
-            model_user_text("GitHub is not connected."),
-        ],
-    );
-    let (unchanged_hook, [first_read_call, first_read_result]) =
-        read_file_then_next_hook(&mut runtime, turn_id, &delivered_completion, "first.txt");
-    let skipped_completion = runtime
+    let next_completion = runtime
         .apply(
             hook_completed(
-                &unchanged_hook,
-                "pre_llm_call",
-                pre_llm_continue_with_context(&[("github", "GitHub is not connected.")]),
+                &next_hook,
+                "pre_agent_turn",
+                json!({
+                    "type": "continue",
+                    "user_content": [{"type": "text", "text": "continue"}],
+                }),
             ),
-            running(turn_id).dispatch(llm_call(1)),
-        )
-        .only_action();
-    runtime.assert_last_model_message_update(
-        &skipped_completion,
-        "append",
-        &[first_read_call, first_read_result],
-    );
-    let (changed_hook, [second_read_call, second_read_result]) =
-        read_file_then_next_hook(&mut runtime, turn_id, &skipped_completion, "second.txt");
-    let updated_completion = runtime
-        .apply(
-            hook_completed(
-                &changed_hook,
-                "pre_llm_call",
-                pre_llm_continue_with_context(&[
-                    ("github", "GitHub is connected."),
-                    ("workspace", "The workspace is /repo."),
-                ]),
-            ),
-            running(turn_id).dispatch(llm_call(2)),
+            running(next_turn_id)
+                .dispatch(llm_call(0))
+                .observe(turn_started(next_turn_id, "continue")),
         )
         .only_action();
 
     // Assert
     runtime.assert_last_model_message_update(
-        &updated_completion,
-        "append",
-        &[
-            second_read_call,
-            second_read_result,
-            model_user_text("GitHub is connected."),
-            model_user_text("The workspace is /repo."),
-        ],
+        &next_completion,
+        "replace",
+        &[model_system(), model_user_text("continue")],
     );
-    runtime.finish_turn_with_text(turn_id, &updated_completion, "done");
+    runtime.finish_turn_with_text(next_turn_id, &next_completion, "done");
 }
 
 ///
-/// *Prepare*: A pre-LLM hook is pending.
-/// *Do*: Complete it with an empty key, empty content, or a repeated key.
-/// *Assert*: Core rejects each result without changing its state.
+/// *Prepare*: A pre-LLM hook is bound. The turn's first model call answers with text and a tool
+/// call, the tool succeeds, and the pre-LLM hook of the second model call is pending.
+/// *Do*: Skip the second model call from the hook with a reason.
+/// *Assert*: The held completion is discarded as skipped and the turn completes on the stop reason
+/// `skipped` with the reason as its output, not the first call's text, with no further Action.
 ///
 #[test]
-fn pre_llm_context_with_an_invalid_key_or_content_is_rejected() {
+fn pre_llm_skip_after_a_tool_call_completes_the_turn_with_the_reason() {
     // Prepare
-    let turn_id = "turn-invalid-keyed-context";
-    let mut runtime = SynchronousRuntime::new(context_hook_config());
-    let hook = runtime
-        .apply(
-            user_message(turn_id, "inspect the repository", "queue"),
-            running(turn_id)
-                .dispatch(hook_call("pre_llm_call", &["context-pre-llm"], Value::Null))
-                .observe(turn_started(turn_id, "inspect the repository")),
-        )
-        .only_action();
-    let invalid_command = |message: &str| {
-        json!({
-            "code": "invalid_command",
-            "error": {
-                "code": "invalid_command",
-                "message": message,
-                "retryable": false,
-                "details": null,
-            },
-        })
-    };
-
-    // Do / Assert
-    runtime.reject(
-        hook_completed(
-            &hook,
-            "pre_llm_call",
-            pre_llm_continue_with_context(&[("", "GitHub is not connected.")]),
-        ),
-        invalid_command("pre-LLM hook context key must not be empty"),
-    );
-    runtime.reject(
-        hook_completed(
-            &hook,
-            "pre_llm_call",
-            json!({"type": "continue", "context_messages": [{"key": "github", "content": []}]}),
-        ),
-        invalid_command("pre-LLM hook context content must contain at least one content block"),
-    );
-    runtime.reject(
-        hook_completed(
-            &hook,
-            "pre_llm_call",
-            pre_llm_continue_with_context(&[
-                ("github", "GitHub is not connected."),
-                ("github", "GitHub is connected."),
-            ]),
-        ),
-        invalid_command("pre-LLM hook context key \"github\" appears more than once"),
-    );
-}
-
-///
-/// *Prepare*: A pre-LLM hook delivered keyed context, then the Session restarts from a checkpoint during a tool call.
-/// *Do*: Return the same keyed context from the next pre-LLM hook.
-/// *Assert*: The restored context still holds the earlier delivery, so the replacement model input carries it exactly once.
-///
-#[test]
-fn restored_pre_llm_context_is_not_delivered_again() {
-    // Prepare
-    let turn_id = "turn-restored-keyed-context";
-    let mut runtime = SynchronousRuntime::new(context_hook_config());
+    let turn_id = "turn-pre-llm-skip-later";
+    let mut config = config();
+    config.capabilities.hook_bindings = serde_json::from_value(json!([{
+        "id": "skip-pre-llm",
+        "point": "pre_llm_call",
+        "order": 0,
+        "selector": {"type": "always"},
+    }]))
+    .expect("pre-LLM hook config deserializes");
+    let mut runtime = SynchronousRuntime::new(config);
     let first_hook = runtime
         .apply(
-            user_message(turn_id, "inspect the repository", "queue"),
+            user_message(turn_id, "read the notes", "queue"),
             running(turn_id)
-                .dispatch(hook_call("pre_llm_call", &["context-pre-llm"], Value::Null))
-                .observe(turn_started(turn_id, "inspect the repository")),
+                .dispatch(hook_call("pre_llm_call", &["skip-pre-llm"], Value::Null))
+                .observe(turn_started(turn_id, "read the notes")),
         )
         .only_action();
     let first_completion = runtime
         .apply(
-            hook_completed(
-                &first_hook,
-                "pre_llm_call",
-                pre_llm_continue_with_context(&[("github", "GitHub is not connected.")]),
-            ),
+            hook_completed(&first_hook, "pre_llm_call", json!({"type": "continue"})),
             running(turn_id).dispatch(llm_call(0)),
         )
         .only_action();
     let calls = vec![tool_call(
-        "restored-read",
+        "call-read",
         "read_file",
         json!({"path": "notes.txt"}),
     )];
-    let tool = runtime
-        .complete_with_tool_calls(
-            turn_id,
-            &first_completion,
-            &calls,
-            [runtime_tool(
-                "file_system.read_file",
-                json!({"path": "notes.txt"}),
-            )],
+    let first_text = json!({"type": "text", "text": "Let me read the notes first."});
+    let mut parts = vec![first_text.clone()];
+    parts.extend(calls.iter().cloned());
+    let mut committed = assistant_tool_calls_committed(turn_id, &first_completion, &calls);
+    committed["candidate"]["message"]["content"]
+        .as_array_mut()
+        .expect("candidate content is an array")
+        .insert(0, first_text);
+    let tool_action = runtime
+        .apply(
+            tool_call_completion(action_id(&first_completion), parts),
+            running(turn_id)
+                .dispatch(runtime_tool(
+                    "file_system.read_file",
+                    json!({"path": "notes.txt"}),
+                ))
+                .observe(committed)
+                .observe(tool_execution_started(turn_id, "call-read")),
         )
         .only_action();
-    runtime.restart_from_checkpoint();
-
-    // Do
-    let result = text_tool_success(&tool, "notes");
+    let tool_result = text_tool_success(&tool_action, "file contents");
     let second_hook = runtime
         .apply(
-            result.clone(),
+            tool_result.clone(),
             running(turn_id)
-                .dispatch(hook_call("pre_llm_call", &["context-pre-llm"], Value::Null))
-                .observe_completed_tool_result(&tool, &result),
+                .dispatch(hook_call("pre_llm_call", &["skip-pre-llm"], Value::Null))
+                .observe_completed_tool_result(&tool_action, &tool_result),
         )
         .only_action();
-    let second_completion = runtime
+    let reason = vec![json!({"type": "text", "text": "model budget spent"})];
+    let skip = hook_completed(
+        &second_hook,
+        "pre_llm_call",
+        json!({"type": "skip", "reason": reason.clone()}),
+    );
+    // The held completion's ID is never dispatched, so the scenario reads it from Core.
+    let held_completion = json!({
+        "action_id": runtime.preview_observations(skip.clone())[0]["action_id"],
+    });
+
+    // Do
+    let skipped = runtime.apply(
+        skip,
+        completed(turn_id, reason.clone())
+            .observe(agent_completion_candidate_discarded(
+                turn_id,
+                &held_completion,
+                "skipped",
+            ))
+            .observe(turn_completed_skipped(turn_id, reason)),
+    );
+
+    // Assert
+    assert!(skipped.actions().is_empty());
+    assert_ne!(action_id(&held_completion), action_id(&first_completion));
+}
+
+///
+/// *Prepare*: A pre-agent hook is bound and pending for a new turn.
+/// *Do*: Send a context message while the hook runs, then continue the turn from the hook.
+/// *Assert*: Core keeps the hook Action, and the first model call reads the context before the
+/// user message.
+///
+#[test]
+fn context_sent_during_the_pre_agent_hook_precedes_the_user_message() {
+    // Prepare
+    let turn_id = "turn-pre-agent-context";
+    let mut runtime = SynchronousRuntime::new(hook_config("context-pre-agent", "pre_agent_turn"));
+    let hook = runtime
+        .apply(
+            user_message(turn_id, "push the fix", "queue"),
+            running(turn_id).dispatch(pre_agent_hook_call("context-pre-agent", "push the fix")),
+        )
+        .only_action();
+
+    // Do
+    runtime.apply(
+        context_message("GitHub status: not connected."),
+        running(turn_id).keep(&hook),
+    );
+    let completion = runtime
         .apply(
             hook_completed(
-                &second_hook,
-                "pre_llm_call",
-                pre_llm_continue_with_context(&[("github", "GitHub is not connected.")]),
+                &hook,
+                "pre_agent_turn",
+                json!({
+                    "type": "continue",
+                    "user_content": [{"type": "text", "text": "push the fix"}],
+                }),
             ),
+            running(turn_id)
+                .dispatch(llm_call(0))
+                .observe(turn_started(turn_id, "push the fix")),
+        )
+        .only_action();
+
+    // Assert
+    runtime.assert_last_model_message_update(
+        &completion,
+        "replace",
+        &[
+            model_system(),
+            model_context_text("GitHub status: not connected."),
+            model_user_text("push the fix"),
+        ],
+    );
+    runtime.finish_turn_with_text(turn_id, &completion, "done");
+}
+
+///
+/// *Prepare*: A pre-agent hook is bound and pending for a new turn.
+/// *Do*: Send a notification, then a context message while the hook runs, restart Core from its
+/// checkpoint, then continue the turn from the hook.
+/// *Assert*: The first model call reads the notification, then the context, then the user
+/// message.
+///
+#[test]
+fn context_sent_during_the_pre_agent_hook_after_a_notification_precedes_the_user_message() {
+    // Prepare
+    let turn_id = "turn-pre-agent-notification-context";
+    let mut runtime = SynchronousRuntime::new(hook_config("context-pre-agent", "pre_agent_turn"));
+    let hook = runtime
+        .apply(
+            user_message(turn_id, "push the fix", "queue"),
+            running(turn_id).dispatch(pre_agent_hook_call("context-pre-agent", "push the fix")),
+        )
+        .only_action();
+    let notification = notification("notification-during-hook", "github was disconnected");
+
+    // Do
+    runtime.receive_notification(turn_id, &notification, &[&hook]);
+    runtime.apply(
+        context_message("GitHub status: not connected."),
+        running(turn_id).keep(&hook),
+    );
+    runtime.restart_from_checkpoint();
+    let completion = runtime
+        .apply(
+            hook_completed(
+                &hook,
+                "pre_agent_turn",
+                json!({
+                    "type": "continue",
+                    "user_content": [{"type": "text", "text": "push the fix"}],
+                }),
+            ),
+            running(turn_id)
+                .dispatch(llm_call(0))
+                .observe(turn_started(turn_id, "push the fix"))
+                .observe(notification_delivered(
+                    turn_id,
+                    observed_notification(&notification),
+                )),
+        )
+        .only_action();
+
+    // Assert
+    runtime.assert_last_model_message_update(
+        &completion,
+        "replace",
+        &[
+            model_system(),
+            model_notifications(&[&notification]),
+            model_context_text("GitHub status: not connected."),
+            model_user_text("push the fix"),
+        ],
+    );
+    runtime.finish_turn_with_text(turn_id, &completion, "done");
+}
+
+///
+/// *Prepare*: A pre-LLM hook is bound and pending before a turn's first model call.
+/// *Do*: Send a context message while the hook runs, restart Core from its checkpoint, then
+/// continue from the hook.
+/// *Assert*: The context survives the restart and the model call reads it after the user message.
+///
+#[test]
+fn context_sent_during_the_pre_llm_hook_reaches_the_next_model_call_after_a_restart() {
+    // Prepare
+    let turn_id = "turn-pre-llm-context";
+    let mut runtime = SynchronousRuntime::new(hook_config("context-pre-llm", "pre_llm_call"));
+    let hook = runtime
+        .apply(
+            user_message(turn_id, "clone the repository", "queue"),
+            running(turn_id)
+                .dispatch(hook_call("pre_llm_call", &["context-pre-llm"], Value::Null))
+                .observe(turn_started(turn_id, "clone the repository")),
+        )
+        .only_action();
+
+    // Do
+    runtime.apply(
+        context_message("The clone of acme/api failed."),
+        running(turn_id).keep(&hook),
+    );
+    runtime.restart_from_checkpoint();
+    let completion = runtime
+        .apply(
+            hook_completed(&hook, "pre_llm_call", json!({"type": "continue"})),
+            running(turn_id).dispatch(llm_call(0)),
+        )
+        .only_action();
+
+    // Assert
+    runtime.assert_last_model_message_update(
+        &completion,
+        "replace",
+        &[
+            model_system(),
+            model_user_text("clone the repository"),
+            model_context_text("The clone of acme/api failed."),
+        ],
+    );
+    runtime.finish_turn_with_text(turn_id, &completion, "done");
+}
+
+///
+/// *Prepare*: A pre-LLM hook is pending with no context received.
+/// *Do*: Checkpoint, assert the checkpoint omits `pending_context`, restore it, then continue.
+/// *Assert*: A checkpoint written without the field restores, and the turn runs as before.
+///
+#[test]
+fn an_active_checkpoint_without_pending_context_restores() {
+    // Prepare
+    let turn_id = "turn-no-pending-context";
+    let mut runtime = SynchronousRuntime::new(hook_config("no-context", "pre_llm_call"));
+    let hook = runtime
+        .apply(
+            user_message(turn_id, "work", "queue"),
+            running(turn_id)
+                .dispatch(hook_call("pre_llm_call", &["no-context"], Value::Null))
+                .observe(turn_started(turn_id, "work")),
+        )
+        .only_action();
+    let checkpoint = runtime.checkpoint_value();
+
+    // Do
+    runtime.restore_checkpoint_value(
+        checkpoint.clone(),
+        hook_config("no-context", "pre_llm_call"),
+    );
+    let completion = runtime
+        .apply(
+            hook_completed(&hook, "pre_llm_call", json!({"type": "continue"})),
+            running(turn_id).dispatch(llm_call(0)),
+        )
+        .only_action();
+
+    // Assert
+    assert!(checkpoint["turn"].get("pending_context").is_none());
+    runtime.assert_last_model_message_update(
+        &completion,
+        "replace",
+        &[model_system(), model_user_text("work")],
+    );
+}
+
+///
+/// *Prepare*: A pre-agent hook is bound and pending for a new turn, and it sent a context message.
+/// *Do*: Skip the turn from the hook, then start another turn.
+/// *Assert*: The skipped request never reaches the model, but the context precedes the next
+/// turn's message.
+///
+#[test]
+fn context_sent_by_a_skipping_pre_agent_hook_reaches_the_next_turn() {
+    // Prepare
+    let skipped_turn_id = "turn-skipped-with-context";
+    let mut runtime = SynchronousRuntime::new(hook_config("context-skip", "pre_agent_turn"));
+    let hook = runtime
+        .apply(
+            user_message(skipped_turn_id, "deploy", "queue"),
+            running(skipped_turn_id).dispatch(pre_agent_hook_call("context-skip", "deploy")),
+        )
+        .only_action();
+    runtime.apply(
+        context_message("Deployments are frozen."),
+        running(skipped_turn_id).keep(&hook),
+    );
+    let reason = vec![json!({"type": "text", "text": "frozen"})];
+
+    // Do
+    runtime.apply(
+        hook_completed(
+            &hook,
+            "pre_agent_turn",
+            json!({"type": "skip", "reason": reason.clone()}),
+        ),
+        completed(skipped_turn_id, reason.clone())
+            .observe(turn_started(skipped_turn_id, "deploy"))
+            .observe(turn_completed_skipped(skipped_turn_id, reason)),
+    );
+    let next_turn_id = "turn-after-skip";
+    let next_hook = runtime
+        .apply(
+            user_message(next_turn_id, "status?", "queue"),
+            running(next_turn_id).dispatch(pre_agent_hook_call("context-skip", "status?")),
+        )
+        .only_action();
+    let completion = runtime
+        .apply(
+            hook_completed(
+                &next_hook,
+                "pre_agent_turn",
+                json!({
+                    "type": "continue",
+                    "user_content": [{"type": "text", "text": "status?"}],
+                }),
+            ),
+            running(next_turn_id)
+                .dispatch(llm_call(0))
+                .observe(turn_started(next_turn_id, "status?")),
+        )
+        .only_action();
+
+    // Assert
+    runtime.assert_last_model_message_update(
+        &completion,
+        "replace",
+        &[
+            model_system(),
+            model_context_text("Deployments are frozen."),
+            model_user_text("status?"),
+        ],
+    );
+}
+
+///
+/// *Prepare*: A skipping pre-agent hook left a context message waiting for the next turn.
+/// *Do*: Start the next turn, send newer context from its pre-agent hook, then continue it.
+/// *Assert*: The model reads the waiting context first and the newer context right before the
+/// user message.
+///
+#[test]
+fn context_from_a_pre_agent_hook_follows_context_waiting_for_its_turn() {
+    // Prepare
+    let skipped_turn_id = "turn-skipped-before-newer-context";
+    let mut runtime = SynchronousRuntime::new(hook_config("context-newer", "pre_agent_turn"));
+    let hook = runtime
+        .apply(
+            user_message(skipped_turn_id, "deploy", "queue"),
+            running(skipped_turn_id).dispatch(pre_agent_hook_call("context-newer", "deploy")),
+        )
+        .only_action();
+    runtime.apply(
+        context_message("Deployments are frozen."),
+        running(skipped_turn_id).keep(&hook),
+    );
+    let reason = vec![json!({"type": "text", "text": "frozen"})];
+    runtime.apply(
+        hook_completed(
+            &hook,
+            "pre_agent_turn",
+            json!({"type": "skip", "reason": reason.clone()}),
+        ),
+        completed(skipped_turn_id, reason.clone())
+            .observe(turn_started(skipped_turn_id, "deploy"))
+            .observe(turn_completed_skipped(skipped_turn_id, reason)),
+    );
+
+    // Do
+    let next_turn_id = "turn-with-newer-context";
+    let next_hook = runtime
+        .apply(
+            user_message(next_turn_id, "deploy now", "queue"),
+            running(next_turn_id).dispatch(pre_agent_hook_call("context-newer", "deploy now")),
+        )
+        .only_action();
+    runtime.apply(
+        context_message("Deployments are open again."),
+        running(next_turn_id).keep(&next_hook),
+    );
+    let completion = runtime
+        .apply(
+            hook_completed(
+                &next_hook,
+                "pre_agent_turn",
+                json!({
+                    "type": "continue",
+                    "user_content": [{"type": "text", "text": "deploy now"}],
+                }),
+            ),
+            running(next_turn_id)
+                .dispatch(llm_call(0))
+                .observe(turn_started(next_turn_id, "deploy now")),
+        )
+        .only_action();
+
+    // Assert
+    runtime.assert_last_model_message_update(
+        &completion,
+        "replace",
+        &[
+            model_system(),
+            model_context_text("Deployments are frozen."),
+            model_context_text("Deployments are open again."),
+            model_user_text("deploy now"),
+        ],
+    );
+}
+
+fn hook_config(binding_id: &str, point: &str) -> HarnessConfig {
+    let mut config = config();
+    config.capabilities.hook_bindings = serde_json::from_value(json!([{
+        "id": binding_id,
+        "point": point,
+        "order": 0,
+        "selector": {"type": "always"},
+    }]))
+    .expect("hook config deserializes");
+    config
+}
+
+fn context_message(text: &str) -> Value {
+    json!({
+        "type": "context_message",
+        "content": [{"type": "text", "text": text}],
+    })
+}
+
+fn pre_agent_hook_call(binding_id: &str, text: &str) -> Value {
+    hook_call(
+        "pre_agent_turn",
+        &[binding_id],
+        json!({"user_content": [{"type": "text", "text": text}]}),
+    )
+}
+
+///
+/// *Prepare*: A pre-LLM hook is bound, and the first completion is cut off at the output limit.
+/// *Do*: Send context while the retry's pre-LLM hook is pending, then complete the hook.
+/// *Assert*: The retried model call reads the context after the retry feedback.
+///
+#[test]
+fn context_sent_during_a_retry_pre_llm_hook_reaches_the_retried_model_call() {
+    // Prepare
+    let turn_id = "turn-retry-context";
+    let mut config = hook_config("context-retry", "pre_llm_call");
+    config.settings.turn = serde_json::from_value(json!({
+        "max_iterations": 8,
+        "output_limit_recovery": {"mode": "retry", "max_retries": 2},
+    }))
+    .expect("turn settings deserialize");
+    let mut runtime = SynchronousRuntime::new(config);
+    let first_hook = runtime
+        .apply(
+            user_message(turn_id, "write the report", "queue"),
+            running(turn_id)
+                .dispatch(hook_call("pre_llm_call", &["context-retry"], Value::Null))
+                .observe(turn_started(turn_id, "write the report")),
+        )
+        .only_action();
+    let first = runtime
+        .apply(
+            hook_completed(&first_hook, "pre_llm_call", json!({"type": "continue"})),
+            running(turn_id).dispatch(llm_call(0)),
+        )
+        .only_action();
+    let retry_hook = runtime
+        .apply(
+            json!({
+                "type": "completion_succeeded",
+                "action_id": action_id(&first),
+                "result": {
+                    "parts": [{"type": "text", "text": "first fragment"}],
+                    "finish_reason": "length",
+                    "usage": {"input_tokens": 100, "output_tokens": 20, "total_tokens": 120, "cached_input_tokens": 0, "cache_write_tokens": 0, "reasoning_tokens": 0},
+                },
+            }),
+            running(turn_id)
+                .dispatch(hook_call("pre_llm_call", &["context-retry"], Value::Null))
+                .observe(agent_completion_candidate_discarded(turn_id, &first, "retry")),
+        )
+        .only_action();
+
+    // Do
+    runtime.apply(
+        context_message("Write the report to report.md."),
+        running(turn_id).keep(&retry_hook),
+    );
+    let retried = runtime
+        .apply(
+            hook_completed(&retry_hook, "pre_llm_call", json!({"type": "continue"})),
             running(turn_id).dispatch(llm_call(1)),
         )
         .only_action();
 
     // Assert
     runtime.assert_last_model_message_update(
-        &second_completion,
-        "replace",
+        &retried,
+        "append",
         &[
-            model_system(),
-            model_user_text("inspect the repository"),
-            model_user_text("GitHub is not connected."),
-            model_assistant_tool_calls(&calls),
-            model_tool_text("restored-read", "read_file", "notes"),
+            model_user_text("Your previous response was discarded because it reached the output token limit after 20 tokens. Give a shorter answer; put long content in a file with a tool call if needed."),
+            model_context_text("Write the report to report.md."),
         ],
     );
-    runtime.finish_turn_with_text(turn_id, &second_completion, "done");
 }

@@ -7,6 +7,7 @@ mod document;
 mod entry;
 mod layout;
 mod paint;
+pub mod sticky;
 mod table_cells;
 mod viewport;
 
@@ -41,9 +42,14 @@ pub fn draw(app: &mut App, f: &mut Frame, area: Rect) {
         .map(|selection| (selection.key.clone(), selection.head_offset()));
     // The promo is width-wrapped, so each layout width gets its own banner rows.
     let empty = app.view.transcript.is_empty();
-    let config = app.view.banner.view(&app.session.startup_config);
-    let banner_full = banner(app, config.clone(), full_w, empty);
-    let banner_content = banner(app, config, content_w, empty);
+    let config = &app.session.startup_config;
+    let banner_full = banner(app, app.view.banner.view(config, full_w), full_w, empty);
+    let banner_content = banner(
+        app,
+        app.view.banner.view(config, content_w),
+        content_w,
+        empty,
+    );
     let selecting = app
         .selection
         .region
@@ -83,6 +89,7 @@ pub fn draw(app: &mut App, f: &mut Frame, area: Rect) {
     if !scroll_view(total_full, area.height, view.scroll).overflow {
         // Short content flows from the top (banner top-left), no scrollbar; the queue stays at the bottom.
         view.scroll_to_entry = None;
+        view.sticky_prompt = None;
         view.scroll_anchor = None;
         view.selection_region.scrollbar = false;
         view.selection_scrollbar.clear();
@@ -142,6 +149,14 @@ pub fn draw(app: &mut App, f: &mut Frame, area: Rect) {
     );
     let total = document_height(banner_content.lines(), content_layout, content_w);
     let document_top = measure(banner_content.lines(), content_w).saturating_add(1);
+    let pin = sticky::Geometry {
+        layout: content_layout,
+        transcript: &view.transcript,
+        top: document_top,
+        height: area.height,
+        width: content_w,
+        enabled: view.sticky_prompt_enabled,
+    };
     let anchored = view.scroll_anchor.take().and_then(|scroll_anchor| {
         anchor::resolve(
             &scroll_anchor,
@@ -151,6 +166,7 @@ pub fn draw(app: &mut App, f: &mut Frame, area: Rect) {
                 top: document_top,
                 total,
                 viewport: area.height,
+                sticky: pin,
             },
         )
     });
@@ -169,7 +185,7 @@ pub fn draw(app: &mut App, f: &mut Frame, area: Rect) {
         view.scroll_target = target;
     }
     // Rewind selection asks for an entry to sit at the top of the viewport; the
-    // layout that answers it only exists here (Python `scroll_to_widget`).
+    // layout that answers it only exists here.
     if let Some(index) = view.scroll_to_entry.take() {
         if let Some(entry) = content_layout.entries.iter().find(|e| e.index == index) {
             let document_top = document_top.saturating_add(entry.top);
@@ -197,6 +213,10 @@ pub fn draw(app: &mut App, f: &mut Frame, area: Rect) {
         .update(scrollbar_area, total, area.height, scroll.position);
     let top = area.y as i32 - scroll.position as i32;
     view.selection_region.top = top;
+    let pinned = sticky::measure(&pin, scroll.position);
+    let covered = pinned.as_ref().map_or(0, |(_, _, shown)| *shown);
+    // The pinned prompt owns the rows it covers, so a link under it never takes the hover.
+    let hovered = mouse_position.filter(|&(_, y)| y >= area.y.saturating_add(covered));
     viewport::render(
         &view.expanded,
         &mut view.markdown_cache,
@@ -208,7 +228,7 @@ pub fn draw(app: &mut App, f: &mut Frame, area: Rect) {
             rows: &mut view.entry_rows,
             hangs: selecting.then_some(&mut view.selection_hangs),
         },
-        mouse_position,
+        hovered,
         &view.transcript,
         f,
         Viewport {
@@ -225,6 +245,7 @@ pub fn draw(app: &mut App, f: &mut Frame, area: Rect) {
             rewind: rewind.as_deref(),
         },
     );
+    sticky::draw(app, f, content_area, pinned);
     scrollbar::draw(
         app,
         f,
@@ -234,6 +255,7 @@ pub fn draw(app: &mut App, f: &mut Frame, area: Rect) {
         area.height,
         scroll.position,
     );
+    super::jump_to_bottom::draw(app, f, content_area);
 }
 
 /// The rows above the entries: `banner`, the promo with its links, then an empty child view's placeholder.
@@ -246,7 +268,7 @@ fn banner(
     if let Some(promo) = &app.view.promo {
         banner.append(markdown::guttered(promo, width, theme::ORANGE));
     }
-    // Python's `#subagent-transcripts` placeholder (`margin-top: 1`) flows under the banner.
+    // The subagent transcript placeholder (one blank row above) flows under the banner.
     if let (Some(child_id), true) = (
         app.subagents.viewed_subagent_id.as_deref(),
         transcript_empty,

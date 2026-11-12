@@ -18,6 +18,7 @@ from tests.app_server.backend_contract.conftest import (
     connect_backend_contract_host,
 )
 from tests.constants import CONNECTORS_BOOTSTRAP_PATH, MISTRAL_BASE_URL
+from vibe.app_server._process_services import ProcessServices
 from vibe.app_server.protocol import (
     ClientCapabilities,
     ConfigReadParams,
@@ -106,13 +107,13 @@ def growthbook_api(respx_mock: respx.MockRouter) -> respx.Route:
 
 @pytest_asyncio.fixture
 async def experiments_connection(
-    experimental_harness: bool, config_dir: Path, growthbook_api: respx.Route
+    config_dir: Path, growthbook_api: respx.Route, process_services: ProcessServices
 ) -> AsyncIterator[BackendContractConnection]:
     _configure_experiments(config_dir)
     connection = await connect_backend_contract_host(
-        experimental_harness,
         session_options=SessionOptions(),
         capabilities=ClientCapabilities(),
+        process_services=process_services,
     )
     try:
         yield connection
@@ -188,18 +189,15 @@ async def test_a_resolved_variant_is_cached_for_the_next_session(
     )
 
 
+@pytest.mark.both_paths
 @pytest.mark.asyncio
 async def test_unified_pushes_a_freshly_resolved_variant_into_the_live_session(
-    experimental_harness: bool,
-    experiments_connection: BackendContractConnection,
-    growthbook_api: respx.Route,
+    experiments_connection: BackendContractConnection, growthbook_api: respx.Route
 ) -> None:
     # Unified-only, and not because Unified is ahead: the legacy app server
     # gates live application on ``await_experiment_model``, which it computes as
     # ``session_id is None`` and then always calls with a freshly generated id,
     # so an uncached variant there governs from the *next* open.
-    if not experimental_harness:
-        pytest.skip("the legacy app server applies an uncached variant on next open")
 
     session = await experiments_connection.host.open_session()
     try:
@@ -213,9 +211,7 @@ async def test_unified_pushes_a_freshly_resolved_variant_into_the_live_session(
 
 @pytest.mark.asyncio
 async def test_the_eval_request_names_the_backend_serving_the_session(
-    experimental_harness: bool,
-    experiments_connection: BackendContractConnection,
-    growthbook_api: respx.Route,
+    experiments_connection: BackendContractConnection, growthbook_api: respx.Route
 ) -> None:
     session = await experiments_connection.host.open_session()
     try:
@@ -225,19 +221,19 @@ async def test_the_eval_request_names_the_backend_serving_the_session(
 
     assert growthbook_api.calls
     attributes = json.loads(growthbook_api.calls.last.request.content)["attributes"]
-    assert attributes["harness"] == ("unified" if experimental_harness else "legacy")
+    assert attributes["harness"] == ("unified")
     assert attributes["userId"] == "user-1"
 
 
 @pytest.mark.asyncio
 async def test_no_eval_is_requested_when_the_ab_opt_out_is_set(
-    experimental_harness: bool, config_dir: Path, growthbook_api: respx.Route
+    config_dir: Path, growthbook_api: respx.Route, process_services: ProcessServices
 ) -> None:
     _configure_experiments(config_dir, enable=False)
     connection = await connect_backend_contract_host(
-        experimental_harness,
         session_options=SessionOptions(),
         capabilities=ClientCapabilities(),
+        process_services=process_services,
     )
 
     try:
@@ -256,15 +252,15 @@ async def test_no_eval_is_requested_when_the_ab_opt_out_is_set(
 
 @pytest.mark.asyncio
 async def test_a_failed_eval_leaves_the_session_on_its_cached_variants(
-    experimental_harness: bool, config_dir: Path, growthbook_api: respx.Route
+    config_dir: Path, growthbook_api: respx.Route, process_services: ProcessServices
 ) -> None:
     _configure_experiments(config_dir)
     await _seed_the_eval_cache()
     growthbook_api.mock(return_value=httpx.Response(500, text="down"))
     connection = await connect_backend_contract_host(
-        experimental_harness,
         session_options=SessionOptions(),
         capabilities=ClientCapabilities(),
+        process_services=process_services,
     )
 
     try:

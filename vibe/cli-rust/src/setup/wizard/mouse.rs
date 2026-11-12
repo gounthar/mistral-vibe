@@ -1,8 +1,8 @@
 //! Mouse interactions for the onboarding screens: click-to-select on the
 //! theme list, and clickable links and input cards. Wheel navigation stays
-//! with the arrow keys (Python's wizard has no list wheel).
+//! with the arrow keys.
 
-use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
+use crossterm::event::{Event, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::layout::Rect;
 
 use crate::app::App;
@@ -10,6 +10,18 @@ use crate::mouse::MouseTarget;
 
 use super::screens;
 use super::{InputCard, OnboardingState};
+
+/// End a gesture whose release was dropped: motion without a button, a key or a focus loss.
+pub fn end_dropped_gesture(app: &mut App, event: &Event) {
+    let dropped = match event {
+        Event::Mouse(mouse) => mouse.kind == MouseEventKind::Moved,
+        Event::Key(_) | Event::FocusLost => true,
+        _ => false,
+    };
+    if dropped && app.view.mouse.holds_target() {
+        crate::mouse::cancel_capture(app, true);
+    }
+}
 
 /// Dispatch one routed mouse event for a wizard region. Client-free: the
 /// wizard runs before the app-server exists.
@@ -39,7 +51,7 @@ pub fn handle_mouse(
             }
         }
         MouseTarget::OnboardingPreview => {}
-        // Click-to-focus, like Textual's `Input`: clicking a card focuses its
+        // Click-to-focus: clicking a card focuses its
         // input and places the caret at the clicked column, clamped to the
         // value. The feedback row stays change-driven, so a click between the
         // custom-domain cards never repaints it.

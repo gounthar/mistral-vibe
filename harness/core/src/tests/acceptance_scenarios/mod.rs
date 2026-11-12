@@ -4,12 +4,21 @@
 
 use super::*;
 
+mod agents;
 mod async_features;
+mod builtin_features;
 mod compaction;
 mod completion_and_tools;
+mod conversation;
+mod embedded_images;
 mod hooks;
+mod image_input;
 mod large_output;
+mod model_wait;
+mod output_type;
 mod permissions;
+mod post_tool_results;
+mod program_timing;
 mod recovery;
 mod runtime_driver;
 mod steering;
@@ -17,6 +26,17 @@ mod tool_argument_validation;
 mod turn_lifecycle;
 
 use runtime_driver::*;
+
+/// The call list Core adds to a failed or interrupted `run_typescript`
+/// result, from its entry lines.
+fn program_call_summary(entries: &[&str]) -> String {
+    let mut lines = vec!["Calls, in order:".to_string()];
+    lines.extend(entries.iter().map(|entry| entry.to_string()));
+    if entries.iter().any(|entry| entry.ends_with(": done")) {
+        lines.push("Do not repeat done calls; continue with the rest.".to_string());
+    }
+    lines.join("\n")
+}
 
 fn tool_call(id: &str, name: &str, arguments: Value) -> Value {
     json!({
@@ -34,7 +54,7 @@ fn tool_call_completion(action_id: &str, calls: Vec<Value>) -> Value {
         "result": {
             "parts": calls,
             "finish_reason": "tool_call",
-            "usage": null,
+            "usage": {"input_tokens": 100, "output_tokens": 20, "total_tokens": 120, "cached_input_tokens": 0, "cache_write_tokens": 0, "reasoning_tokens": 0},
         },
     })
 }
@@ -91,6 +111,20 @@ fn run_typescript_success(structured_content: Value) -> Value {
     })
 }
 
+/// Stands in for the V8 stack of an uncaught program error; see
+/// `runtime_driver::without_program_error_stacks`.
+const PROGRAM_ERROR_STACK: &str = "<stack>";
+
+/// The `run_typescript` failure for an uncaught JavaScript error.
+fn run_typescript_uncaught_error(name: &str, message: &str) -> Value {
+    let error = json!({"name": name, "message": message, "stack": PROGRAM_ERROR_STACK});
+    json!({
+        "type": "failure",
+        "content": [{"type": "text", "text": format!("run_typescript failed: {error}")}],
+        "error": {"code": name, "message": message, "retryable": false, "details": null},
+    })
+}
+
 fn file_read_success(action: &Value, content: &str) -> Value {
     structured_tool_success(
         action,
@@ -115,14 +149,6 @@ fn hook_completed(action: &Value, hook: &str, output: Value) -> Value {
             "output": output,
         },
     })
-}
-
-fn pre_llm_continue_with_context(context: &[(&str, &str)]) -> Value {
-    let context_messages = context
-        .iter()
-        .map(|(key, text)| json!({"key": key, "content": [{"type": "text", "text": text}]}))
-        .collect::<Vec<_>>();
-    json!({"type": "continue", "context_messages": context_messages})
 }
 
 fn turn_started(turn_id: &str, text: &str) -> Value {
@@ -165,7 +191,7 @@ fn text_candidate(text: &str) -> Value {
             "content": [{"type": "text", "text": text}],
         },
         "finish_reason": "stop",
-        "usage": null,
+        "usage": {"input_tokens": 100, "output_tokens": 20, "total_tokens": 120, "cached_input_tokens": 0, "cache_write_tokens": 0, "reasoning_tokens": 0},
     })
 }
 
@@ -191,7 +217,7 @@ fn tool_calls_candidate(calls: &[Value]) -> Value {
     json!({
         "message": {"role": "assistant", "content": content},
         "finish_reason": "tool_call",
-        "usage": null,
+        "usage": {"input_tokens": 100, "output_tokens": 20, "total_tokens": 120, "cached_input_tokens": 0, "cache_write_tokens": 0, "reasoning_tokens": 0},
     })
 }
 
@@ -210,6 +236,7 @@ fn tool_result_committed(turn_id: &str, action: &Value, result: Value) -> Value 
         "turn_id": turn_id,
         "action_id": action_id(action),
         "call_id": action["call_id"],
+        "call": action["call"],
         "result": result,
     })
 }
@@ -219,6 +246,16 @@ fn tool_execution_started(turn_id: &str, call_id: &str) -> Value {
         "type": "tool_execution_started",
         "turn_id": turn_id,
         "call_id": call_id,
+    })
+}
+
+/// A model tool call that Core runs itself (`run_typescript`, `search_tool_functions`).
+fn core_tool_execution_started(turn_id: &str, call_id: &str) -> Value {
+    json!({
+        "type": "tool_execution_started",
+        "turn_id": turn_id,
+        "call_id": call_id,
+        "executed_by_core": true,
     })
 }
 
@@ -275,10 +312,36 @@ fn turn_completed_at_iteration_limit(turn_id: &str, output: Vec<Value>) -> Value
     })
 }
 
+fn turn_completed_at_output_limit(turn_id: &str, text: &str) -> Value {
+    json!({
+        "type": "turn_completed",
+        "turn_id": turn_id,
+        "output": [{"type": "text", "text": text}],
+        "stop_reason": "output_limit",
+    })
+}
+
+fn turn_completed_skipped(turn_id: &str, reason: Vec<Value>) -> Value {
+    json!({
+        "type": "turn_completed",
+        "turn_id": turn_id,
+        "output": reason,
+        "stop_reason": "skipped",
+    })
+}
+
 fn model_user_text(text: &str) -> Value {
     json!({
         "role": "user",
         "content": [{"type": "text", "text": text}],
+    })
+}
+
+fn model_context_text(text: &str) -> Value {
+    json!({
+        "role": "user",
+        "content": [{"type": "text", "text": text}],
+        "context": true,
     })
 }
 

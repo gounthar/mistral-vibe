@@ -1,4 +1,4 @@
-//! The browser sign-in step tracker (Python `BrowserSignInScreen`): three
+//! The browser sign-in step tracker: three
 //! boxed step cards with the active one marked, the URL copy help, and the
 //! centered wizard hints.
 
@@ -11,49 +11,39 @@ use ratatui::Frame;
 use super::panel::{render, Hint, Row, Subtitle};
 use crate::app::App;
 use crate::hints::{self, action};
-use crate::setup::wizard::{BrowserSignInState, OnboardingState, SignInStep, SignInVariant};
+use crate::setup::wizard::sign_in::{
+    max_detail_lines, step_detail_lines, BrowserSignInState, SignInStep, SignInVariant, STEP_TITLES,
+};
+use crate::setup::wizard::OnboardingState;
 use crate::ui::{hint_line, theme};
 use unicode_width::UnicodeWidthStr;
 
-/// The step titles and their two detail lines (Python `STEP_DESCRIPTIONS`).
-const STEP_TITLES: [&str; 3] = ["Open browser", "Complete sign-in", "Finished setup"];
-const STEP_PENDING_DETAILS: [&str; 3] = [
-    "Your browser should open automatically",
-    "Waiting for authentication...",
-    "Vibe will start automatically",
-];
-const STEP_DONE_DETAILS: [&str; 3] = ["Browser opened", "Sign-in confirmed.", "Setup complete."];
-/// The step cards' total height: three boxed cards, four rows each.
-pub(super) const STEPS_HEIGHT: u16 = STEP_TITLES.len() as u16 * 4;
-/// Python `WAITING_FOR_AUTHENTICATION_MESSAGE`, painted as a gradient.
-const WAITING_FOR_AUTHENTICATION: &str = "Waiting for authentication...";
-/// Python `SIGN_IN_URL_FALLBACK_PREFIX` and the capitalized `NATIVE_COPY_HINT`
-/// that follows the raw URL once the copy key revealed it.
+/// The sign-in URL fallback prefix that precedes the raw URL once the copy key revealed it.
 const URL_FALLBACK_PREFIX: &str =
     "If copying to the clipboard was not successful, copy the following URL:";
-const NATIVE_COPY_HINT: &str = "If paste fails, hold Shift (Option in iTerm2, Fn in Terminal.app) while selecting for native copy";
 
-/// The URL row is visible once the copy help delay passed (Python
-/// `SIGN_IN_URL_HELP_DELAY_SECONDS`), or right after a copy reveals it.
+/// The URL row is visible once the copy help delay passed, or right after a
+/// copy reveals it.
 fn url_help_visible(state: &BrowserSignInState) -> bool {
     state.variant != SignInVariant::Success
         && state.sign_in_url.is_some()
         && (state.show_url_help
             || state
                 .sign_in_started_at
-                .is_some_and(|at| at.elapsed() >= std::time::Duration::from_secs(4)))
+                .is_some_and(|at| crate::clock::since(at) >= std::time::Duration::from_secs(4)))
 }
 
-/// Python `_build_url_text`'s reveal branch: the fallback prefix, the raw
+/// The revealed URL text: the fallback prefix, the raw
 /// URL, and the native-copy hint, wrapped to the URL widget's content width.
 fn reveal_lines(state: &BrowserSignInState) -> Vec<String> {
     let Some(url) = state.sign_in_url.as_deref() else {
         return Vec::new();
     };
-    crate::utils::text::wrap_hard(
-        &format!("{URL_FALLBACK_PREFIX} {url}. {NATIVE_COPY_HINT}."),
-        68,
-    )
+    let mut hint = crate::clipboard::unverified_hint().to_owned();
+    if let Some(first) = hint.get_mut(..1) {
+        first.make_ascii_uppercase();
+    }
+    crate::utils::text::wrap_hard(&format!("{URL_FALLBACK_PREFIX} {url}. {hint}."), 68)
 }
 
 /// Draw the browser sign-in step tracker screen.
@@ -73,7 +63,7 @@ pub(super) fn draw(
         SignInStep::Confirm => 1,
         SignInStep::Finish => 2,
     };
-    // Python keeps the URL Static mounted, so its row is always reserved:
+    // The URL row is always reserved:
     // one blank row when there is nothing to say, the help line once the
     // delay passed, and the wrapped fallback text after a copy. The hint
     // keeps the two blank rows every panel screen uses before it.
@@ -104,77 +94,107 @@ pub(super) fn draw(
     );
 }
 
-/// The three boxed step cards, stacked without gaps inside the row's `area`.
+/// The three boxed step cards, stacked without gaps inside the row's `area`;
+/// the active card grows by its wrapped detail lines, clamped so the cards
+/// fit the `budget` rows the panel gave the stack.
 pub(super) fn draw_step_cards(
     f: &mut Frame,
     area: Rect,
     panel_x: u16,
     step_idx: usize,
+    budget: u16,
     state: &BrowserSignInState,
 ) {
+    let max_lines = max_detail_lines(budget);
+    let mut card_y = area.y;
     for index in 0..3 {
-        draw_step_card(f, area, panel_x, index, step_idx, state);
+        let lines = step_detail_lines(state, step_idx, index, area.width, max_lines);
+        let height = lines.len() as u16 + 3;
+        draw_step_card(
+            f,
+            Rect::new(area.x, card_y, area.width, height),
+            panel_x,
+            index,
+            step_idx,
+            &lines,
+            state,
+        );
+        card_y += height;
     }
 }
 
-/// One step card (Python `.browser-sign-in-step`): a boxed 4-row card whose
-/// title and detail restate the step, recolored by its done/active/idle class.
+/// One step card: a boxed card whose title and detail restate the step,
+/// recolored by its done/active/idle class.
 fn draw_step_card(
     f: &mut Frame,
-    area: Rect,
+    card: Rect,
     panel_x: u16,
     index: usize,
     step_idx: usize,
+    lines: &[String],
     state: &BrowserSignInState,
 ) {
-    let card_y = area.y + index as u16 * 4;
     f.render_widget(
         Block::default()
             .borders(Borders::ALL)
             .border_style(Style::default().fg(theme::fixed::ONBOARDING_CARD_BORDER)),
-        Rect::new(area.x, card_y, area.width, 4),
+        card,
     );
     // The card's border, padding, and title padding leave the text at +4.
-    let text_x = area.x + 4;
+    let text_x = card.x + 4;
     let title = Style::default()
         .fg(theme::foreground())
         .add_modifier(Modifier::BOLD);
     let detail = theme::muted_style();
     if index < step_idx {
         // A finished step keeps its border but shows its done detail, with a
-        // success left edge (Python `.browser-sign-in-step.done`).
+        // success left edge.
         let success = Style::default().fg(theme::success());
-        f.buffer_mut().set_string(area.x, card_y + 1, "│", success);
-        f.buffer_mut().set_string(area.x, card_y + 2, "│", success);
+        f.buffer_mut().set_string(card.x, card.y + 1, "│", success);
+        f.buffer_mut().set_string(card.x, card.y + 2, "│", success);
         f.buffer_mut()
-            .set_string(text_x, card_y + 1, STEP_TITLES[index], title);
+            .set_string(text_x, card.y + 1, STEP_TITLES[index], title);
         f.buffer_mut()
-            .set_string(text_x, card_y + 2, STEP_DONE_DETAILS[index], detail);
+            .set_string(text_x, card.y + 2, &lines[0], detail);
     } else if index == step_idx {
         f.buffer_mut()
-            .set_string(panel_x, card_y + 1, ">", Style::default().fg(theme::ORANGE));
+            .set_string(panel_x, card.y + 1, ">", Style::default().fg(theme::ORANGE));
         f.buffer_mut()
-            .set_string(text_x, card_y + 1, STEP_TITLES[index], title);
-        draw_active_detail(f, text_x, card_y + 2, area.width.saturating_sub(4), state);
+            .set_string(text_x, card.y + 1, STEP_TITLES[index], title);
+        draw_active_detail(
+            f,
+            text_x,
+            card.y + 2,
+            card.width.saturating_sub(4),
+            lines,
+            state,
+        );
     } else {
         f.buffer_mut().set_string(
             text_x,
-            card_y + 1,
+            card.y + 1,
             STEP_TITLES[index],
             detail.add_modifier(Modifier::BOLD),
         );
         f.buffer_mut()
-            .set_string(text_x, card_y + 2, STEP_PENDING_DETAILS[index], detail);
+            .set_string(text_x, card.y + 2, &lines[0], detail);
     }
 }
 
-/// The active step's detail line: the gradient while waiting on the confirm
-/// step, the status message colored by the variant otherwise.
-fn draw_active_detail(f: &mut Frame, x: u16, y: u16, width: u16, state: &BrowserSignInState) {
+/// The active step's detail lines: the gradient while waiting on the confirm
+/// step, the wrapped status message colored by the variant otherwise.
+fn draw_active_detail(
+    f: &mut Frame,
+    x: u16,
+    y: u16,
+    width: u16,
+    lines: &[String],
+    state: &BrowserSignInState,
+) {
     if state.variant == SignInVariant::Pending && state.step == SignInStep::Confirm {
-        // Python animates the gradient offset; the wizard replays pin it at
-        // zero so captures stay deterministic.
-        let spans: Vec<Span> = WAITING_FOR_AUTHENTICATION
+        // The gradient offset animates; the wizard replays pin it at zero so
+        // captures stay deterministic.
+        let spans: Vec<Span> = crate::setup::wizard::sign_in::WAITING_FOR_AUTHENTICATION
             .chars()
             .enumerate()
             .map(|(offset, ch)| {
@@ -195,15 +215,13 @@ fn draw_active_detail(f: &mut Frame, x: u16, y: u16, width: u16, state: &Browser
         SignInVariant::Error => theme::error(),
         SignInVariant::Success => theme::success(),
     };
-    f.buffer_mut().set_string(
-        x,
-        y,
-        state.message.as_str(),
-        Style::default().fg(color).add_modifier(Modifier::BOLD),
-    );
+    let style = Style::default().fg(color).add_modifier(Modifier::BOLD);
+    for (offset, line) in lines.iter().enumerate() {
+        f.buffer_mut().set_string(x, y + offset as u16, line, style);
+    }
 }
 
-/// Python `_build_url_text`'s help line: the prefix, the clickable copy
+/// The URL help line: the prefix, the clickable copy
 /// label, and the "(press c)" suffix.
 pub(super) fn draw_url_help(f: &mut Frame, x: u16, y: u16) {
     let text = theme::muted_style();
@@ -224,9 +242,8 @@ pub(super) fn draw_url_help(f: &mut Frame, x: u16, y: u16) {
     );
 }
 
-/// The bottom hint, centered in the row's `area` (Python
-/// `#browser-sign-in-hint`; the Esc wording deliberately diverges: Esc goes
-/// back to the sign-in target, it does not cancel the wizard).
+/// The bottom hint, centered in the row's `area` (Esc goes back to the
+/// sign-in target, it does not cancel the wizard).
 pub(super) fn draw_hint(f: &mut Frame, area: Rect, variant: SignInVariant) {
     const API_KEY: hints::Hint = ("m", action::API_KEY);
     let keys: &[hints::Hint] = match variant {

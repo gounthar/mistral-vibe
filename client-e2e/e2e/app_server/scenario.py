@@ -17,13 +17,33 @@ from e2e.app_server.config import SCENARIO_DIR
 AppServerEvent = dict[str, Any]
 Release = dict[str, int]
 Resize = dict[str, tuple[int, int]]
-Timeline = list[str | AppServerEvent | Release | Resize]
+SnapshotMarker = dict[str, str | None]
+Timeline = list[str | AppServerEvent | Release | Resize | SnapshotMarker]
 _RESIZE_DIMENSIONS = 2
+_REMOVED_ATTRIBUTES = ("capture_startup", "capture_steps")
+ASSERTS_NOTHING = "asserts nothing: add take_snapshot() or an expectation"
 
 
 def resize(rows: int, columns: int) -> Resize:
     """Resize the client's PTY before capturing the next settled frame."""
     return {"resize": (rows, columns)}
+
+
+def take_snapshot(label: str | None = None) -> SnapshotMarker:
+    """Store a golden SVG of the frame settled by the preceding step (or startup)."""
+    return {"take_snapshot": label}
+
+
+# Kitty F23: the client advances its frozen replay clock 100 ms per press.
+_ADVANCE_KEY = "\x1b[57386u"
+_ADVANCE_STEP_MS = 100
+
+
+def advance(ms: int) -> str:
+    """Let ``ms`` of UI time pass (a multiple of 100); replay time never moves otherwise."""
+    if ms <= 0 or ms % _ADVANCE_STEP_MS:
+        raise ValueError("advance takes a positive multiple of 100 ms")
+    return _ADVANCE_KEY * (ms // _ADVANCE_STEP_MS)
 
 
 @dataclass(frozen=True)
@@ -66,6 +86,8 @@ class Step:
     # Events gated on settles after this step's input, one event per settle.
     release_after: int = 0
     resize: tuple[int, int] | None = None
+    snapshot: str | None = None
+    """Label of the golden SVG taken once this step settles, if any."""
 
 
 @dataclass
@@ -74,26 +96,31 @@ class Scenario:
 
     name: str
     steps: list[Step]
+    startup_snapshot: str | None = None
+    """Label of the golden SVG taken once startup settles, if any."""
     env: Mapping[str, str] = field(default_factory=dict)
     handshake: Mapping[str, Any] = field(default_factory=dict)
     on_request: Mapping[str, list[AppServerEvent]] = field(default_factory=dict)
     """Events the server would emit while answering a request, by method."""
     request_methods: frozenset[str] = frozenset()
-    """Additional client requests this scenario compares for parity."""
-    expected_actions: Mapping[str, list[Action]] = field(default_factory=dict)
+    """Additional client requests this scenario pins in its golden."""
+    expected_actions: list[Action] | None = None
     expected_clipboard: str | None = None
     expected_titles: tuple[str, ...] | None = None
     clipboard_contains: tuple[str, ...] = ()
     clipboard_excludes: tuple[str, ...] = ()
-    clipboard_clients: frozenset[str] | None = None
-    screen_contains: Mapping[str, tuple[str, ...]] = field(default_factory=dict)
-    screen_excludes: Mapping[str, tuple[str, ...]] = field(default_factory=dict)
-    screen_rows: Mapping[str, Mapping[int, str]] = field(default_factory=dict)
-    screen_cursor: Mapping[str, tuple[int, int]] = field(default_factory=dict)
-    """Expected final terminal cursor ``(row, column)`` per client."""
+    screen_contains: tuple[str, ...] = ()
+    screen_excludes: tuple[str, ...] = ()
+    screen_rows: Mapping[int, str] = field(default_factory=dict)
+    screen_cursor: tuple[int, int] | None = None
+    """Expected final terminal cursor ``(row, column)``."""
+    screen_hyperlinks: tuple[tuple[str, str], ...] | None = None
+    """Exact OSC 8 runs ``(text, target)`` on the final screen, top to bottom."""
+    mouse_tracking: bool | None = None
+    """Whether the terminal must end up reporting mouse events to the client."""
+    mouse_tracking_seen: bool | None = None
+    """Whether mouse reports must have been turned on at any point of the run."""
     skip_reason: str | None = None
-    capture_startup: bool = True
-    capture_steps: set[int] | None = None
     exit_after_last_step: bool = False
     settle_per_key: bool = False
     """Settle after every keypress, for scenarios needing each key in its own read."""
@@ -116,12 +143,28 @@ class Scenario:
         """Return non-empty server-event batches in input order."""
         return [step.events for step in self.steps if step.events]
 
-    def clamp_capture_startup(self) -> None:
-        """Drop the startup snapshot for stepped scenarios: only stepless ones
-        (e.g. onboarding welcome) need it to capture anything.
-        """
-        if self.steps:
-            self.capture_startup = False
+    def takes_snapshots(self) -> bool:
+        return self.startup_snapshot is not None or any(
+            step.snapshot is not None for step in self.steps
+        )
+
+    def has_expectations(self) -> bool:
+        """Whether the scenario asserts anything besides its golden requests."""
+        return self.takes_snapshots() or any((
+            self.request_methods,
+            self.expected_actions is not None,
+            self.expected_clipboard is not None,
+            self.expected_titles is not None,
+            self.clipboard_contains,
+            self.clipboard_excludes,
+            self.screen_contains,
+            self.screen_excludes,
+            self.screen_rows,
+            self.screen_cursor is not None,
+            self.screen_hyperlinks is not None,
+            self.mouse_tracking is not None,
+            self.mouse_tracking_seen is not None,
+        ))
 
 
 def available_scenarios() -> list[str]:
@@ -170,31 +213,36 @@ def _module_from_path(path: Path, module_name: str) -> ModuleType:
 def _build_scenario(module: ModuleType, name: str, origin: str) -> Scenario:
     if not isinstance(module, ScenarioModule):
         raise TypeError(f"{origin} must define `timeline`")
+    if removed := [attr for attr in _REMOVED_ATTRIBUTES if hasattr(module, attr)]:
+        raise TypeError(
+            f"{origin}: {removed} is gone; mark frames with take_snapshot()"
+        )
+    startup_snapshot, steps = _split_timeline(module.timeline)
+    exits = getattr(module, "exit_after_last_step", False)
+    if exits and steps and steps[-1].snapshot is not None:
+        raise ValueError(f"{origin}: the exiting last step cannot take a snapshot")
     return Scenario(
         name=name,
-        steps=_split_timeline(module.timeline),
+        steps=steps,
+        startup_snapshot=startup_snapshot,
         env=getattr(module, "env", {}),
         handshake=getattr(module, "handshake", {}),
         on_request=getattr(module, "on_request", {}),
         request_methods=frozenset(getattr(module, "request_methods", ())),
-        expected_actions=getattr(module, "expected_actions", {}),
+        expected_actions=getattr(module, "expected_actions", None),
         expected_clipboard=getattr(module, "expected_clipboard", None),
         expected_titles=getattr(module, "expected_titles", None),
         clipboard_contains=tuple(getattr(module, "clipboard_contains", ())),
         clipboard_excludes=tuple(getattr(module, "clipboard_excludes", ())),
-        clipboard_clients=(
-            frozenset(clients)
-            if (clients := getattr(module, "clipboard_clients", None)) is not None
-            else None
-        ),
-        screen_contains=getattr(module, "screen_contains", {}),
-        screen_excludes=getattr(module, "screen_excludes", {}),
+        screen_contains=_texts(module, "screen_contains"),
+        screen_excludes=_texts(module, "screen_excludes"),
         screen_rows=getattr(module, "screen_rows", {}),
-        screen_cursor=getattr(module, "screen_cursor", {}),
+        screen_cursor=getattr(module, "screen_cursor", None),
+        screen_hyperlinks=getattr(module, "screen_hyperlinks", None),
+        mouse_tracking=getattr(module, "mouse_tracking", None),
+        mouse_tracking_seen=getattr(module, "mouse_tracking_seen", None),
         skip_reason=getattr(module, "skip", None),
-        capture_startup=getattr(module, "capture_startup", True),
-        capture_steps=getattr(module, "capture_steps", None),
-        exit_after_last_step=getattr(module, "exit_after_last_step", False),
+        exit_after_last_step=exits,
         settle_per_key=getattr(module, "settle_per_key", False),
         terminal_responses=getattr(module, "terminal_responses", {}),
         exit_responses=getattr(module, "exit_responses", {}),
@@ -206,12 +254,35 @@ def _build_scenario(module: ModuleType, name: str, origin: str) -> Scenario:
     )
 
 
-def _split_timeline(timeline: Timeline) -> list[Step]:
+def _texts(module: ModuleType, name: str) -> tuple[str, ...]:
+    texts = getattr(module, name, ())
+    if isinstance(texts, str) or not all(isinstance(text, str) for text in texts):
+        raise TypeError(f"{module.__name__}.{name} must be a sequence of strings")
+    return tuple(texts)
+
+
+def _split_timeline(timeline: Timeline) -> tuple[str | None, list[Step]]:
+    """Split a timeline into input steps and the optional startup snapshot label."""
+    startup_snapshot: str | None = None
     steps: list[Step] = []
     for item in timeline:
         if isinstance(item, str):
             steps.append(Step(item))
             continue
+        if "take_snapshot" in item:
+            label = item["take_snapshot"]
+            if not steps:
+                if startup_snapshot is not None:
+                    raise ValueError("startup is already snapshotted")
+                startup_snapshot = label or "startup"
+                continue
+            if steps[-1].snapshot is not None:
+                raise ValueError(f"step {len(steps) - 1} is already snapshotted")
+            steps[-1].snapshot = label or f"step{len(steps) - 1}"
+            continue
+        starts_step = "release" in item or "resize" in item
+        if steps and steps[-1].snapshot is not None and not starts_step:
+            raise ValueError("take_snapshot() must follow every event of its step")
         if "release" in item:
             release = item["release"]
             if not isinstance(release, int) or release < 1:
@@ -241,4 +312,4 @@ def _split_timeline(timeline: Timeline) -> list[Step]:
         # An `id` marks a server-to-client request (e.g. `callback/call`).
         keys = ("id", "method", "params")
         steps[-1].events.append({key: item[key] for key in keys if key in item})
-    return steps
+    return startup_snapshot, steps

@@ -1,8 +1,8 @@
-"""A startup skill config issue surfaces as a toast (VIBE-4622)."""
+"""A startup skill config issue lands in the startup warnings box (VIBE-4099)."""
 
 from __future__ import annotations
 
-from e2e.app_server.scenario import Timeline
+from e2e.app_server.scenario import Timeline, take_snapshot
 
 # The config issue rides the startup runtime snapshot, not a server event.
 handshake = {
@@ -18,13 +18,7 @@ handshake = {
     }
 }
 
-# Python surfaces config issues through Textual `App.notify`, whose toast mounts
-# on a later frame and is not deterministically captured; Rust draws it inline.
-skip_terminal_parity = (
-    "python's Textual notify toast mounts async; rust draws it inline"
-)
+# A lone keystroke yields a settled frame.
+timeline: Timeline = ["a", take_snapshot()]
 
-# A lone keystroke yields a settled frame; the startup toast is still up (10s).
-timeline: Timeline = ["a"]
-
-screen_contains = {"rust": ("Failed to load: bad frontmatter",)}
+screen_contains = ("Failed to load: bad frontmatter",)

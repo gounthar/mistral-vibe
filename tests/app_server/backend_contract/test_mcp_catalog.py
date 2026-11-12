@@ -8,12 +8,19 @@ import sys
 import tomllib
 from typing import Any, cast
 
+import httpx
 import pytest
+import respx
 import tomli_w
 
-from tests.app_server.backend_contract.conftest import BackendContractConnection
-from vibe.app_server._legacy_session_backend import LegacySessionBackend
+from tests.app_server.backend_contract.conftest import (
+    BackendContractConnection,
+    connect_backend_contract_host,
+    wait_for_background_integrations,
+)
+from tests.constants import CONNECTORS_BOOTSTRAP_PATH, MISTRAL_BASE_URL
 from vibe.app_server._mcp_auth import MCPAuthenticationService
+from vibe.app_server._process_services import ProcessServices
 from vibe.app_server._runtime import HarnessProcess, create_harness_server
 from vibe.app_server._session_backend_port import (
     SessionBackendError,
@@ -38,6 +45,7 @@ from vibe.app_server.protocol import (
     MCPRemoveResponse,
     MCPToggleParams,
     ProtocolErrorCode,
+    SessionOptions,
     SessionStartParams,
     SessionStartResponse,
     SessionStopParams,
@@ -48,9 +56,9 @@ from vibe.app_server.transport import JsonRpcTransport, memory_transport_pair
 _HEALTHY_SERVER = "healthy"
 _OAUTH_SERVER = "oauth"
 _MCP_SERVER_SOURCE = """
-from mcp.server.fastmcp import FastMCP
+from mcp.server.mcpserver import MCPServer
 
-mcp = FastMCP("backend-contract")
+mcp = MCPServer("backend-contract")
 
 
 @mcp.tool()
@@ -97,9 +105,8 @@ def backend_contract_mcp_configuration(config_dir: Path, tmp_path: Path) -> None
     config_path.write_text(tomli_w.dumps(config), encoding="utf-8")
 
 
-def _backend_class(experimental_harness: bool) -> BackendWithMCPClass:
-    if not experimental_harness:
-        return LegacySessionBackend
+def _backend_class() -> BackendWithMCPClass:
+
     from vibe.app_server._unified_harness_backend_adapter import (
         UnifiedHarnessBackendAdapter,
     )
@@ -117,6 +124,7 @@ async def test_mcp_catalog_read_refresh_toggle_remove_and_compatibility_aliases(
     backend_contract_session: AppServerSession,
 ) -> None:
     await backend_contract_session.resources.runtime.wait_until_ready()
+    await wait_for_background_integrations()
     session_id = backend_contract_session.session_id
     canonical_read = MCPReadResponse.model_validate(
         await backend_contract_connection.client.request(
@@ -201,10 +209,43 @@ async def test_mcp_catalog_read_refresh_toggle_remove_and_compatibility_aliases(
 
 
 @pytest.mark.asyncio
-async def test_mcp_catalog_add_login_logout_aliases_and_notification_order(
-    experimental_harness: bool, monkeypatch: pytest.MonkeyPatch
+@pytest.mark.usefixtures("connectors_enabled")
+async def test_local_mcp_servers_stay_usable_when_connectors_reject_the_key(
+    backend_contract_connection: BackendContractConnection, respx_mock: respx.MockRouter
 ) -> None:
-    backend_type = _backend_class(experimental_harness)
+    """A shared-only or service-account key the connector service rejects must
+    not take the user's local MCP servers down with it.
+    """
+    respx_mock.get(f"{MISTRAL_BASE_URL}{CONNECTORS_BOOTSTRAP_PATH}").mock(
+        return_value=httpx.Response(401)
+    )
+    session = await backend_contract_connection.host.open_session()
+    try:
+        await session.resources.runtime.wait_until_ready()
+        await wait_for_background_integrations()
+
+        read = MCPReadResponse.model_validate(
+            await backend_contract_connection.client.request(
+                "mcp_catalog/read", MCPReadParams(session_id=session.session_id)
+            )
+        )
+        state = await session.resources.mcp.read()
+
+        healthy = _source(read, _HEALTHY_SERVER)
+        assert healthy.status is MCPSourceStatus.ENABLED
+        assert {tool.name for tool in healthy.tools} == {"echo", "summarize"}
+        assert any(source.name == _HEALTHY_SERVER for source in state.sources)
+        assert state.connector_error is not None
+        assert "401" in state.connector_error
+    finally:
+        await session.close()
+
+
+@pytest.mark.asyncio
+async def test_mcp_catalog_add_login_logout_aliases_and_notification_order(
+    monkeypatch: pytest.MonkeyPatch, process_services: ProcessServices
+) -> None:
+    backend_type = _backend_class()
 
     async def keep_current_state(
         backend: BackendWithMCP, *args: object, **kwargs: object
@@ -232,7 +273,7 @@ async def test_mcp_catalog_add_login_logout_aliases_and_notification_order(
     monkeypatch.setattr(backend_type, "suspend_mcp", keep_current_state)
     monkeypatch.setattr(MCPAuthenticationService, "login", login)
     monkeypatch.setattr(MCPAuthenticationService, "logout", logout)
-    connection = await _connect_recording_client(experimental_harness)
+    connection = await _connect_recording_client(process_services=process_services)
     session_id: str | None = None
     try:
         started = SessionStartResponse.model_validate(
@@ -308,9 +349,9 @@ async def test_mcp_catalog_add_login_logout_aliases_and_notification_order(
 
 @pytest.mark.asyncio
 async def test_mcp_catalog_auth_required_is_deduplicated_across_backend_events(
-    experimental_harness: bool, monkeypatch: pytest.MonkeyPatch
+    monkeypatch: pytest.MonkeyPatch, process_services: ProcessServices
 ) -> None:
-    backend_type = _backend_class(experimental_harness)
+    backend_type = _backend_class()
     original_subscribe = backend_type.subscribe
 
     async def subscribe_twice(
@@ -329,7 +370,7 @@ async def test_mcp_catalog_auth_required_is_deduplicated_across_backend_events(
         )
 
     monkeypatch.setattr(backend_type, "subscribe", subscribe_twice)
-    connection = await _connect_recording_client(experimental_harness)
+    connection = await _connect_recording_client(process_services=process_services)
     session_id: str | None = None
     try:
         started = SessionStartResponse.model_validate(
@@ -410,16 +451,11 @@ async def test_mcp_login_for_disabled_source_performs_no_runtime_authorization(
 
 @pytest.mark.asyncio
 async def test_sessionless_mcp_mutations_do_not_build_a_session_runtime_and_bootstrap(
-    experimental_harness: bool, monkeypatch: pytest.MonkeyPatch
+    monkeypatch: pytest.MonkeyPatch, process_services: ProcessServices
 ) -> None:
-    process = HarnessProcess(
-        experimental_harness=experimental_harness,
-        legacy_harness=not experimental_harness,
-    )
+    process = HarnessProcess(services=process_services)
     build_calls = 0
-    build_name = (
-        "build_unified_session_context" if experimental_harness else "open_root"
-    )
+    build_name = "build_unified_session_context"
     original_build = getattr(process, build_name)
 
     async def tracked_build(*args: object, **kwargs: object):
@@ -445,7 +481,9 @@ async def test_sessionless_mcp_mutations_do_not_build_a_session_runtime_and_boot
     monkeypatch.setattr(process, build_name, tracked_build)
     monkeypatch.setattr(MCPAuthenticationService, "login", login)
     monkeypatch.setattr(MCPAuthenticationService, "logout", logout)
-    connection = await _connect_recording_client(experimental_harness, process=process)
+    connection = await _connect_recording_client(
+        process=process, process_services=process_services
+    )
     session_id: str | None = None
     try:
         added = MCPAddResponse.model_validate(
@@ -566,11 +604,10 @@ async def test_sessionless_mcp_mutation_conflicts_with_an_active_session(
 async def test_mcp_convergence_failure_preserves_safe_public_state(
     backend_contract_connection: BackendContractConnection,
     backend_contract_session: AppServerSession,
-    experimental_harness: bool,
     monkeypatch: pytest.MonkeyPatch,
     change: str,
 ) -> None:
-    backend_type = _backend_class(experimental_harness)
+    backend_type = _backend_class()
 
     async def fail_convergence(*args: object, **kwargs: object):
         del args, kwargs
@@ -665,12 +702,9 @@ class _RecordingConnection:
 
 
 async def _connect_recording_client(
-    experimental_harness: bool, *, process: HarnessProcess | None = None
+    *, process: HarnessProcess | None = None, process_services: ProcessServices
 ) -> _RecordingConnection:
-    effective_process = process or HarnessProcess(
-        experimental_harness=experimental_harness,
-        legacy_harness=not experimental_harness,
-    )
+    effective_process = process or HarnessProcess(services=process_services)
     client_transport, server_transport = memory_transport_pair()
     recording = _RecordingTransport(cast(JsonRpcTransport, client_transport))
     harness = await create_harness_server(
@@ -728,3 +762,125 @@ def _assert_login_wire_order(timeline: list[tuple[str, dict[str, Any]]]) -> None
     assert auth_url < response
     assert compatibility_auth_url < response
     assert response < runtime_updated
+
+
+_COUNTING_SERVER_SOURCE = """
+import sys
+from pathlib import Path
+
+from mcp.server.mcpserver import MCPServer
+
+log, fail = Path(sys.argv[1]), sys.argv[2] == "fail"
+server = MCPServer("counting")
+
+
+@server.tool()
+def echo(value: str) -> str:
+    return value
+
+
+list_tools = server.list_tools
+
+
+async def counted_list_tools():
+    with log.open("a") as stream:
+        stream.write("tools/list\\n")
+    if fail:
+        raise RuntimeError("down")
+    return await list_tools()
+
+
+server.list_tools = counted_list_tools
+
+if __name__ == "__main__":
+    server.run()
+"""
+
+
+def _configure_counting_servers(config_dir: Path, tmp_path: Path) -> dict[str, Path]:
+    """A healthy and a failing stdio server, each logging every tools/list."""
+    source = tmp_path / "counting_mcp_server.py"
+    source.write_text(_COUNTING_SERVER_SOURCE, encoding="utf-8")
+    logs = {name: tmp_path / f"{name}.log" for name in ("counted", "failing")}
+    config_path = config_dir / "config.toml"
+    config = tomllib.loads(config_path.read_text(encoding="utf-8"))
+    config["mcp_servers"] = [
+        {
+            "name": name,
+            "transport": "stdio",
+            "command": [
+                sys.executable,
+                str(source),
+                str(log),
+                "fail" if name == "failing" else "ok",
+            ],
+            "startup_timeout_sec": 30.0,
+            "tool_timeout_sec": 30.0,
+        }
+        for name, log in logs.items()
+    ]
+    config_path.write_text(tomli_w.dumps(config), encoding="utf-8")
+    return logs
+
+
+def _listed(log: Path) -> int:
+    return len(log.read_text().splitlines()) if log.exists() else 0
+
+
+@pytest.mark.asyncio
+async def test_sessions_of_one_process_discover_each_mcp_server_once(
+    config_dir: Path,
+    tmp_path: Path,
+    process_services: ProcessServices,
+    backend_contract_mistral_api: respx.Route,
+) -> None:
+    """*Prepare*: A healthy and a failing stdio MCP server, nothing cached, and
+      two channels of one multiplexed process.
+    *Do*: Open a session on the first channel and let its discovery finish,
+      then open one on the second channel.
+    *Assert*: The second session routes the healthy server's tools from the
+      shared cache and reports the failing one unavailable, and neither
+      server is contacted again.
+    """
+    # Prepare
+    logs = _configure_counting_servers(config_dir, tmp_path)
+    connections = [
+        await connect_backend_contract_host(
+            session_options=SessionOptions(),
+            capabilities=ClientCapabilities(),
+            process_services=process_services,
+        )
+        for _ in range(2)
+    ]
+
+    # Do
+    sessions: list[AppServerSession] = []
+    reads: list[MCPReadResponse] = []
+    listed: list[dict[str, int]] = []
+    try:
+        for connection in connections:
+            session = await connection.host.open_session()
+            sessions.append(session)
+            await session.resources.runtime.wait_until_ready()
+            await wait_for_background_integrations()
+            reads.append(
+                MCPReadResponse.model_validate(
+                    await connection.client.request(
+                        "mcp_catalog/read", MCPReadParams(session_id=session.session_id)
+                    )
+                )
+            )
+            listed.append({name: _listed(log) for name, log in logs.items()})
+    finally:
+        for session in sessions:
+            await session.close()
+        for connection in connections:
+            await connection.host.close()
+
+    # Assert
+    assert listed == [{"counted": 1, "failing": 1}] * 2
+    for read in reads:
+        counted = _source(read, "counted")
+        assert counted.status is MCPSourceStatus.ENABLED
+        assert {tool.name for tool in counted.tools} == {"echo"}
+        assert _source(read, "failing").status is MCPSourceStatus.UNAVAILABLE

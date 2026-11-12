@@ -9,9 +9,9 @@ from e2e.app_server.events import (
     turn_started,
     user_msg,
 )
-from e2e.app_server.scenario import Timeline
+from e2e.app_server.scenario import Timeline, take_snapshot
 
-screen_rows = {"rust": {11: "⏵ Ran cat app.log"}}
+screen_rows = {8: "⏵ Ran cat app.log"}
 
 _WHEEL_UP = "\x1b[<64;60;10M"
 _CTRL_O = "\x0f"
@@ -29,13 +29,18 @@ timeline: Timeline = [
     bash("cat app.log", _LOG),
     assistant_msg("Read."),
     turn_completed(),
+    take_snapshot(),
     "next\r",
     turn_started(),
     user_msg("next"),
     assistant_msg(_reply("Next line", 15)),
     turn_completed(),
+    take_snapshot(),
     _CTRL_O,
+    take_snapshot(),
     _WHEEL_UP * 30,
-    # SGR row 12 hits a log line while the result header is above the viewport.
-    "\x1b[<0;10;12M\x1b[<0;10;12m",
+    take_snapshot(),
+    # SGR row 9 hits a log line while the result header is above the viewport.
+    "\x1b[<0;10;9M\x1b[<0;10;9m",
+    take_snapshot(),
 ]

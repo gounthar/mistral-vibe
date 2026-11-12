@@ -354,7 +354,8 @@ fn checkpoint_round_trips_every_rich_content_shape_without_semantic_loss() {
                 "role": "user",
                 "content": rich_content()
             },
-            "source": "history"
+            "source": "history",
+            "turn_index": 0
         },
         {
             "message": {
@@ -383,7 +384,8 @@ fn checkpoint_round_trips_every_rich_content_shape_without_semantic_loss() {
                     { "type": "text", "text": "working" }
                 ]
             },
-            "source": "injection"
+            "source": "injection",
+            "turn_index": 0
         },
         {
             "message": {
@@ -394,7 +396,8 @@ fn checkpoint_round_trips_every_rich_content_shape_without_semantic_loss() {
                 "content": [{ "type": "text", "text": "done" }],
                 "_meta": { "client": { "request_id": "request-1" } }
             },
-            "source": "history"
+            "source": "history",
+            "turn_index": 0
         }
     ]);
 
@@ -535,7 +538,7 @@ fn checkpoint_round_trips_a_reasoning_only_completion_candidate() {
 }
 
 #[test]
-fn restore_defaults_cached_input_tokens_for_older_checkpoints() {
+fn restore_defaults_optional_usage_counters_for_older_checkpoints() {
     let mut checkpoint = restorable_active_candidate_checkpoint();
     checkpoint["turn"]["phase"]["pending"]["candidate"]["usage"] = json!({
         "input_tokens": 10,
@@ -548,8 +551,15 @@ fn restore_defaults_cached_input_tokens_for_older_checkpoints() {
     let recaptured = serde_json::to_value(Checkpoint::capture(&restored).unwrap()).unwrap();
 
     assert_eq!(
-        recaptured["turn"]["phase"]["pending"]["candidate"]["usage"]["cached_input_tokens"],
-        0
+        recaptured["turn"]["phase"]["pending"]["candidate"]["usage"],
+        json!({
+            "input_tokens": 10,
+            "output_tokens": 2,
+            "total_tokens": 12,
+            "cached_input_tokens": 0,
+            "cache_write_tokens": 0,
+            "reasoning_tokens": 0
+        })
     );
 }
 
@@ -620,95 +630,35 @@ fn restore_rejects_invalid_pre_agent_content_and_pending_notifications() {
 }
 
 #[test]
-fn checkpoint_round_trips_keyed_context_and_rejects_invalid_keys() {
-    let keyed_message = |role: &str, source: &str, key: &str| {
+fn restore_reads_queued_agent_tasks_from_older_checkpoints_as_messages() {
+    for saved_kind in [Some("task"), Some("message"), None] {
+        // Prepare
+        let mut source = json!({"type": "agent_message", "sender_agent_path": "/root/child"});
+        if let Some(kind) = saved_kind {
+            source["kind"] = json!(kind);
+        }
         let mut checkpoint = checkpoint_with_turn(json!({ "type": "idle" }));
-        checkpoint["context"]["messages"] = json!([{
-            "message": {
-                "role": role,
-                "content": [{ "type": "text", "text": "GitHub is connected." }]
-            },
-            "source": source,
-            "context_key": key
+        checkpoint["notifications"] = json!([{
+            "type": "pending",
+            "notification": {
+                "id": "notification-1",
+                "source": source,
+                "level": "info",
+                "message": "Agent input",
+                "content": [{"type": "text", "text": "retained advice"}]
+            }
         }]);
-        checkpoint
-    };
-    let valid = keyed_message("user", "injection", "github");
-    let restored = decode_checkpoint(&valid.to_string())
-        .unwrap()
-        .restore(config())
-        .unwrap();
-    let recaptured = serde_json::to_value(Checkpoint::capture(&restored).unwrap()).unwrap();
-    assert_eq!(recaptured, valid);
 
-    for (checkpoint, expected) in [
-        (
-            keyed_message("user", "injection", ""),
-            "checkpoint context key must not be empty",
-        ),
-        (
-            keyed_message("user", "history", "github"),
-            "checkpoint context key requires an injected user message",
-        ),
-        (
-            keyed_message("assistant", "injection", "github"),
-            "checkpoint context key requires an injected user message",
-        ),
-    ] {
+        // Do
         let decoded = decode_checkpoint(&checkpoint.to_string()).unwrap();
-        let error = decoded.restore(config()).unwrap_err();
-        assert!(error.contains(expected), "{error}");
-    }
-}
+        let restored = decoded.restore(config()).unwrap();
+        let recaptured = serde_json::to_value(Checkpoint::capture(&restored).unwrap()).unwrap();
 
-#[test]
-fn checkpoint_round_trips_compaction_context_keys_and_rejects_invalid_keys() {
-    let with_context_keys = |context_keys: Value| {
-        let mut checkpoint: Value = serde_json::from_str(include_str!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/tests/fixtures/checkpoints/v1/active-awaiting-compaction-completion.json"
-        )))
-        .unwrap();
-        checkpoint["context"]["messages"]
-            .as_array_mut()
-            .unwrap()
-            .push(json!({
-                "message": {
-                    "role": "user",
-                    "content": [{ "type": "text", "text": "GitHub is connected." }]
-                },
-                "source": "injection",
-                "context_key": "github"
-            }));
-        checkpoint["turn"]["phase"]["context_keys"] = context_keys;
-        checkpoint
-    };
-    let valid = with_context_keys(json!(["github"]));
-    let restored = decode_checkpoint(&valid.to_string())
-        .unwrap()
-        .restore(config())
-        .unwrap();
-    let recaptured = serde_json::to_value(Checkpoint::capture(&restored).unwrap()).unwrap();
-    assert_eq!(recaptured, valid);
-
-    for (context_keys, expected) in [
-        (
-            json!([]),
-            "checkpoint compaction context keys must not be empty",
-        ),
-        (json!([""]), "checkpoint context key must not be empty"),
-        (
-            json!(["github", "github"]),
-            "duplicate checkpoint compaction context key \"github\"",
-        ),
-        (
-            json!(["jira"]),
-            "checkpoint compaction context key \"jira\" has no keyed message",
-        ),
-    ] {
-        let checkpoint = with_context_keys(context_keys);
-        let decoded = decode_checkpoint(&checkpoint.to_string()).unwrap();
-        let error = decoded.restore(config()).unwrap_err();
-        assert!(error.contains(expected), "{error}");
+        // Assert
+        assert_eq!(
+            recaptured["notifications"][0]["notification"]["source"],
+            json!({"type": "agent_message", "sender_agent_path": "/root/child"}),
+            "{saved_kind:?}"
+        );
     }
 }

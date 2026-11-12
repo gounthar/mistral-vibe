@@ -1,9 +1,11 @@
 use crate::core::error::CoreError;
 use std::collections::BTreeSet;
 
+use crate::core::config::OutputLimitRecovery;
+use crate::core::features::output_limit_recovery;
 use crate::core::features::programmatic_tool_calling::is_private_wrapper;
-use crate::core::hooks::{CompletionHookOutput, HookPoint, KeyedContextMessage, PreLlmCallOutput};
-use crate::core::step_protocol::DeterminismContext;
+use crate::core::hooks::{CompletionHookOutput, HookPoint, PreLlmCallOutput};
+use crate::core::step_protocol::{DeterminismContext, TurnStopReason};
 use crate::core::tools::context::ToolContext;
 use crate::core::tools::execution::batch::{ToolBatchTransition, start_tool_batch};
 use crate::core::wire::completion::{
@@ -50,14 +52,30 @@ impl<'a> CandidateContext<'a> {
 pub(in crate::core::turn) struct CandidateTurn {
     iterations: u32,
     max_iterations: Option<u32>,
+    output_limit_recovery: OutputLimitRecovery,
+    output_limit_retries: u32,
 }
 
 impl CandidateTurn {
-    pub(in crate::core::turn) fn new(iterations: u32, max_iterations: Option<u32>) -> Self {
+    pub(in crate::core::turn) fn new(
+        iterations: u32,
+        max_iterations: Option<u32>,
+        output_limit_recovery: OutputLimitRecovery,
+        output_limit_retries: u32,
+    ) -> Self {
         Self {
             iterations,
             max_iterations,
+            output_limit_recovery,
+            output_limit_retries,
         }
+    }
+
+    fn has_iteration_for_retry(&self) -> bool {
+        let next_iteration = self.iterations + 1;
+        !self
+            .max_iterations
+            .is_some_and(|max_iterations| next_iteration >= max_iterations)
     }
 }
 
@@ -96,26 +114,27 @@ pub(in crate::core::turn) struct CompletionTransition {
 
 pub(in crate::core::turn) enum CompletionResolution {
     Wait(Box<CompletionWait>),
-    ContinueWithContext {
-        context_messages: Vec<KeyedContextMessage>,
-        plan: AgentCompletionPlan,
-    },
     Retry {
         action_id: String,
         next_iteration: u32,
         feedback: StoredMessage,
+        /// The discarded candidate reached the output token limit, so the
+        /// retry counts against the turn's output limit recovery budget.
+        output_limit: bool,
     },
     Finish(CompletionFinish),
     Accept(AcceptedCompletion),
 }
 
 pub(in crate::core::turn) enum CompletionWait {
+    Completion(AgentCompletionPlan),
     LifecycleHook(Box<PendingLifecycleHook>),
 }
 
 pub(in crate::core::turn) enum CompletionFinish {
     Skipped {
         action_id: String,
+        reason: Vec<ContentBlock>,
     },
     Rejected {
         action_id: String,
@@ -135,13 +154,22 @@ pub(in crate::core::turn) struct AcceptedCompletion {
     /// when the provider reported usage. Feeds the automatic compaction
     /// trigger so it reacts to the real context size, not only the estimate.
     pub(in crate::core::turn) context_tokens: Option<u64>,
+    /// Provider-reported input size of the request, when reported. Measures
+    /// the session's estimate correction.
+    pub(in crate::core::turn) input_tokens: Option<u64>,
     pub(in crate::core::turn) message: StoredMessage,
     pub(in crate::core::turn) observable_candidate: Option<CompletionCandidate>,
     pub(in crate::core::turn) continuation: AcceptedCompletionContinuation,
 }
 
 pub(in crate::core::turn) enum AcceptedCompletionContinuation {
-    Complete { output: Vec<ContentBlock> },
+    /// `stop_reason`: `OutputLimit` when the model's reply stopped at the output limit and
+    /// recovery did not retry it. It follows the model's finish reason, also when a hook replaced
+    /// the reply's content.
+    Complete {
+        output: Vec<ContentBlock>,
+        stop_reason: Option<TurnStopReason>,
+    },
     ToolBatch(Box<ToolBatchTransition>),
 }
 
@@ -151,7 +179,13 @@ pub(in crate::core::turn) fn resolve_completion(
 ) -> Result<CompletionTransition, CoreError> {
     match event {
         CompletionEvent::Succeeded { action_id, result } => {
-            let candidate = parse_completion_result(result)?;
+            let mut candidate = parse_completion_result(result)?;
+            if recovers_from_output_limit(&context.turn, &candidate) {
+                return Ok(CompletionTransition {
+                    resolution: output_limit_retry(&context, action_id, &candidate),
+                });
+            }
+            settle_cut_off_tool_calls(&mut candidate);
             let resolution = if context.hooks.post_llm_binding_ids.is_empty() {
                 resolve_after_post_llm(&context, action_id, candidate)?
             } else {
@@ -182,15 +216,15 @@ fn resolve_completion_hook(
             completion_action_id,
             output,
         } => match output {
-            PreLlmCallOutput::Continue { context_messages } => {
-                Ok(CompletionResolution::ContinueWithContext {
-                    context_messages,
-                    plan: agent_completion_after_pre_llm_hook(completion_action_id),
-                })
-            }
-            PreLlmCallOutput::Skip { .. } => {
+            PreLlmCallOutput::Continue => Ok(CompletionResolution::Wait(Box::new(
+                CompletionWait::Completion(agent_completion_after_pre_llm_hook(
+                    completion_action_id,
+                )),
+            ))),
+            PreLlmCallOutput::Skip { reason } => {
                 Ok(CompletionResolution::Finish(CompletionFinish::Skipped {
                     action_id: completion_action_id,
+                    reason,
                 }))
             }
         },
@@ -282,7 +316,49 @@ fn resolve_retry(
         action_id,
         next_iteration,
         feedback,
+        output_limit: false,
     })
+}
+
+/// A completion cut off at the output limit is unfinished: either an answer
+/// that stops mid-sentence or a tool call whose arguments stop mid-value.
+/// While the turn has recovery budget and an iteration to spend, discard it
+/// before any Hook sees it and ask for a shorter response.
+fn recovers_from_output_limit(turn: &CandidateTurn, candidate: &CompletionCandidate) -> bool {
+    candidate.finish_reason == CompletionFinishReason::Length
+        && turn
+            .output_limit_recovery
+            .allows_retry(turn.output_limit_retries)
+        && turn.has_iteration_for_retry()
+}
+
+fn output_limit_retry(
+    context: &CandidateContext<'_>,
+    action_id: String,
+    candidate: &CompletionCandidate,
+) -> CompletionResolution {
+    let output_tokens = candidate.usage.as_ref().map(|usage| usage.output_tokens);
+    CompletionResolution::Retry {
+        action_id,
+        next_iteration: context.turn.iterations + 1,
+        feedback: StoredMessage::injected(Message::user(output_limit_recovery::feedback(
+            output_limit_recovery::CutOffAt::of(&candidate.message),
+            output_tokens,
+        ))),
+        output_limit: true,
+    }
+}
+
+/// Without recovery, a completion cut off inside a tool call keeps its tool
+/// calls: each runs or reports its own argument error, as for any tool call
+/// finish. Its finish reason becomes `tool_call` so the candidate stays a
+/// well-formed tool call completion.
+fn settle_cut_off_tool_calls(candidate: &mut CompletionCandidate) {
+    if candidate.finish_reason == CompletionFinishReason::Length
+        && !candidate.message.tool_calls().is_empty()
+    {
+        candidate.finish_reason = CompletionFinishReason::ToolCall;
+    }
 }
 
 fn resolve_rejection(
@@ -314,6 +390,7 @@ fn resolve_accepted(
         ));
     }
     let context_tokens = candidate.usage.as_ref().map(|usage| usage.total_tokens);
+    let input_tokens = candidate.usage.as_ref().map(|usage| usage.input_tokens);
     let message = Message::assistant(candidate.message.content.clone());
     message.validate()?;
     let tool_calls = candidate.message.tool_calls();
@@ -325,6 +402,8 @@ fn resolve_accepted(
     let continuation = if tool_calls.is_empty() {
         AcceptedCompletionContinuation::Complete {
             output: candidate.message.content_blocks(),
+            stop_reason: (candidate.finish_reason == CompletionFinishReason::Length)
+                .then_some(TurnStopReason::OutputLimit),
         }
     } else {
         AcceptedCompletionContinuation::ToolBatch(Box::new(start_tool_batch(
@@ -337,6 +416,7 @@ fn resolve_accepted(
         action_id,
         next_iteration,
         context_tokens,
+        input_tokens,
         message: StoredMessage::visible(message),
         observable_candidate,
         continuation,
@@ -357,7 +437,7 @@ fn apply_acceptance(
 pub(in crate::core::turn) fn parse_completion_result(
     result: CompletionResult,
 ) -> Result<CompletionCandidate, CoreError> {
-    validate_token_usage(result.usage.as_ref()).map_err(CoreError::invalid_command)?;
+    validate_token_usage(Some(&result.usage)).map_err(CoreError::invalid_command)?;
     if result.parts.is_empty() {
         return Err(CoreError::invalid_command(
             "completion result must contain at least one part",
@@ -397,6 +477,13 @@ pub(in crate::core::turn) fn parse_completion_result(
                     )));
                 }
                 let arguments = match serde_json::from_str(&arguments_json) {
+                    // Some providers stream a call to a tool without parameters
+                    // as empty arguments. Store `{}` so the call runs and is
+                    // replayed as valid JSON to any provider.
+                    Err(_) if arguments_json.trim().is_empty() => ToolArguments::Json {
+                        raw: "{}".to_string(),
+                        value: serde_json::json!({}),
+                    },
                     Ok(value) => ToolArguments::Json {
                         raw: arguments_json,
                         value,
@@ -430,6 +517,8 @@ pub(in crate::core::turn) fn parse_completion_result(
             ));
         }
         CompletionFinishReason::ToolCall => {}
+        // The output limit can stop a completion while it writes a tool call.
+        CompletionFinishReason::Length => {}
         _ if has_tool_call => {
             return Err(CoreError::invalid_command(
                 "only tool_call finish may contain a tool call",
@@ -441,7 +530,7 @@ pub(in crate::core::turn) fn parse_completion_result(
     Ok(CompletionCandidate {
         message,
         finish_reason: result.finish_reason,
-        usage: result.usage,
+        usage: Some(result.usage),
     })
 }
 
@@ -466,7 +555,7 @@ mod tests {
         CompletionResult {
             parts: vec![CompletionResultPart::Content(ContentBlock::text(text))],
             finish_reason: CompletionFinishReason::Stop,
-            usage: None,
+            usage: test_usage(),
         }
     }
 
@@ -509,8 +598,9 @@ mod tests {
     #[test]
     fn completion_rejection_stores_only_the_rejection_state() {
         let mut state = started();
-        add_always_hook(&mut state.config, HookPoint::PostLlmCall);
-        rebuild_hook_binding_index(&mut state);
+        edit_config(&mut state, |config| {
+            add_always_hook(config, HookPoint::PostLlmCall)
+        });
         let messages = state.context.messages().to_vec();
         let action_id = awaiting_action_id(&state);
         let state = advance(
@@ -539,7 +629,7 @@ mod tests {
         // The rejected draft is not committed: context is untouched, and the turn
         // ends carrying only why it declined.
         assert_eq!(step.state.context.messages(), messages);
-        assert_eq!(step.output(), Some(Vec::new()));
+        assert_eq!(step.output(), Some(vec![ContentBlock::text("unsafe")]));
         assert_eq!(
             turn_outcome(&step.state),
             Some(&TurnOutcome::Rejected {
@@ -553,8 +643,9 @@ mod tests {
         let mut config = config();
         config.settings.turn.max_iterations = Some(1);
         let mut state = started_with(config);
-        add_always_hook(&mut state.config, HookPoint::PostLlmCall);
-        rebuild_hook_binding_index(&mut state);
+        edit_config(&mut state, |config| {
+            add_always_hook(config, HookPoint::PostLlmCall)
+        });
         let action_id = awaiting_action_id(&state);
         state = advance(
             state,

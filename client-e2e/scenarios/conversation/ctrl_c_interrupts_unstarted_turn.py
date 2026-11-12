@@ -5,9 +5,6 @@ from __future__ import annotations
 from e2e.app_server.events import turn_started, user_msg
 from e2e.app_server.scenario import Timeline
 
-env = {"VIBE_REPLAY_SETTLE_BUSY": "1"}
-capture_startup = False
-
 _PROMPT = "write the migration"
 
 # The server only starts the turn after the key press; the client then sends `turn/interrupt`.
@@ -19,5 +16,5 @@ timeline: Timeline = [
     {"release": 3},
 ]
 
-screen_contains = {"rust": ("Interrupted",)}
-screen_excludes = {"rust": ("Esc/Ctrl+C to interrupt",)}
+screen_contains = ("Interrupted",)
+screen_excludes = ("Esc/Ctrl+C to interrupt",)

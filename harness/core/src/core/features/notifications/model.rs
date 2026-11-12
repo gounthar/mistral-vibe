@@ -4,8 +4,14 @@ use serde::Serialize;
 use crate::core::wire::content::ContentBlock;
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
-#[serde(tag = "type", rename_all = "snake_case")]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub(crate) enum NotificationSource {
+    /// A message from another agent that arrived while this agent had no Turn to receive it.
+    AgentMessage { sender_agent_path: String },
+    AgentResult {
+        sender_agent_path: String,
+        termination: crate::core::helpers::AgentResultTermination,
+    },
     BackgroundProcess {
         process_id: String,
         status: ProcessTerminalStatus,

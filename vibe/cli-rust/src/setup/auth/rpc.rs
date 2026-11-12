@@ -1,4 +1,4 @@
-//! The wizard's `setup/*` RPC calls (Python app-server `_setup.py`): the
+//! The wizard's `setup/*` RPC calls (app-server `_setup.py`): the
 //! client's ONLY persistence channel — `status` seeds the wizard,
 //! `store-credential` saves the key, `submit-choices` lands the provider,
 //! base URLs, and theme. No local fallback exists when these are absent
@@ -29,8 +29,7 @@ pub struct ProviderView {
 }
 
 /// `setup/status`'s params: the wizard names the provider the failed
-/// session used (Python resolves it against the full effective config);
-/// absent means the server's own active provider.
+/// session used; absent means the server's own active provider.
 #[derive(Debug, Default, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct StatusParams<'a> {
@@ -50,13 +49,31 @@ pub struct SetupStatus {
     /// provider's backend — not a URL-presence guess.
     pub supports_browser_sign_in: bool,
     pub has_api_key: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub oidc_enabled: bool,
     /// The server-resolved TLS trust flag (ADR 0015): the fully-resolved
     /// effective config, not just env var and user config.toml.
     #[serde(default)]
     pub enable_system_trust_store: bool,
+    /// The administrator-pinned console URL (`VIBE_CUSTOM_CONSOLE_URL`), when
+    /// the server resolved one: the wizard locks its sign-in domain to it.
+    #[serde(default)]
+    pub pinned_console_url: Option<String>,
+    /// The Mistral provider `--setup` also offers when `provider` has no
+    /// browser sign-in.
+    #[serde(default)]
+    pub mistral_provider: Option<ProviderView>,
+    /// The credential source in use, as `/status` reports it: `process_env`
+    /// means a key the wizard saves is shadowed by the shell.
+    #[serde(default)]
+    pub active_credential_source: Option<String>,
+    /// The offered Mistral provider's own source: the wizard warns for the
+    /// provider the user picks, never the seeded one's.
+    #[serde(default)]
+    pub mistral_active_credential_source: Option<String>,
 }
 
-/// `setup/store-credential`'s outcome, the Python key-persist contract
+/// `setup/store-credential`'s outcome, the server's key-persist contract
 /// (`SetupStoreCredentialResponse`: the `outcome` tag plus `detail`).
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(tag = "outcome", rename_all = "snake_case")]
@@ -65,14 +82,14 @@ pub enum StoreOutcome {
     /// env carries it — the reused child's session authenticates.
     Completed,
     /// The derived env var name is empty or invalid; nothing was saved
-    /// (Python `env_var_error` — exit 1). `detail` carries the env var name.
+    /// (`env_var_error` — exit 1). `detail` carries the env var name.
     EnvVarError {
         #[serde(default)]
         detail: String,
     },
     /// Neither the keyring nor the `.env` fallback could store it, so the
-    /// key lives only in the server process env for this run (Python
-    /// `save_error` — warning, then continue). `detail` carries the error.
+    /// key lives only in the server process env for this run
+    /// (`save_error` — warning, then continue). `detail` carries the error.
     SaveError {
         #[serde(default)]
         detail: String,
@@ -85,8 +102,8 @@ pub enum StoreOutcome {
 #[serde(tag = "outcome", rename_all = "snake_case")]
 pub enum SubmitOutcome {
     Completed,
-    /// A provider/URL/theme field failed to persist (Python
-    /// `provider_config_error` — warning, then continue).
+    /// A provider/URL/theme field failed to persist
+    /// (`provider_config_error` — warning, then continue).
     ProviderConfigError {
         #[serde(default)]
         failures: Vec<String>,
@@ -170,7 +187,7 @@ pub async fn submit_choices(
 }
 
 /// One request with the old-server skew classified.
-async fn call(
+pub(super) async fn call(
     client: &Client,
     method_name: &str,
     params: serde_json::Value,
@@ -184,6 +201,10 @@ async fn call(
             error.message
         ))),
     }
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 /// `method_not_found` (app-server `ProtocolErrorCode`) or JSON-RPC `-32601`.

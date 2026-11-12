@@ -19,8 +19,8 @@ from vibe.core.config.vibe_schema import VibeConfigSchema
 
 # Only these fields are required for a valid persisted model entry; all other
 # ModelConfig fields have defaults. Writing only required fields + the changed
-# field avoids baking in values from higher-priority layers (admin/GrowthBook)
-# into the user's writable config.
+# field avoids baking in values from higher-priority layers (admin, agent
+# profiles) into the user's writable config.
 _REQUIRED_MODEL_FIELDS = {"name", "provider", "alias"}
 
 
@@ -44,7 +44,9 @@ def model_config_write_ops(
 
     An empty alias is how this configuration says "follow the default", and
     writing it is the only way to unpin a session, so it is passed through
-    rather than looked up.
+    rather than looked up. A durable write of the pin names the model the way
+    the target file already does (an old name while it is there), via
+    ``ConfigSchema.layer_write_op``.
 
     Raises ``ValueError`` for a model this configuration does not offer.
     """
@@ -104,19 +106,63 @@ def _model_field_write(
     return alias, model, field
 
 
+def _route(config: VibeConfigSchema, alias: str) -> tuple[Any, ...]:
+    """What a model's route compiles from: the model, which of its fields the
+    config sets (an unset thinking level is not an explicit one), and its
+    provider.
+    """
+    model = config.models[alias]
+    try:
+        provider = config.get_provider_for_model(model).model_dump()
+    except ValueError:
+        provider = None
+    return model.model_dump(), sorted(model.model_fields_set), provider
+
+
+def _active_alias(config: VibeConfigSchema) -> str | None:
+    try:
+        return config.get_active_model().alias
+    except ValueError:
+        return None
+
+
+def models_a_write_changes(
+    before: VibeConfigSchema, after: VibeConfigSchema
+) -> list[ModelConfig]:
+    """The models of ``after`` that read differently from ``before``, or that
+    the write made active.
+
+    A field, whole-model, provider or active-model write, or a removal that
+    uncovers a lower layer's value, all show up here, whatever path names them.
+    """
+    changed = {
+        alias: model
+        for alias, model in after.models.items()
+        if alias not in before.models or _route(before, alias) != _route(after, alias)
+    }
+    active = _active_alias(after)
+    if active in after.models and active != _active_alias(before):
+        changed.setdefault(active, after.models[active])
+    return list(changed.values())
+
+
 def config_write_ops_to_patches(
     config: VibeConfigSchema,
     ops: list[ConfigWriteOpWire],
     *,
-    durable_model_aliases: set[str],
+    sparse_override_model_aliases: set[str],
 ) -> list[PatchOp]:
-    # Materialize a model no durable layer can reconstruct on restart; a sparse
-    # field-only override of one would be missing its required identity fields
-    # and fail schema validation next launch. Held per alias, not just for the
-    # active model: a pick that names another model writes that model's fields
-    # before it becomes the active one. Multiple field writes targeting the same
-    # alias in one batch fold into a single upsert so earlier changes are not
-    # silently overwritten.
+    # A model no layer redefines needs its identity materialized: a sparse
+    # field-only override of one would be an orphan no layer completes on the
+    # next launch. Held per alias, not just for the active model: a pick that
+    # names another model writes that model's fields before it becomes the
+    # active one. Multiple field writes targeting the same alias in one batch
+    # fold into a single upsert so earlier changes are not silently
+    # overwritten.
+    #
+    # Every other model takes a bare field write: durable layers reconstruct
+    # it, and the catalog or GrowthBook layer re-fetches it — copied identity
+    # would keep a model running after its layer drops it (VIBE-4877).
     pending: dict[tuple[str | None, str], tuple[ModelConfig, dict[str, Any]]] = {}
     operations: list[PatchOp] = []
 
@@ -128,7 +174,7 @@ def config_write_ops_to_patches(
             continue
 
         write = _model_field_write(op.path, config)
-        if write is not None and write[0] not in durable_model_aliases:
+        if write is not None and write[0] not in sparse_override_model_aliases:
             alias, model, field = write
             _, overrides = pending.setdefault((op.target_layer, alias), (model, {}))
             overrides[field] = op.value

@@ -8,13 +8,44 @@ use serde_json::Value;
 
 use crate::core::helpers::normalized_similarity_score;
 
-pub(crate) use prompt::{
-    AUTONOMY_ACTIVITY, IDENTITY_GUIDANCE, catalog_prompt_section, rules_prompt_section,
-};
+pub(crate) use prompt::{catalog_prompt_section, rules_prompt_section};
 pub(crate) use tools::{ToolName, direct_tool, is_direct_name, tool};
 
 pub(crate) const NAMESPACE: &str = "skill";
 const MAX_SKILL_NAME_SUGGESTIONS: usize = 3;
+
+/// Whether the Session exposes the `skill` tool and its rules.
+///
+/// `Enabled` and `WhenConfigured` expose them only while the catalog is not
+/// empty, so an agent with no skills is never offered a tool that has nothing
+/// to load. `WhenConfigured` is the default, so settings recorded before this
+/// field existed keep their behavior. `Disabled` exposes nothing and rejects a
+/// non-empty catalog.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(tag = "mode", rename_all = "snake_case", deny_unknown_fields)]
+pub(crate) enum Mode {
+    Disabled,
+    #[default]
+    WhenConfigured,
+    Enabled,
+}
+
+impl Mode {
+    pub(crate) fn is_when_configured(&self) -> bool {
+        matches!(self, Self::WhenConfigured)
+    }
+
+    pub(crate) fn is_disabled(&self) -> bool {
+        matches!(self, Self::Disabled)
+    }
+
+    pub(crate) fn exposes<'a>(self, skills: impl IntoIterator<Item = &'a SkillDefinition>) -> bool {
+        match self {
+            Self::Disabled => false,
+            Self::WhenConfigured | Self::Enabled => skills.into_iter().next().is_some(),
+        }
+    }
+}
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 pub(crate) struct SkillDefinition {
@@ -116,9 +147,9 @@ fn find_closest_skill_names<'a>(requested_name: &str, available: &[&'a str]) -> 
 }
 
 fn is_skill_name(value: &str) -> bool {
-    if let Some((namespace, skill_name)) = value.split_once(':') {
+    if let Some((qualifier, skill_name)) = value.split_once(':') {
         return !skill_name.contains(':')
-            && is_programmatic_identifier(namespace)
+            && is_skill_qualifier(qualifier)
             && is_unqualified_skill_name(skill_name);
     }
     is_unqualified_skill_name(value)
@@ -144,10 +175,12 @@ fn is_skill_path(value: &str) -> bool {
                 && matches!(value.as_bytes()[2], b'/' | b'\\')))
 }
 
-fn is_programmatic_identifier(value: &str) -> bool {
-    let mut chars = value.chars();
-    chars.next().is_some_and(|character| {
-        character == '_' || character == '$' || character.is_ascii_alphabetic()
-    }) && chars
-        .all(|character| character == '_' || character == '$' || character.is_ascii_alphanumeric())
+/// The part of a Runtime-qualified alias before `:`, usually the name of the
+/// plugin that provides the skill, such as `acme-tools` or `acme.tools`. A
+/// programmatic identifier such as a tool namespace is accepted too.
+fn is_skill_qualifier(value: &str) -> bool {
+    !value.is_empty()
+        && value.chars().all(|character| {
+            character.is_ascii_alphanumeric() || matches!(character, '-' | '.' | '_' | '$')
+        })
 }

@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import asyncio
 from collections.abc import Awaitable, Callable
 from pathlib import Path
+from urllib.error import URLError
 
 from pydantic import JsonValue
 import pytest
@@ -14,6 +16,7 @@ from mistralai_vibe_local_harness.protocol import (
     RustProvidedToolCallAction,
     RustTextContentBlock,
     RustToolFailedEvent,
+    RustToolGroupDefinition,
     RustToolSucceededEvent,
 )
 from tests.conftest import build_test_vibe_config
@@ -28,12 +31,31 @@ from vibe.app_server._provided_tools import (
     resolved_max_todos,
     vibe_tool_groups,
 )
+from vibe.app_server._session_spawn import (
+    MAX_SESSION_HOPS,
+    MAX_TURN_STARTED_SESSIONS,
+    START_SESSION_TOOL_NAME,
+    SessionOriginResolver,
+    SessionSettings,
+    SessionSpawner,
+    SessionSpawnError,
+    SessionSpawnOrigin,
+    SpawnModel,
+)
 from vibe.app_server._unified_permissions import UnifiedPermissionResolver
 from vibe.app_server._unified_scheduled_loops import (
     ScheduledLoopStoreError,
     UnifiedScheduledLoops,
 )
 from vibe.app_server._unified_scratchpad import SCRATCHPAD_TOOL_NAME, scratchpad_dir
+from vibe.app_server.protocol import (
+    SessionSpawnCheckout,
+    SessionSpawnDirectory,
+    SessionSpawnManagedWorktree,
+    SessionSpawnNewWorktree,
+    SessionSpawnParams,
+    SessionSpawnResponse,
+)
 from vibe.core.config.harness_files import HarnessFilesManager
 from vibe.core.loop import MAX_LOOPS_PER_SESSION, LoopError
 from vibe.core.tools.base import ToolPermission
@@ -51,13 +73,41 @@ def _executor(
     tools: VibeProvidedTools | None = None,
     max_todos: Callable[[], int] | None = None,
     scheduled_loops: Callable[[str], UnifiedScheduledLoops] | None = None,
+    session_spawner: SessionSpawner | None = None,
+    session_origin: SessionOriginResolver | None = None,
 ) -> _Executor:
     holder = tools if tools is not None else VibeProvidedTools()
+
+    async def resolve_loops(session_id: str) -> UnifiedScheduledLoops:
+        assert scheduled_loops is not None
+        return scheduled_loops(session_id)
+
     return holder.executor_factory(
         root,
         max_todos=max_todos or (lambda: TodoConfig().max_todos),
-        scheduled_loops=scheduled_loops,
+        scheduled_loops=resolve_loops if scheduled_loops is not None else None,
+        session_spawner=session_spawner,
+        session_origin=session_origin or _parent_in_a_managed_worktree,
     )(session_id)
+
+
+_PARENT_SETTINGS = SessionSettings(
+    model="medium", reasoning_effort="low", approval_policy="default"
+)
+_MODELS = (
+    SpawnModel(alias="medium", display_name=None, levels=("low", "high")),
+    SpawnModel(
+        alias="claude-opus-5", display_name="Claude Opus 5", levels=("off", "max")
+    ),
+)
+
+
+def _parent_in_a_managed_worktree(_session_id: str) -> SessionSpawnOrigin:
+    return SessionSpawnOrigin(
+        checkout=SessionSpawnManagedWorktree(path="/repo/.worktrees/parent"),
+        settings=_PARENT_SETTINGS,
+        models=_MODELS,
+    )
 
 
 def _call(
@@ -330,11 +380,27 @@ def test_todo_is_routed_to_the_name_its_permission_is_configured_under() -> None
     assert VIBE_PROVIDED_TOOL_NAMES == {
         f"{VIBE_TOOL_GROUP}.{TODO_TOOL_NAME}": "todo",
         f"{VIBE_TOOL_GROUP}.{CRON_TOOL_NAME}": "cron",
+        f"{VIBE_TOOL_GROUP}.{START_SESSION_TOOL_NAME}": "start_session",
+        f"{VIBE_TOOL_GROUP}.list_sessions": "list_sessions",
+        f"{VIBE_TOOL_GROUP}.read_session": "read_session",
+        f"{VIBE_TOOL_GROUP}.send_to_session": "send_to_session",
+        f"{VIBE_TOOL_GROUP}.archive_sessions": "archive_sessions",
+        f"{VIBE_TOOL_GROUP}.restore_sessions": "restore_sessions",
+        f"{VIBE_TOOL_GROUP}.mark_sessions_seen": "mark_sessions_seen",
+        f"{VIBE_TOOL_GROUP}.enter_worktree": "enter_worktree",
     }
     assert VIBE_PROVIDED_TOOL_MODES == {
         TODO_TOOL_NAME: "ask",
         CRON_TOOL_NAME: "ask",
+        START_SESSION_TOOL_NAME: "ask",
+        "list_sessions": "ask",
+        "read_session": "ask",
+        "send_to_session": "ask",
+        "archive_sessions": "ask",
+        "restore_sessions": "ask",
+        "mark_sessions_seen": "ask",
         SCRATCHPAD_TOOL_NAME: "allow",
+        "enter_worktree": "allow",
     }
 
 
@@ -451,8 +517,27 @@ def test_cron_declares_discriminated_actions_and_structured_results() -> None:
     assert _schema_property(tool.output_schema, "loops")["type"] == "array"
     assert _schema_property(tool.output_schema, "verb")["type"] == "string"
     assert _schema_property(tool.output_schema, "message")["type"] == "string"
-    for term in ("50", "persisted", "live", "idle", "local timezone", "not caught up"):
+    for term in (
+        "50",
+        "persisted",
+        "live",
+        "idle",
+        "local timezone",
+        "not caught up",
+        "human-readable",
+        "short title",
+        "line break",
+        "first line",
+    ):
         assert term in tool.description
+    # The prompt field tells the model to write a short title on the first
+    # line, then a line break, then the full instruction shown to the user
+    # as-is; the first line is displayed in the UI as the loop's name.
+    prompt_description = variants["ScheduleArgs"]["properties"]["prompt"]["description"]
+    assert "human-readable" in prompt_description
+    assert "short title" in prompt_description
+    assert "line break" in prompt_description
+    assert "first line" in prompt_description
 
 
 @pytest.mark.parametrize(
@@ -712,3 +797,569 @@ async def test_cron_approval_mode_honors_config(
     assert VIBE_PROVIDED_TOOL_MODES[CRON_TOOL_NAME] == "ask"
     outcome = await resolver.resolve("vibe.cron", {"action": "list"})
     assert outcome.decision == decision
+
+
+class _FakeSpawner:
+    def __init__(
+        self,
+        answer: Callable[[SessionSpawnParams], Awaitable[SessionSpawnResponse]]
+        | None = None,
+    ) -> None:
+        self.requests: list[SessionSpawnParams] = []
+        self._answer = answer
+
+    async def spawn_session(self, params: SessionSpawnParams) -> SessionSpawnResponse:
+        self.requests.append(params)
+        if self._answer is not None:
+            return await self._answer(params)
+        return SessionSpawnResponse(session_id="spawned-1", title=params.title)
+
+
+def _start_session(
+    action_id: str, **arguments: JsonValue
+) -> RustProvidedToolCallAction:
+    return _call(action_id, tool_name=START_SESSION_TOOL_NAME, **arguments)
+
+
+def _tool_names(groups: list[RustToolGroupDefinition]) -> list[str]:
+    return [tool.name for group in groups for tool in group.tools]
+
+
+def test_start_session_is_offered_only_to_a_client_that_can_spawn() -> None:
+    assert START_SESSION_TOOL_NAME not in _tool_names(vibe_tool_groups({"bash"}))
+
+    groups = vibe_tool_groups({"bash"}, session_spawn=_MODELS)
+
+    start = next(
+        tool for tool in groups[0].tools if tool.name == START_SESSION_TOOL_NAME
+    )
+    assert start.exposure == "direct"
+    schema = start.input_schema
+    assert isinstance(schema, dict)
+    properties = schema["properties"]
+    assert isinstance(properties, dict)
+    assert set(properties) == {
+        "prompt",
+        "title",
+        "placement",
+        "model",
+        "reasoning_effort",
+    }
+    assert schema["required"] == ["prompt", "placement"]
+    assert schema["additionalProperties"] is False
+    assert "$defs" not in schema
+    # Named, so a user's "opus" can be matched to its alias.
+    assert "medium; claude-opus-5 (Claude Opus 5)" in str(
+        _schema_property(schema, "model")["description"]
+    )
+    assert "medium: low, high; claude-opus-5: off, max" in str(
+        _schema_property(schema, "reasoning_effort")["description"]
+    )
+    assert _schema_property(schema, "placement")["enum"] == [
+        "current_checkout",
+        "new_worktree",
+    ]
+
+
+def test_start_session_obeys_tool_filters() -> None:
+    groups = vibe_tool_groups(
+        {"bash"}, session_spawn=_MODELS, disabled_tools=[START_SESSION_TOOL_NAME]
+    )
+
+    assert START_SESSION_TOOL_NAME not in _tool_names(groups)
+
+
+@pytest.mark.asyncio
+async def test_start_session_asks_the_client_for_the_calling_session(
+    tmp_path: Path,
+) -> None:
+    spawner = _FakeSpawner()
+    execute = _executor(tmp_path, "parent-session", session_spawner=spawner)
+
+    started = await execute(
+        _start_session(
+            "start",
+            prompt="Fix the flaky test",
+            title="Flaky test",
+            placement="new_worktree",
+        )
+    )
+
+    assert isinstance(started, RustToolSucceededEvent)
+    assert started.result.structured_content == {
+        "session_id": "spawned-1",
+        "title": "Flaky test",
+        "url": None,
+        "message": 'Started "Flaky test"',
+    }
+    [request] = spawner.requests
+    assert request.model_dump(exclude={"idempotency_key"}) == SessionSpawnParams(
+        parent_session_id="parent-session",
+        prompt="Fix the flaky test",
+        title="Flaky test",
+        checkout=SessionSpawnNewWorktree(),
+        idempotency_key="unused",
+        model=_PARENT_SETTINGS.model,
+        reasoning_effort=_PARENT_SETTINGS.reasoning_effort,
+        approval_policy=_PARENT_SETTINGS.approval_policy,
+    ).model_dump(exclude={"idempotency_key"})
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "checkout",
+    [
+        SessionSpawnManagedWorktree(path="/repo/.worktrees/parent"),
+        SessionSpawnDirectory(path="/repo-linked-checkout"),
+    ],
+)
+async def test_start_session_in_the_current_checkout_runs_where_the_caller_does(
+    tmp_path: Path, checkout: SessionSpawnCheckout
+) -> None:
+    spawner = _FakeSpawner()
+
+    def origin(_session_id: str) -> SessionSpawnOrigin:
+        return SessionSpawnOrigin(
+            checkout=checkout, settings=_PARENT_SETTINGS, models=_MODELS
+        )
+
+    started = await _executor(tmp_path, session_spawner=spawner, session_origin=origin)(
+        _start_session("start", prompt="Fix it", placement="current_checkout")
+    )
+
+    assert isinstance(started, RustToolSucceededEvent)
+    [request] = spawner.requests
+    assert request.checkout == checkout
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("asked", "sent"),
+    [
+        # Another model at its own default level: the parent's may not exist.
+        ({"model": "claude-opus-5"}, ("claude-opus-5", None)),
+        (
+            {"model": "claude-opus-5", "reasoning_effort": "max"},
+            ("claude-opus-5", "max"),
+        ),
+        # The parent's model keeps the parent's level unless told otherwise.
+        ({"model": "medium"}, ("medium", "low")),
+        ({"reasoning_effort": "high"}, ("medium", "high")),
+    ],
+)
+async def test_start_session_runs_on_the_model_the_user_asked_for(
+    tmp_path: Path, asked: dict[str, JsonValue], sent: tuple[str, str | None]
+) -> None:
+    spawner = _FakeSpawner()
+
+    started = await _executor(tmp_path, session_spawner=spawner)(
+        _start_session("start", prompt="Fix it", placement="new_worktree", **asked)
+    )
+
+    assert isinstance(started, RustToolSucceededEvent)
+    [request] = spawner.requests
+    assert (request.model, request.reasoning_effort) == sent
+    assert request.approval_policy == _PARENT_SETTINGS.approval_policy
+
+
+@pytest.mark.asyncio
+async def test_start_session_takes_a_catalog_alias_for_its_model(
+    tmp_path: Path,
+) -> None:
+    spawner = _FakeSpawner()
+
+    def origin(_session_id: str) -> SessionSpawnOrigin:
+        return SessionSpawnOrigin(
+            checkout=SessionSpawnManagedWorktree(path="/repo/.worktrees/parent"),
+            settings=_PARENT_SETTINGS,
+            models=_MODELS,
+            model_names={"opus-old": "claude-opus-5"},
+        )
+
+    started = await _executor(tmp_path, session_spawner=spawner, session_origin=origin)(
+        _start_session(
+            "start",
+            prompt="Fix it",
+            placement="new_worktree",
+            model="opus-old",
+            reasoning_effort="max",
+        )
+    )
+
+    assert isinstance(started, RustToolSucceededEvent)
+    [request] = spawner.requests
+    assert (request.model, request.reasoning_effort) == ("claude-opus-5", "max")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("asked", "reason"),
+    [
+        ({"model": "opus"}, "Pick one of: medium, claude-opus-5"),
+        (
+            {"model": "claude-opus-5", "reasoning_effort": "high"},
+            "Pick one of: off, max",
+        ),
+        ({"reasoning_effort": "max"}, "Pick one of: low, high"),
+        # The policy is always the parent's: a started session cannot widen it.
+        ({"approval_policy": "auto-approve"}, ""),
+    ],
+)
+async def test_start_session_refuses_a_setting_the_host_does_not_offer(
+    tmp_path: Path, asked: dict[str, JsonValue], reason: str
+) -> None:
+    spawner = _FakeSpawner()
+
+    rejected = await _executor(tmp_path, session_spawner=spawner)(
+        _start_session("start", prompt="Fix it", placement="new_worktree", **asked)
+    )
+
+    assert isinstance(rejected, RustToolFailedEvent)
+    assert reason in rejected.result.error.message
+    assert spawner.requests == []
+
+
+@pytest.mark.asyncio
+async def test_start_session_without_a_spawner_is_a_correctable_tool_failure(
+    tmp_path: Path,
+) -> None:
+    rejected = await _executor(tmp_path)(
+        _start_session("start", prompt="Fix it", placement="current_checkout")
+    )
+
+    assert isinstance(rejected, RustToolFailedEvent)
+    assert "not available" in rejected.result.error.message
+
+
+class _Turn:
+    """Counts the sessions a turn starts, as the adapter does."""
+
+    def __init__(self, *, started_by: str | None = None, starts: int = 0) -> None:
+        self.started_by = started_by
+        self.starts = starts
+
+    def origin(self, hops: int) -> SessionSpawnOrigin:
+        parent = _parent_in_a_managed_worktree("session-1")
+        return SessionSpawnOrigin(
+            checkout=parent.checkout,
+            settings=parent.settings,
+            hops=hops,
+            started_by=self.started_by,
+            turn_starts=self.starts,
+            count_turn_start=self.count,
+        )
+
+    def count(self, delta: int = 1) -> None:
+        self.starts += delta
+
+
+async def _start_from(
+    tmp_path: Path, spawner: _FakeSpawner, turn: _Turn, hops: int = 0
+) -> RustEvent:
+    return await _executor(
+        tmp_path, session_spawner=spawner, session_origin=lambda _id: turn.origin(hops)
+    )(_start_session("start", prompt="Fix it", placement="current_checkout"))
+
+
+@pytest.mark.asyncio
+async def test_a_session_another_one_started_cannot_start_sessions(
+    tmp_path: Path,
+) -> None:
+    """*Prepare*: A session the user started, and one another session started.
+    *Do*: Call start_session from each.
+    *Assert*: The user's session starts one; the other fails back to the model
+    with a reason the client can read, without reaching the client.
+    """
+    spawner = _FakeSpawner()
+
+    allowed = await _start_from(tmp_path, spawner, _Turn())
+    refused = await _start_from(tmp_path, spawner, _Turn(started_by="parent-1"))
+
+    assert isinstance(allowed, RustToolSucceededEvent)
+    assert isinstance(refused, RustToolFailedEvent)
+    assert "Do the task here" in refused.result.error.message
+    assert refused.result.error.details == {"reason": "session_depth"}
+    assert len(spawner.requests) == 1
+
+
+@pytest.mark.asyncio
+async def test_a_turn_starts_no_more_sessions_than_the_cap(tmp_path: Path) -> None:
+    """*Prepare*: A turn one start short of the cap, whose client takes a
+        while to create each session.
+    *Do*: Call start_session twice at once.
+    *Assert*: The first counts before it reaches the client, so the second is
+    refused at the cap with a reason the client can read.
+    """
+    release = asyncio.Event()
+
+    async def slow(params: SessionSpawnParams) -> SessionSpawnResponse:
+        await release.wait()
+        return SessionSpawnResponse(session_id="spawned-1", title=params.title)
+
+    spawner = _FakeSpawner(slow)
+    turn = _Turn(starts=MAX_TURN_STARTED_SESSIONS - 1)
+    first = asyncio.ensure_future(_start_from(tmp_path, spawner, turn))
+    await asyncio.sleep(0.05)
+    second = await _start_from(tmp_path, spawner, turn)
+    release.set()
+
+    assert isinstance(await first, RustToolSucceededEvent)
+    assert isinstance(second, RustToolFailedEvent)
+    assert "Do the rest of the work here" in second.result.error.message
+    assert second.result.error.details == {"reason": "started_sessions"}
+    assert len(spawner.requests) == 1
+
+
+@pytest.mark.asyncio
+async def test_a_start_the_client_refuses_does_not_count_against_the_turn(
+    tmp_path: Path,
+) -> None:
+    """*Prepare*: A turn at its last start.
+    *Do*: The client refuses one start, then accepts the next.
+    *Assert*: The refused start gave its slot back, so the next one goes out.
+    """
+    answers = iter(["refuse", "accept"])
+
+    async def answer(params: SessionSpawnParams) -> SessionSpawnResponse:
+        if next(answers) == "refuse":
+            raise SessionSpawnError("Could not check whether sessions may start.")
+        return SessionSpawnResponse(session_id="spawned-1", title=params.title)
+
+    spawner = _FakeSpawner(answer)
+    turn = _Turn(starts=MAX_TURN_STARTED_SESSIONS - 1)
+
+    refused = await _start_from(tmp_path, spawner, turn)
+    started = await _start_from(tmp_path, spawner, turn)
+
+    assert isinstance(refused, RustToolFailedEvent)
+    assert isinstance(started, RustToolSucceededEvent)
+    assert turn.starts == MAX_TURN_STARTED_SESSIONS
+
+
+@pytest.mark.asyncio
+async def test_a_failure_carries_only_a_session_limit_as_its_reason(
+    tmp_path: Path,
+) -> None:
+    """An OSError such as ``URLError`` has a ``reason`` of its own, which is no
+    session limit for a client to read.
+    """
+
+    async def unreachable(_params: SessionSpawnParams) -> SessionSpawnResponse:
+        raise URLError("no route to host")
+
+    failed = await _start_from(tmp_path, _FakeSpawner(unreachable), _Turn())
+
+    assert isinstance(failed, RustToolFailedEvent)
+    assert failed.result.error.details is None
+
+
+@pytest.mark.asyncio
+async def test_a_started_session_carries_one_hop_more_than_its_starter(
+    tmp_path: Path,
+) -> None:
+    """*Prepare*: A session in a turn another session's message started, and
+    one at the hop limit.
+    *Do*: Call start_session from each.
+    *Assert*: The first hands the new session one hop more; the one at the
+    limit is refused, so starting sessions cannot extend a loop of messages.
+    """
+    spawner = _FakeSpawner()
+
+    allowed = await _start_from(tmp_path, spawner, _Turn(), hops=2)
+    refused = await _start_from(tmp_path, spawner, _Turn(), hops=MAX_SESSION_HOPS)
+
+    assert isinstance(allowed, RustToolSucceededEvent)
+    assert [request.hops for request in spawner.requests] == [3]
+    assert isinstance(refused, RustToolFailedEvent)
+    assert refused.result.error.details == {"reason": "session_hops"}
+
+
+@pytest.mark.asyncio
+async def test_a_client_refusal_reaches_the_model(tmp_path: Path) -> None:
+    async def refuse(_params: SessionSpawnParams) -> SessionSpawnResponse:
+        raise SessionSpawnError("The project is not linked on this computer")
+
+    execute = _executor(tmp_path, session_spawner=_FakeSpawner(refuse))
+    rejected = await execute(
+        _start_session(
+            "start", prompt="Fix it", title="Fix", placement="current_checkout"
+        )
+    )
+
+    assert isinstance(rejected, RustToolFailedEvent)
+    assert "not linked on this computer" in rejected.result.error.message
+
+
+@pytest.mark.asyncio
+async def test_an_invalid_placement_fails_without_asking_the_client(
+    tmp_path: Path,
+) -> None:
+    spawner = _FakeSpawner()
+    execute = _executor(tmp_path, session_spawner=spawner)
+
+    rejected = await execute(
+        _start_session(
+            "start", prompt="Fix it", title="Fix", placement="somewhere_else"
+        )
+    )
+
+    assert isinstance(rejected, RustToolFailedEvent)
+    assert spawner.requests == []
+
+
+@pytest.mark.asyncio
+async def test_a_spawn_the_client_never_answers_times_out(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr("vibe.app_server._session_spawn.SPAWN_TIMEOUT_SECONDS", 0.01)
+
+    async def never(_params: SessionSpawnParams) -> SessionSpawnResponse:
+        await asyncio.Event().wait()
+        raise AssertionError("unreachable")
+
+    execute = _executor(tmp_path, session_spawner=_FakeSpawner(never))
+    rejected = await execute(
+        _start_session("start", prompt="Fix it", title="Fix", placement="new_worktree")
+    )
+
+    assert isinstance(rejected, RustToolFailedEvent)
+    assert "may or may not have started" in rejected.result.error.message
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("permission", "decision"), [(None, "ask"), ("always", "allow"), ("never", "deny")]
+)
+async def test_start_session_asks_for_approval_by_default(
+    tmp_path: Path, permission: str | None, decision: str
+) -> None:
+    config = build_test_vibe_config(
+        tools={}
+        if permission is None
+        else {START_SESSION_TOOL_NAME: {"permission": permission}}
+    )
+    orchestrator = FakeConfigOrchestrator(config)
+    store = PermissionStore()
+    manager = ToolManager(
+        lambda: orchestrator.config,
+        defer_mcp=True,
+        cwd=tmp_path,
+        harness_files=HarnessFilesManager().for_session(tmp_path),
+        permission_getter=store.get_tool_permission,
+    )
+    resolver = UnifiedPermissionResolver(manager, store, orchestrator)
+    resolver.provided_names.register(VIBE_TOOL_GROUP, VIBE_PROVIDED_TOOL_NAMES)
+
+    assert VIBE_PROVIDED_TOOL_MODES[START_SESSION_TOOL_NAME] == "ask"
+    outcome = await resolver.resolve(
+        f"{VIBE_TOOL_GROUP}.{START_SESSION_TOOL_NAME}",
+        {"prompt": "Fix it", "placement": "new_worktree"},
+    )
+    assert outcome.decision == decision
+
+
+@pytest.mark.asyncio
+async def test_start_session_names_the_session_by_its_title_and_link(
+    tmp_path: Path,
+) -> None:
+    async def linked(params: SessionSpawnParams) -> SessionSpawnResponse:
+        # The client may not manage to set the title; the requested one stands.
+        return SessionSpawnResponse(session_id="spawned-1", url="/code/p/spawned-1")
+
+    execute = _executor(tmp_path, session_spawner=_FakeSpawner(linked))
+    started = await execute(
+        _start_session(
+            "start", prompt="Review #64565", title="Review", placement="new_worktree"
+        )
+    )
+
+    assert isinstance(started, RustToolSucceededEvent)
+    assert started.result.structured_content == {
+        "session_id": "spawned-1",
+        "title": "Review",
+        "url": "/code/p/spawned-1",
+        "message": "Started [Review](/code/p/spawned-1)",
+    }
+
+
+@pytest.mark.asyncio
+async def test_start_session_names_the_session_by_the_clients_id(
+    tmp_path: Path,
+) -> None:
+    """The id the client's session tools take, which the app server's own id
+    stops matching after a handoff.
+    """
+
+    async def hosted(params: SessionSpawnParams) -> SessionSpawnResponse:
+        return SessionSpawnResponse(
+            session_id="app-server-1", client_session_id="code-session-1"
+        )
+
+    execute = _executor(tmp_path, session_spawner=_FakeSpawner(hosted))
+    started = await execute(
+        _start_session("start", prompt="Fix it", placement="new_worktree")
+    )
+
+    assert isinstance(started, RustToolSucceededEvent)
+    assert isinstance(started.result.structured_content, dict)
+    assert started.result.structured_content["session_id"] == "code-session-1"
+
+
+@pytest.mark.asyncio
+async def test_a_title_with_brackets_keeps_the_link_whole(tmp_path: Path) -> None:
+    async def linked(_params: SessionSpawnParams) -> SessionSpawnResponse:
+        return SessionSpawnResponse(session_id="spawned-1", url="/code/p/spawned-1")
+
+    execute = _executor(tmp_path, session_spawner=_FakeSpawner(linked))
+    started = await execute(
+        _start_session(
+            "start", prompt="Fix it", title="Fix [auth] retry", placement="new_worktree"
+        )
+    )
+
+    assert isinstance(started, RustToolSucceededEvent)
+    assert started.result.structured_content == {
+        "session_id": "spawned-1",
+        "title": "Fix [auth] retry",
+        "url": "/code/p/spawned-1",
+        "message": r"Started [Fix \[auth\] retry](/code/p/spawned-1)",
+    }
+
+
+@pytest.mark.asyncio
+async def test_an_unnamed_session_is_left_to_name_itself(tmp_path: Path) -> None:
+    async def untitled(_params: SessionSpawnParams) -> SessionSpawnResponse:
+        return SessionSpawnResponse(session_id="spawned-1", url="/code/p/spawned-1")
+
+    spawner = _FakeSpawner(untitled)
+    execute = _executor(tmp_path, session_spawner=spawner)
+
+    started = await execute(
+        _start_session("start", prompt="Fix it", placement="new_worktree")
+    )
+
+    assert isinstance(started, RustToolSucceededEvent)
+    assert spawner.requests[0].title is None
+    assert started.result.structured_content == {
+        "session_id": "spawned-1",
+        "title": None,
+        "url": "/code/p/spawned-1",
+        "message": "Started [the new session](/code/p/spawned-1)",
+    }
+
+
+@pytest.mark.asyncio
+async def test_running_the_same_call_again_asks_for_the_same_session(
+    tmp_path: Path,
+) -> None:
+    spawner = _FakeSpawner()
+    execute = _executor(tmp_path, "parent-session", session_spawner=spawner)
+
+    for action_id in ("start-1", "start-1", "start-2"):
+        await execute(
+            _start_session(action_id, prompt="Fix it", placement="new_worktree")
+        )
+
+    first, replayed, other = (request.idempotency_key for request in spawner.requests)
+    assert first == replayed
+    assert other != first

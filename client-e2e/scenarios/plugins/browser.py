@@ -31,4 +31,4 @@ timeline: Timeline = [
     _ESCAPE,
 ]
 
-screen_contains = {"rust": ("Plugins opened...", "Plugins closed.")}
+screen_excludes = ("Search plugins", "Plugins closed.")

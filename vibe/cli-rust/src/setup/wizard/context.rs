@@ -1,6 +1,6 @@
-//! Provider/config resolution for onboarding (Python `OnboardingContext`):
-//! seeded from the server's resolved view (`setup/status`), never from raw
-//! config.toml — the server owns the read side too.
+//! Provider/config resolution for onboarding: seeded from the server's
+//! resolved view (`setup/status`), never from raw config.toml — the server
+//! owns the read side too.
 
 use crate::setup::auth::rpc::{ProviderView, SetupStatus};
 
@@ -35,8 +35,16 @@ pub struct OnboardingContext {
     /// The server's own browser-sign-in answer (`SetupStatus`), not a
     /// client-side guess: it also weighs the provider's backend.
     pub supports_browser_sign_in: bool,
+    pub oidc_enabled: bool,
     /// The server-resolved TLS trust flag (ADR 0015).
     pub enable_system_trust_store: bool,
+    /// The administrator-pinned console URL (`VIBE_CUSTOM_CONSOLE_URL`), when
+    /// the server resolved one: sign-in locks to it and the domain cannot be
+    /// modified.
+    pub pinned_console_url: Option<String>,
+    /// The provider's key env var when the shell sets it: it overrides any
+    /// key setup saves, so the sign-in target screen warns.
+    pub shell_key_override: Option<String>,
 }
 
 impl Default for OnboardingContext {
@@ -47,16 +55,24 @@ impl Default for OnboardingContext {
             console_base_url: DEFAULT_CONSOLE_BASE_URL.into(),
             theme: "auto".into(),
             supports_browser_sign_in: true,
+            oidc_enabled: false,
             enable_system_trust_store: false,
+            pinned_console_url: None,
+            shell_key_override: None,
         }
     }
 }
 
 impl OnboardingContext {
+    /// OIDC follows the explicit Mistral AI target, independently of inference.
+    pub fn uses_oidc(&self, default_target: bool) -> bool {
+        self.oidc_enabled && default_target && self.pinned_console_url.is_none()
+    }
+
     /// Seed from the server's resolved view (`setup/status`); the server
     /// already applied the config layering, so the only client-side
-    /// override left is `VIBE_THEME`, which Python's context applies over
-    /// the injected schema too (env wins over config).
+    /// override left is `VIBE_THEME`, applied over the injected schema too
+    /// (env wins over config).
     pub fn from_status(status: &SetupStatus) -> Self {
         let theme = std::env::var("VIBE_THEME")
             .ok()
@@ -68,24 +84,35 @@ impl OnboardingContext {
             console_base_url: status.console_base_url.clone(),
             theme,
             supports_browser_sign_in: status.supports_browser_sign_in,
+            oidc_enabled: status.oidc_enabled,
             enable_system_trust_store: status.enable_system_trust_store,
+            pinned_console_url: status.pinned_console_url.clone(),
+            shell_key_override: shell_override_env_var(
+                status.active_credential_source.as_deref(),
+                &status.provider,
+            ),
         }
     }
 }
 
-/// Whether the wizard still holds the launch snapshot (Python
-/// `persist_credentials`' early return): provider, console, and vibe URL
-/// all equal what the server resolved before the wizard opened, so no
-/// on-prem tenant resolution could add information.
+/// The provider's key env var when the shell sets it: `process_env` means
+/// the shell key shadows any key the wizard saves for that provider.
+pub fn shell_override_env_var(source: Option<&str>, provider: &ProviderView) -> Option<String> {
+    (source == Some("process_env")).then(|| provider.api_key_env_var.clone())
+}
+
+/// Whether the wizard still holds the launch snapshot: provider, console,
+/// and vibe URL all equal what the server resolved before the wizard opened,
+/// so no on-prem tenant resolution could add information.
 pub fn matches_launch_snapshot(context: &OnboardingContext, snapshot: &OnboardingContext) -> bool {
     context.provider == snapshot.provider
         && context.console_base_url == snapshot.console_base_url
         && context.vibe_base_url == snapshot.vibe_base_url
 }
 
-/// Validate a custom domain URL (Python `is_valid_custom_domain`): reject a
-/// broken scheme separator, upgrade scheme-less input to `https://`, then
-/// require an http/https URL with a host (pydantic's `HttpUrl`).
+/// Validate a custom domain URL: reject a broken scheme separator, upgrade
+/// scheme-less input to `https://`, then require an http/https URL with a
+/// host (pydantic's `HttpUrl`).
 pub fn is_valid_custom_domain(value: &str) -> bool {
     let origin = value.trim();
     if origin.is_empty() {
@@ -108,8 +135,7 @@ pub fn is_valid_custom_domain(value: &str) -> bool {
 }
 
 /// Resolve browser auth URLs from a domain plus its optional split-horizon
-/// API base (Python `resolve_browser_auth_urls`): the API base defaults to
-/// the browser base's own `/api`.
+/// API base: the API base defaults to the browser base's own `/api`.
 pub fn resolve_browser_auth_urls(domain: &str, api_base_url: Option<&str>) -> (String, String) {
     let base = normalize_origin(domain);
     let api = match api_base_url {
@@ -119,13 +145,13 @@ pub fn resolve_browser_auth_urls(domain: &str, api_base_url: Option<&str>) -> (S
     (base, api)
 }
 
-/// Whether the sign-in URLs cross origins (Python `browser_auth_requires_origin_rewrite`).
+/// Whether the sign-in URLs cross origins.
 pub fn browser_auth_requires_origin_rewrite(browser_base_url: &str, api_base_url: &str) -> bool {
     origin_key(browser_base_url) != origin_key(api_base_url)
 }
 
-/// The CLI-reachable base for account calls (Python `browser_auth_account_base`):
-/// the API base's origin in a split-horizon setup, the browser base otherwise.
+/// The CLI-reachable base for account calls: the API base's origin in a
+/// split-horizon setup, the browser base otherwise.
 pub fn browser_auth_account_base(browser_base_url: &str, api_base_url: Option<&str>) -> String {
     let browser_base = normalize_origin(browser_base_url);
     let Some(api) = api_base_url else {
@@ -145,7 +171,7 @@ pub fn browser_auth_account_base(browser_base_url: &str, api_base_url: Option<&s
 }
 
 /// Heuristic: a Mistral-hosted private-cloud subdomain that is not the default
-/// auth host (Python `is_likely_mistral_private_cloud_domain`).
+/// auth host.
 pub fn is_likely_mistral_private_cloud_domain(domain: &str) -> bool {
     let Ok(parsed) = url::Url::parse(&normalize_origin(domain)) else {
         return false;
@@ -156,9 +182,9 @@ pub fn is_likely_mistral_private_cloud_domain(domain: &str) -> bool {
     host != "console.mistral.ai" && host.starts_with("console.") && host.ends_with(".mistral.ai")
 }
 
-/// The configured custom domain to seed the input with (Python
-/// `configured_custom_domain`): a non-default browser auth base. An absent
-/// URL is the wizard's "no browser sign-in" state.
+/// The configured custom domain to seed the input with: a non-default
+/// browser auth base. An absent URL is the wizard's "no browser sign-in"
+/// state.
 pub fn configured_custom_domain(provider: &ProviderView) -> Option<String> {
     let base = provider
         .browser_auth_base_url
@@ -170,8 +196,8 @@ pub fn configured_custom_domain(provider: &ProviderView) -> Option<String> {
     Some(base.to_owned())
 }
 
-/// The configured split-horizon API base to seed the input with (Python
-/// `configured_custom_api_base`): only a distinct cross-origin API base.
+/// The configured split-horizon API base to seed the input with: only a
+/// distinct cross-origin API base.
 pub fn configured_custom_api_base(provider: &ProviderView) -> Option<String> {
     let base = provider
         .browser_auth_base_url
@@ -188,6 +214,16 @@ pub fn configured_custom_api_base(provider: &ProviderView) -> Option<String> {
         return None;
     }
     Some(api.to_owned())
+}
+
+/// The configured split-horizon API base belonging to the admin-pinned
+/// console: the pin fixes the browser sign-in host and must not clobber an
+/// API base configured for the same deployment. Only returned when the
+/// configured browser base normalizes to the pin.
+pub fn pinned_console_api_base(provider: &ProviderView, pin: &str) -> Option<String> {
+    let browser_base = provider.browser_auth_base_url.as_deref()?;
+    let api_base = provider.browser_auth_api_base_url.as_deref()?;
+    (normalize_origin(browser_base) == pin).then(|| api_base.to_owned())
 }
 
 /// (scheme, host, normalized port) — the origin identity two URLs share or not.

@@ -43,8 +43,7 @@ pub enum RoundsOutcome {
     ExitFailure,
 }
 
-/// `--setup`'s session-less round (Python `require_api_key_or_onboard`
-/// with `force`): the wizard owns the screen from its first paint while
+/// `--setup`'s session-less, forced round: the wizard owns the screen from its first paint while
 /// the boot (spawn, initialize, `setup/status`) overlaps behind the
 /// welcome screen — the flow's welcome gate holds the theme transition
 /// until the status lands, so the seed still precedes every choice. The
@@ -64,18 +63,17 @@ pub async fn setup_round(
     // A joined future, not a spawned task: the spawn mark records into
     // `timings`, whose borrow cannot cross a task boundary.
     let boot = async {
-        let (client, child, _notifications, _crash_rx) = match Client::spawn(launch.clone()).await {
+        let (client, child, mut notifs, _crash_rx) = match Client::spawn(launch.clone()).await {
             Ok(spawned) => spawned,
             Err(error) => {
-                // The Sentry bridge only carries ERROR records, so the
-                // startup window's own failure sites log their own fatal
-                // errors.
-                tracing::error!(vibe_boundary = "startup", fatal = true, "{error:#}");
+                crate::startup::failure::log_spawn(&error);
                 let _ = boot_tx.send(SetupBoot::Spawn(error.context("spawn app-server")));
                 return None;
             }
         };
         timings.record("child_spawned");
+        // A dropped receiver would stop the reader on the first server notification.
+        crate::work::spawn_daemon(async move { while notifs.recv().await.is_some() {} });
         let client = Arc::new(client);
         let _ = child_tx.send(child);
         // A failed initialize leaves no setup surface to fall back to, so
@@ -99,7 +97,10 @@ pub async fn setup_round(
         Some(client)
     };
     tokio::pin!(boot);
-    let mut wizard = OnboardingState::default();
+    let mut wizard = OnboardingState {
+        offers_provider_choice: true,
+        ..OnboardingState::default()
+    };
     let round = run_setup_round(
         terminal,
         app,
@@ -191,8 +192,7 @@ fn guard_exit(
     RoundsOutcome::ExitFailure
 }
 
-/// Flush and fold one round exit into the entrypoint's outcome (Python
-/// prints and exits inside `run_onboarding`'s caller).
+/// Flush and fold one round exit into the entrypoint's outcome.
 fn round_exit(
     code: std::process::ExitCode,
     history_flush: &std::sync::Arc<Persister>,
@@ -205,8 +205,8 @@ fn round_exit(
     }
 }
 
-/// Drive the constructed loop to its end (the entrypoint's half of Python's
-/// `run_textual_ui` caller): the worktree replay folds first — its buffered
+/// Drive the constructed loop to its end (the entrypoint's half): the
+/// worktree replay folds first — its buffered
 /// missing-key verdict raises the same exit as the live ready stream — and
 /// every `NeedsOnboarding` runs the pre-session wizard round, then re-enters
 /// the loop on the round's child with the stale replay dropped.

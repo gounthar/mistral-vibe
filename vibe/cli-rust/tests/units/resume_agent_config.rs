@@ -1,5 +1,4 @@
-//! `session/resume` keeps the interactive flags, mirroring the Python
-//! `SessionOptions` sent on both start and resume (cli.py).
+//! `session/resume` keeps the interactive flags sent on `session/start`.
 
 use clap::Parser;
 use vibe_rs::cli::Cli;
@@ -13,7 +12,7 @@ fn resume_carries_interactive_flags() {
         "--resume",
         "session-1",
         "--agent",
-        "plan",
+        "ask",
         "--yolo",
         "--trust",
         "--add-dir",
@@ -24,14 +23,14 @@ fn resume_carries_interactive_flags() {
         "web_search",
     ]);
     let config = cli
-        .interactive_agent_config(Some("/work".into()), None)
+        .interactive_agent_config(Some("/work".into()), None, None)
         .unwrap();
     let params = resume_params("session-1", &config);
 
     assert_eq!(params["sessionId"], "session-1");
     assert_eq!(params["historyLimit"], HISTORY_LIMIT);
     assert_eq!(params["agentConfig"]["cwd"], "/work");
-    assert_eq!(params["agentConfig"]["agent"], "plan");
+    assert_eq!(params["agentConfig"]["agent"], "ask");
     assert_eq!(params["agentConfig"]["autoApprove"], true);
     assert_eq!(
         params["agentConfig"]["enabledTools"],
@@ -53,11 +52,11 @@ fn resume_carries_interactive_flags() {
 fn resume_defaults_stay_slim() {
     let cli = Cli::parse_from(["vibe-rs", "--resume", "session-1"]);
     let config = cli
-        .interactive_agent_config(Some("/work".into()), None)
+        .interactive_agent_config(Some("/work".into()), None, None)
         .unwrap();
     let params = resume_params("session-1", &config);
 
-    // Defaults are skipped, matching the Python wire shape.
+    // Defaults are skipped, matching the server's wire shape.
     assert_eq!(params["agentConfig"]["agent"], serde_json::Value::Null);
     assert!(!params["agentConfig"]
         .as_object()

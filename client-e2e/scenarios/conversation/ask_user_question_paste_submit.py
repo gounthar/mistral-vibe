@@ -13,12 +13,10 @@ from e2e.app_server.events import (
 )
 from e2e.app_server.scenario import Timeline
 
-env = {"VIBE_REPLAY_SETTLE_BUSY": "1", "VIBE_TYPING_GRACE_PERIOD_MS": "0"}
+env = {"VIBE_TYPING_GRACE_PERIOD_MS": "0"}
 handshake = {"callback/result": {"accepted": True}}
-capture_startup = False
-capture_steps = {1, 2, 3, 4, 5, 6, 7}
 request_methods = {"callback/result"}
-screen_excludes = {"rust": ("Junk answer",), "python": ("Junk answer",)}
+screen_excludes = ("Junk answer",)
 
 _QUESTION = "Which database should we use for this project?"
 _QUESTIONS = [
@@ -63,6 +61,3 @@ timeline: Timeline = [
     paste("SQLite Enterprise\nwith WAL"),
     "\r",
 ]
-
-# Each key must land on a settled UI: batching changes the outcome here.
-settle_per_key = True

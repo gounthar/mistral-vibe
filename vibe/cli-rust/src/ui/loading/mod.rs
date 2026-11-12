@@ -1,9 +1,12 @@
 //! Loading area: a spinner, gradient status label, and key hints.
 
+pub mod failure;
 mod hint;
 mod snake;
 
-use std::time::{Duration, Instant};
+use std::time::Duration;
+
+use crate::clock::UiInstant;
 
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
@@ -18,11 +21,13 @@ use crate::app::{App, Status};
 pub const DEFAULT_LOADING_STATUS: &str = "Generating";
 pub const THINKING_LOADING_STATUS: &str = "Thinking";
 pub const INITIALIZING_LOADING_STATUS: &str = "Initializing";
-/// Label while a turn retries after a transient failure (Python `set_retrying`).
+/// Label while a turn retries after a transient failure.
 pub const RETRYING_LOADING_STATUS: &str = "Retrying";
 /// Label for a slash command fetching in the background (`/whoami`).
 pub const COMMAND_LOADING_STATUS: &str = "Loading";
 pub const SHELL_LOADING_STATUS: &str = "Running command";
+/// Still glyph in place of the spinner while the agent only waits.
+const WAITING_GLYPH: &str = "◷";
 
 /// Spinner glyph + label gradient state, recreated at the start of each turn.
 pub struct LoadingAnim {
@@ -36,7 +41,7 @@ pub struct LoadingAnim {
     /// Elapsed time already accumulated before the current pause.
     paused_total: Duration,
     /// When the elapsed counter was paused, or `None` while it runs.
-    pause_start: Option<Instant>,
+    pause_start: Option<UiInstant>,
     /// Index into `theme::LOADING_GRADIENT` of the current base color.
     color_index: usize,
     /// Wipe direction through the palette: +1 up, -1 down. Ping-pongs at the ends.
@@ -82,7 +87,7 @@ impl LoadingAnim {
     pub fn begin_action_required(&mut self, label: &str) {
         if self.action_required.is_none() {
             self.label_before_action_required = Some(self.label.clone());
-            self.pause_start = Some(Instant::now());
+            self.pause_start = Some(crate::clock::now());
         }
         self.action_required = Some(label.to_owned());
         self.label = label.to_owned();
@@ -94,7 +99,7 @@ impl LoadingAnim {
             return;
         }
         if let Some(pause_start) = self.pause_start.take() {
-            self.paused_total += pause_start.elapsed();
+            self.paused_total += crate::clock::since(pause_start);
         }
         self.label = self
             .label_before_action_required
@@ -103,10 +108,10 @@ impl LoadingAnim {
     }
 
     /// Turn elapsed time, excluding whatever a blocking callback froze.
-    fn elapsed(&self, since: Instant) -> Duration {
+    fn elapsed(&self, since: UiInstant) -> Duration {
         let running = match self.pause_start {
             Some(pause_start) => pause_start.duration_since(since),
-            None => since.elapsed(),
+            None => crate::clock::since(since),
         };
         running.saturating_sub(self.paused_total)
     }
@@ -157,7 +162,7 @@ pub fn draw(app: &App, f: &mut Frame, area: Rect) {
         ..area
     };
 
-    // Python hides the main loading widget while a subagent is viewed and
+    // The main loading row is hidden while a subagent is viewed, which
     // shows the subagent's own status instead (Running / Waiting for input).
     if let Some(child) = app.subagents.viewed_child() {
         if let Some(status) = crate::subagents::subagent_loading_status(child.status) {
@@ -175,30 +180,14 @@ pub fn draw(app: &App, f: &mut Frame, area: Rect) {
         return;
     }
 
-    // A crashed app server lands in `Failed`; its transcript notice explains
-    // the failure, so the startup-error line stays out of the way.
-    if app.session.status == Status::Failed && !app.server_closed {
-        let message = app
-            .session
-            .startup_error
-            .as_deref()
-            .unwrap_or("unknown error");
-        f.render_widget(
-            Line::from(Span::styled(
-                format!(" Failed to initialize: {message}"),
-                Style::default().fg(theme::error()),
-            )),
-            content,
-        );
+    if failure::draw(app, f, area) {
         return;
     }
-    let teleport_since = crate::teleport::loading_since(app);
     // Queue mode's own keys replace every other hint for exactly as long as it lasts.
     let queue_hints = crate::input::composer_reachable(app)
         .then(|| crate::message_queue::mode_hints(app))
         .flatten();
     if !app.view.command_loading
-        && teleport_since.is_none()
         && !matches!(
             app.session.status,
             Status::Starting | Status::Generating { .. }
@@ -211,26 +200,41 @@ pub fn draw(app: &App, f: &mut Frame, area: Rect) {
         }
         return;
     }
-    // `--resume` goes straight to its picker; the engine still coming up behind
-    // it is not something the user is waiting on.
-    if app.session.status == Status::Starting && app.startup_picker_active() {
-        return;
-    }
-
     let anim = &app.view.loading;
-    let color = |pos: usize| Style::default().fg(anim.color_at(pos));
-
-    let mut spans: Vec<Span> = Vec::new();
-
-    // Snake spinner glyph + gap.
-    spans.push(Span::styled(anim.snake.render(), color(0)));
-    spans.push(Span::raw(" "));
-
-    // Label, one color-cycled span per character, then the trailing "… ".
-    for (i, ch) in anim.label.chars().enumerate() {
-        spans.push(Span::styled(ch.to_string(), color(1 + i)));
-    }
-    spans.push(Span::styled("… ", color(1 + anim.label.chars().count())));
+    // An agent that only waits for its background work gets a still, grey line
+    // naming what it waits for. A program's sleep keeps the spinner: a message
+    // waits for the program to end.
+    let waiting = app.session.shell_operation_id.is_none()
+        && app
+            .session
+            .active_turn_id
+            .as_deref()
+            .is_some_and(|turn| app.view.transcript.only_model_waiting(turn));
+    let mut spans: Vec<Span> = match waiting {
+        true => {
+            let label = app.session.wait_target.as_deref().map_or_else(
+                || anim.label.clone(),
+                |target| format!("Waiting for {target}"),
+            );
+            let muted = theme::muted_style();
+            vec![
+                Span::styled(WAITING_GLYPH, muted),
+                Span::raw(" "),
+                Span::styled(format!("{label}… "), muted),
+            ]
+        }
+        false => {
+            let color = |pos: usize| Style::default().fg(anim.color_at(pos));
+            // Snake spinner glyph + gap, then the label one color-cycled span per
+            // character, then the trailing "… ".
+            let mut spans = vec![Span::styled(anim.snake.render(), color(0)), Span::raw(" ")];
+            for (i, ch) in anim.label.chars().enumerate() {
+                spans.push(Span::styled(ch.to_string(), color(1 + i)));
+            }
+            spans.push(Span::styled("… ", color(1 + anim.label.chars().count())));
+            spans
+        }
+    };
 
     // Background slash commands have no timer or controls; manual shell commands do.
     // Startup keeps queue cancellation available without offering turn interruption.
@@ -250,7 +254,7 @@ pub fn draw(app: &App, f: &mut Frame, area: Rect) {
     let elapsed = match (app.session.shell_started_at, app.session.status) {
         (Some(since), _) => anim.elapsed(since),
         (None, Status::Generating { since }) => anim.elapsed(since),
-        _ => teleport_since.map_or_else(Duration::default, |since| anim.elapsed(since)),
+        _ => Duration::default(),
     };
     let hints = queue_hints.map_or_else(|| hint::running(app), <[_]>::to_vec);
     hint::push(
@@ -258,9 +262,17 @@ pub fn draw(app: &App, f: &mut Frame, area: Rect) {
         format!("{} ", format_elapsed(elapsed.as_secs())),
         &hints,
     );
+    // A message reaches an agent that only waits at once: say so after the controls.
+    if waiting && !app.queue.paused && crate::input::composer_reachable(app) {
+        spans.push(Span::styled(
+            // A message reaches the agent at once: sending one steers it.
+            format!(" · send a message to {}", crate::hints::action::STEER),
+            crate::ui::hint_line::action_style(),
+        ));
+    }
 
-    // A callback is waiting for the user to stop typing (Python `.loading-debounce`).
-    if app.question_app.pending.is_some()
+    // A callback is waiting for the user to stop typing.
+    if crate::question_app::waiting(app)
         || (app.approval.active.is_none() && app.approval.has_pending())
     {
         spans.push(Span::styled(
@@ -272,7 +284,7 @@ pub fn draw(app: &App, f: &mut Frame, area: Rect) {
     f.render_widget(Line::from(spans), content);
 }
 
-/// Mirrors Python `_format_elapsed`: `Ns`, then `NmNs`, then `NhNmNs`.
+/// `Ns`, then `NmNs`, then `NhNmNs`.
 fn format_elapsed(seconds: u64) -> String {
     if seconds < 60 {
         return format!("{seconds}s");
@@ -284,3 +296,6 @@ fn format_elapsed(seconds: u64) -> String {
     let (hours, mins) = (minutes / 60, minutes % 60);
     format!("{hours}h{mins}m{secs}s")
 }
+
+#[cfg(test)]
+mod tests;

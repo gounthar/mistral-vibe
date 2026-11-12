@@ -5,6 +5,11 @@ from __future__ import annotations
 from mistralai_vibe_local_harness.vibe._completion import (
     INVALID_API_KEY_MESSAGE,
     invalid_api_key_message,
+    sent_reasoning,
+)
+from mistralai_vibe_local_harness.vibe._completion_budget import (
+    CompletionPricing,
+    SharedCompletionBudget,
 )
 from mistralai_vibe_local_harness.vibe._connector_gateway import ConnectorGatewayClient
 from mistralai_vibe_local_harness.vibe._connector_models import (
@@ -46,6 +51,7 @@ from mistralai_vibe_local_harness.vibe._errors import (
     HarnessCallbackConflictError,
     HarnessCallbackNotFoundError,
     HarnessCommandConflictError,
+    HarnessConfigurationRejectedError,
     HarnessContextCompactionError,
     HarnessForkActiveTurnError,
     HarnessForkEntryNotFoundError,
@@ -67,6 +73,11 @@ from mistralai_vibe_local_harness.vibe._errors import (
     HarnessTurnQueuePendingError,
     HarnessUnfinishedMigrationError,
 )
+from mistralai_vibe_local_harness.vibe._file_tools import FILE_SYSTEM
+from mistralai_vibe_local_harness.vibe._foreign_hooks import (
+    HookProcess,
+    HookProcessResolver,
+)
 from mistralai_vibe_local_harness.vibe._hook_config import (
     CompiledHooks,
     ForeignHookDefinition,
@@ -74,6 +85,7 @@ from mistralai_vibe_local_harness.vibe._hook_config import (
 )
 from mistralai_vibe_local_harness.vibe._hook_matcher import tool_catalog_for_config
 from mistralai_vibe_local_harness.vibe._host import (
+    ExternalCommittedHistory,
     HarnessSessionDeleteResult,
     HarnessSessionForkResult,
     HarnessSessionListItem,
@@ -88,7 +100,9 @@ from mistralai_vibe_local_harness.vibe._host import (
 )
 from mistralai_vibe_local_harness.vibe._local_actions import (
     CLASSIFICATION_EVENT_TYPE,
+    AcceptOrRetryPostAgentHandler,
     ApprovalGrant,
+    HookAgentIdentity,
     HookApprovalCallback,
     HookContext,
     HookHandlers,
@@ -101,6 +115,7 @@ from mistralai_vibe_local_harness.vibe._local_actions import (
     ProvidedToolExecutorFactory,
 )
 from mistralai_vibe_local_harness.vibe._mcp_models import (
+    MCP_DISCOVERY_PENDING,
     MCPAuthorizationProvider,
     MCPAuthorizationRef,
     MCPAuthorizationRequired,
@@ -113,17 +128,28 @@ from mistralai_vibe_local_harness.vibe._mcp_models import (
     ResolvedMCPCatalog,
     ResolvedMCPServerConfig,
 )
+from mistralai_vibe_local_harness.vibe._mcp_runtime import MCPDiscoveryFlights
 from mistralai_vibe_local_harness.vibe._protected_paths import protected_target
+from mistralai_vibe_local_harness.vibe._route_profile import (
+    adapter_capabilities,
+    compile_route_profile,
+    default_model_facts,
+    rust_input_modalities,
+    rust_model_facts,
+)
 from mistralai_vibe_local_harness.vibe._runtime_config import (
     LocalModelRoute,
     LocalProviderRoute,
     LocalRuntimeAdapterConfig,
     LocalRuntimeAdapterPorts,
+    MalformedToolCallsTelemetry,
+    ModelRequest,
     PathSpace,
     RequestSentTelemetry,
     SessionConfig,
     SessionWorkspace,
     ToolApprovalMode,
+    output_room,
 )
 from mistralai_vibe_local_harness.vibe._sandbox import (
     SANDBOX_FAILURES,
@@ -141,6 +167,7 @@ from mistralai_vibe_local_harness.vibe._session import (
     HarnessSessionSubscription,
     UnifiedHarnessSessionBackend,
 )
+from mistralai_vibe_local_harness.vibe._shell_tools import BASH_TIMEOUT, bash_timeout
 from mistralai_vibe_local_harness.vibe._smart_approve import (
     DEFAULT_SMART_APPROVE_MODEL,
     ClassificationTier,
@@ -156,20 +183,31 @@ from mistralai_vibe_local_harness.vibe._smart_approve import (
 )
 from mistralai_vibe_local_harness.vibe._system_instructions import (
     build_vibe_code_system_instructions,
+    with_shell_guidance,
+)
+from mistralai_vibe_local_harness.vibe._utility_completion import (
+    UtilityCompletionError,
+    UtilityReply,
+    execute_utility_completion,
 )
 
 __all__ = [
+    "BASH_TIMEOUT",
     "CLASSIFICATION_EVENT_TYPE",
     "DEFAULT_SMART_APPROVE_MODEL",
+    "FILE_SYSTEM",
     "INVALID_API_KEY_MESSAGE",
+    "MCP_DISCOVERY_PENDING",
     "SANDBOX_FAILURES",
     "SANDBOX_UNAVAILABLE_CODE",
+    "AcceptOrRetryPostAgentHandler",
     "ApprovalGrant",
     "ClassificationTier",
     "ClassificationVerdict",
     "ClassifierFactory",
     "CompiledHooks",
     "CompletedWorktreeHistoryEntry",
+    "CompletionPricing",
     "ConnectorGatewayClient",
     "ConnectorRouteSnapshot",
     "ConnectorSourceState",
@@ -180,12 +218,14 @@ __all__ = [
     "DeferredTurnStartCapability",
     "DeferredTurnStartParams",
     "DeferredTurnStartResult",
+    "ExternalCommittedHistory",
     "FailedWorktreeHistoryEntry",
     "ForeignHookDefinition",
     "HarnessCallbackClosedError",
     "HarnessCallbackConflictError",
     "HarnessCallbackNotFoundError",
     "HarnessCommandConflictError",
+    "HarnessConfigurationRejectedError",
     "HarnessContextCompactionError",
     "HarnessForkActiveTurnError",
     "HarnessForkEntryNotFoundError",
@@ -213,9 +253,12 @@ __all__ = [
     "HarnessTurnQueuePendingError",
     "HarnessUnfinishedMigrationError",
     "HelperCrashCount",
+    "HookAgentIdentity",
     "HookApprovalCallback",
     "HookContext",
     "HookHandlers",
+    "HookProcess",
+    "HookProcessResolver",
     "LegacyImportSource",
     "LegacySessionReference",
     "LegacySourceLoader",
@@ -229,10 +272,13 @@ __all__ = [
     "MCPAuthorizationRequired",
     "MCPAuthorizationSnapshot",
     "MCPDescriptorCachePolicy",
+    "MCPDiscoveryFlights",
     "MCPHTTPTransportPolicy",
     "MCPRouteSnapshot",
     "MCPSourceState",
     "MCPToolFilter",
+    "MalformedToolCallsTelemetry",
+    "ModelRequest",
     "ModelRiskClassifier",
     "PathSpace",
     "PostAgentTurnHookHandler",
@@ -268,6 +314,7 @@ __all__ = [
     "SandboxUnavailableError",
     "SessionConfig",
     "SessionWorkspace",
+    "SharedCompletionBudget",
     "StaticProviderCredentials",
     "ToolApprovalMode",
     "ToolRiskClassifierPort",
@@ -275,15 +322,27 @@ __all__ = [
     "TurnStartRequest",
     "UnifiedHarnessSessionBackend",
     "UnifiedHarnessSessionBackendHost",
+    "UtilityCompletionError",
+    "UtilityReply",
+    "adapter_capabilities",
+    "bash_timeout",
     "build_classification_request",
     "build_vibe_code_system_instructions",
     "classify_tool_call",
     "compile_foreign_hooks",
+    "compile_route_profile",
     "create_harness_host",
+    "default_model_facts",
     "default_tool_risk_classifier",
+    "execute_utility_completion",
     "invalid_api_key_message",
+    "output_room",
     "protected_target",
     "run_helper",
+    "rust_input_modalities",
+    "rust_model_facts",
     "sandbox_path",
+    "sent_reasoning",
     "tool_catalog_for_config",
+    "with_shell_guidance",
 ]

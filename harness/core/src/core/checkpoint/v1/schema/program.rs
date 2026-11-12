@@ -6,14 +6,20 @@ use crate::core::tools::external::{ExternalTool, RuntimeBuiltinToolName};
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq)]
 pub(in crate::core::checkpoint::v1) enum CheckpointRuntimeBuiltinToolName {
+    #[serde(rename = "self.wait")]
+    SelfWait,
     #[serde(rename = "self.sleep")]
     SelfSleep,
     #[serde(rename = "file_system.read_file")]
     FileSystemReadFile,
     #[serde(rename = "file_system.write_file")]
     FileSystemWriteFile,
+    #[serde(rename = "file_system.edit")]
+    FileSystemEdit,
+    /// Deprecated: Actions that older Sessions issued before the edit tool
+    /// took the model's argument names. They restore as retired Actions.
     #[serde(rename = "file_system.search_replace")]
-    FileSystemSearchReplace,
+    DeprecatedFileSystemSearchReplace,
     #[serde(rename = "file_system.bash")]
     FileSystemBash,
     #[serde(rename = "skill.read")]
@@ -28,6 +34,8 @@ pub(in crate::core::checkpoint::v1) enum CheckpointRuntimeBuiltinToolName {
     ProcessList,
     #[serde(rename = "process.stop")]
     ProcessStop,
+    #[serde(rename = "agents.list_configs")]
+    SubagentListConfigs,
     #[serde(rename = "subagent.list")]
     SubagentList,
     #[serde(rename = "subagent.spawn")]
@@ -45,10 +53,14 @@ pub(in crate::core::checkpoint::v1) enum CheckpointRuntimeBuiltinToolName {
 impl CheckpointRuntimeBuiltinToolName {
     fn capture(name: &RuntimeBuiltinToolName) -> Self {
         match name {
+            RuntimeBuiltinToolName::SelfWait => Self::SelfWait,
             RuntimeBuiltinToolName::SelfSleep => Self::SelfSleep,
             RuntimeBuiltinToolName::FileSystemReadFile => Self::FileSystemReadFile,
             RuntimeBuiltinToolName::FileSystemWriteFile => Self::FileSystemWriteFile,
-            RuntimeBuiltinToolName::FileSystemSearchReplace => Self::FileSystemSearchReplace,
+            RuntimeBuiltinToolName::FileSystemEdit => Self::FileSystemEdit,
+            RuntimeBuiltinToolName::DeprecatedFileSystemSearchReplace => {
+                Self::DeprecatedFileSystemSearchReplace
+            }
             RuntimeBuiltinToolName::FileSystemBash => Self::FileSystemBash,
             RuntimeBuiltinToolName::SkillRead => Self::SkillRead,
             RuntimeBuiltinToolName::ProcessStart => Self::ProcessStart,
@@ -56,21 +68,30 @@ impl CheckpointRuntimeBuiltinToolName {
             RuntimeBuiltinToolName::ProcessWrite => Self::ProcessWrite,
             RuntimeBuiltinToolName::ProcessList => Self::ProcessList,
             RuntimeBuiltinToolName::ProcessStop => Self::ProcessStop,
-            RuntimeBuiltinToolName::SubagentList => Self::SubagentList,
-            RuntimeBuiltinToolName::SubagentSpawn => Self::SubagentSpawn,
+            RuntimeBuiltinToolName::SubagentListConfigs => Self::SubagentListConfigs,
+            RuntimeBuiltinToolName::SubagentList
+            | RuntimeBuiltinToolName::DeprecatedSubagentList => Self::SubagentList,
+            RuntimeBuiltinToolName::SubagentSpawn
+            | RuntimeBuiltinToolName::DeprecatedSubagentSpawn => Self::SubagentSpawn,
             RuntimeBuiltinToolName::SubagentWait => Self::SubagentWait,
-            RuntimeBuiltinToolName::SubagentSendMessage => Self::SubagentSendMessage,
-            RuntimeBuiltinToolName::SubagentInterrupt => Self::SubagentInterrupt,
+            RuntimeBuiltinToolName::SubagentSendMessage
+            | RuntimeBuiltinToolName::DeprecatedSubagentSendMessage => Self::SubagentSendMessage,
+            RuntimeBuiltinToolName::SubagentInterrupt
+            | RuntimeBuiltinToolName::DeprecatedSubagentInterrupt => Self::SubagentInterrupt,
             RuntimeBuiltinToolName::SubagentStop => Self::SubagentStop,
         }
     }
 
-    fn restore(self) -> RuntimeBuiltinToolName {
+    fn restore(self, invocation_name: &str) -> RuntimeBuiltinToolName {
         match self {
+            Self::SelfWait => RuntimeBuiltinToolName::SelfWait,
             Self::SelfSleep => RuntimeBuiltinToolName::SelfSleep,
             Self::FileSystemReadFile => RuntimeBuiltinToolName::FileSystemReadFile,
             Self::FileSystemWriteFile => RuntimeBuiltinToolName::FileSystemWriteFile,
-            Self::FileSystemSearchReplace => RuntimeBuiltinToolName::FileSystemSearchReplace,
+            Self::FileSystemEdit => RuntimeBuiltinToolName::FileSystemEdit,
+            Self::DeprecatedFileSystemSearchReplace => {
+                RuntimeBuiltinToolName::DeprecatedFileSystemSearchReplace
+            }
             Self::FileSystemBash => RuntimeBuiltinToolName::FileSystemBash,
             Self::SkillRead => RuntimeBuiltinToolName::SkillRead,
             Self::ProcessStart => RuntimeBuiltinToolName::ProcessStart,
@@ -78,9 +99,22 @@ impl CheckpointRuntimeBuiltinToolName {
             Self::ProcessWrite => RuntimeBuiltinToolName::ProcessWrite,
             Self::ProcessList => RuntimeBuiltinToolName::ProcessList,
             Self::ProcessStop => RuntimeBuiltinToolName::ProcessStop,
+            Self::SubagentListConfigs => RuntimeBuiltinToolName::SubagentListConfigs,
+            Self::SubagentList if invocation_name == "agent_list" => {
+                RuntimeBuiltinToolName::DeprecatedSubagentList
+            }
+            Self::SubagentSpawn if invocation_name == "agent_spawn" => {
+                RuntimeBuiltinToolName::DeprecatedSubagentSpawn
+            }
             Self::SubagentList => RuntimeBuiltinToolName::SubagentList,
             Self::SubagentSpawn => RuntimeBuiltinToolName::SubagentSpawn,
             Self::SubagentWait => RuntimeBuiltinToolName::SubagentWait,
+            Self::SubagentSendMessage if invocation_name == "agent_message" => {
+                RuntimeBuiltinToolName::DeprecatedSubagentSendMessage
+            }
+            Self::SubagentInterrupt if invocation_name == "agent_interrupt" => {
+                RuntimeBuiltinToolName::DeprecatedSubagentInterrupt
+            }
             Self::SubagentSendMessage => RuntimeBuiltinToolName::SubagentSendMessage,
             Self::SubagentInterrupt => RuntimeBuiltinToolName::SubagentInterrupt,
             Self::SubagentStop => RuntimeBuiltinToolName::SubagentStop,
@@ -115,6 +149,7 @@ impl CheckpointExternalTool {
                 group_name,
                 tool_name,
                 arguments,
+                ..
             } => Self::Provided {
                 group_name: group_name.clone(),
                 tool_name: tool_name.clone(),
@@ -126,7 +161,7 @@ impl CheckpointExternalTool {
     pub(in crate::core::checkpoint::v1) fn restore(self, invocation_name: String) -> ExternalTool {
         match self {
             Self::RuntimeBuiltin { name, arguments } => ExternalTool::RuntimeBuiltin {
-                name: name.restore(),
+                name: name.restore(&invocation_name),
                 invocation_name,
                 arguments,
             },
@@ -137,6 +172,7 @@ impl CheckpointExternalTool {
             } => ExternalTool::Provided {
                 group_name,
                 tool_name,
+                invocation_name,
                 arguments,
             },
         }
@@ -206,7 +242,11 @@ mod tests {
                 "file_system.write_file",
             ),
             (
-                CheckpointRuntimeBuiltinToolName::FileSystemSearchReplace,
+                CheckpointRuntimeBuiltinToolName::FileSystemEdit,
+                "file_system.edit",
+            ),
+            (
+                CheckpointRuntimeBuiltinToolName::DeprecatedFileSystemSearchReplace,
                 "file_system.search_replace",
             ),
             (

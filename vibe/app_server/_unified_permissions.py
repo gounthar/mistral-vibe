@@ -23,8 +23,12 @@ permission rule reads.
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping, Sequence
-from pathlib import Path
+from dataclasses import dataclass, replace
+from functools import partial
+import os
+from pathlib import Path, PureWindowsPath
 import re
+import tempfile
 from typing import Any, Literal, cast
 
 from pydantic import BaseModel
@@ -33,9 +37,18 @@ from mistralai_vibe_local_harness.protocol import RustRuntimeBuiltinToolName
 from mistralai_vibe_local_harness.vibe import PathSpace, sandbox_path
 from mistralai_vibe_local_harness.vibe._permissions import PermissionOutcome
 from vibe.app_server._cron import CRON_TOOL_NAME
+from vibe.app_server._session_peers import (
+    LIST_SESSIONS_TOOL_NAME,
+    MARK_SESSIONS_SEEN_TOOL_NAME,
+    READ_SESSION_TOOL_NAME,
+)
 from vibe.core.config import VibeConfigSchema
 from vibe.core.config.orchestrator import ConfigOrchestrator
-from vibe.core.tools.base import BaseTool
+from vibe.core.config.vibe_schema import stored_tool_allowlist_patterns
+from vibe.core.scratchpad import is_scratchpad_path
+from vibe.core.tools.base import BaseTool, BaseToolConfig
+from vibe.core.tools.builtins._shell_permission_analysis import redirect_writes
+from vibe.core.tools.builtins.windows_shell import windows_redirect_writes
 from vibe.core.tools.manager import NoSuchToolError, ToolManager
 from vibe.core.tools.models import (
     ApprovedRule,
@@ -44,21 +57,36 @@ from vibe.core.tools.models import (
     ToolPermission,
 )
 from vibe.core.tools.permissions import PermissionStore, wildcard_match
+from vibe.core.tools.utils import (
+    is_path_within_workdir,
+    resolve_tool_path,
+    ungranted_paths,
+)
 from vibe.observability.logging import logger
-from vibe.permissions import RequiredPermission
+from vibe.permissions import OutsideWorkdirPolicy, RequiredPermission
 
 # The Rust Runtime's builtin tools and Vibe's tool catalogue are separate
 # namespaces; this is the only overlap the local adapter can currently execute.
 # The process family rides the shell tools: a background start runs
-# ``[shell, "-lc", command]``, and the family only exists where a shell does, so
+# ``[shell, "-c", command]``, and the family only exists where a shell does, so
 # a shell denied at the catalogue level takes the process tools down with it.
 _SHELL_TOOL_SOURCES = frozenset({"bash", "powershell", "git_bash"})
 """The shell tools: everything a foreground shell call and a background start do."""
 
+# Cron only schedules this session's own prompts, listing or reading sessions
+# changes nothing, and marking sessions seen only clears their unread mark, so
+# none of them asks by default.
+_ALLOWED_BY_DEFAULT = frozenset({
+    CRON_TOOL_NAME,
+    LIST_SESSIONS_TOOL_NAME,
+    MARK_SESSIONS_SEEN_TOOL_NAME,
+    READ_SESSION_TOOL_NAME,
+})
+
 RUST_BUILTIN_TOOL_SOURCES: dict[RustRuntimeBuiltinToolName, frozenset[str]] = {
     "file_system.read_file": frozenset({"read_file"}),
     "file_system.write_file": frozenset({"write_file"}),
-    "file_system.search_replace": frozenset({"edit"}),
+    "file_system.edit": frozenset({"edit"}),
     "file_system.bash": _SHELL_TOOL_SOURCES,
     "skill.read": frozenset({"skill"}),
     "process.start": _SHELL_TOOL_SOURCES,
@@ -67,6 +95,12 @@ RUST_BUILTIN_TOOL_SOURCES: dict[RustRuntimeBuiltinToolName, frozenset[str]] = {
     "process.list": _SHELL_TOOL_SOURCES,
     "process.stop": _SHELL_TOOL_SOURCES,
 }
+
+# Builtins that run a shell command, whose redirects can write files.
+_SHELL_COMMAND_BUILTINS: frozenset[RustRuntimeBuiltinToolName] = frozenset({
+    "file_system.bash",
+    "process.start",
+})
 
 # Process calls whose authority the ``process.start`` gate already settled.
 # The reads only ever observe a process this session started, and a stop only
@@ -99,7 +133,7 @@ _PROCESS_SESSION_GRANT_BUILTINS: frozenset[RustRuntimeBuiltinToolName] = frozens
 ALLOWLIST_EXEMPTED_BUILTINS: frozenset[RustRuntimeBuiltinToolName] = frozenset({
     "file_system.read_file",
     "file_system.write_file",
-    "file_system.search_replace",
+    "file_system.edit",
 })
 
 
@@ -133,20 +167,12 @@ class ProvidedToolNames:
         return route
 
 
-def _first_block(arguments: Mapping[str, Any]) -> Mapping[str, Any]:
-    content = arguments.get("content")
-    if isinstance(content, list) and content and isinstance(content[0], dict):
-        return content[0]
-    return {}
-
-
-def _search_replace_args(arguments: Mapping[str, Any]) -> dict[str, Any]:
-    block = _first_block(arguments)
+def _edit_args(arguments: Mapping[str, Any]) -> dict[str, Any]:
     return {
         "file_path": arguments.get("file_path"),
-        "old_string": block.get("old_str", ""),
-        "new_string": block.get("new_str", ""),
-        "replace_all": block.get("replace_all", False),
+        "old_string": arguments.get("old_string", ""),
+        "new_string": arguments.get("new_string", ""),
+        "replace_all": arguments.get("replace_all", False),
     }
 
 
@@ -161,7 +187,7 @@ _ARGUMENT_TRANSLATORS: dict[
         "file_path": args.get("path"),
         "content": args.get("content", ""),
     },
-    "file_system.search_replace": _search_replace_args,
+    "file_system.edit": _edit_args,
     "file_system.bash": lambda args: {"command": args.get("command", "")},
     "skill.read": lambda args: {"name": args.get("name", "")},
     # A background start is the shell's own question: the command it will run.
@@ -226,6 +252,160 @@ _FALLBACK_SCOPES: dict[
 }
 
 
+type CommandEnvironment = Literal["unix", "git_bash", "powershell"]
+"""The one shell a session runs every command in."""
+
+
+@dataclass(frozen=True, slots=True)
+class ShellWrites:
+    """Where a shell command's redirects write, as far as Vibe can place them."""
+
+    paths: tuple[Path, ...] = ()
+    """Files placed exactly, resolved."""
+
+    unplaced: tuple[str, ...] = ()
+    """Targets from a root, as written, that cannot be placed before the command
+    runs: the spelling needs the shell to read it, or names no fixed file."""
+
+
+def shell_writes(
+    command: str,
+    *,
+    environment: CommandEnvironment,
+    path_space: PathSpace = "host",
+    process_env: Mapping[str, str] | None = None,
+) -> ShellWrites:
+    """Where ``command``'s redirects write from a root, read as ``environment`` does.
+
+    A target is placed only where its spelling has one meaning on this host:
+    nothing the command does first (a ``cd``, a ``HOME``, a variable) can move
+    it, and no mapping Vibe does not know stands between it and the file. Every
+    other target from a root is unplaced. Relative, ``~`` and expansion-led
+    targets are in neither: they are left to the classifier.
+
+    ``process_env``: the variables a ``process.start`` sets for its shell.
+    """
+    match environment:
+        case "powershell":
+            writes = windows_redirect_writes(command)
+            place = _powershell_path
+        case "git_bash":
+            writes = redirect_writes(command, drive_paths=True)
+            temp_moved = any(
+                name.casefold() in _TEMP_VARIABLES for name in process_env or {}
+            )
+            place = partial(_git_bash_path, temp_moved=temp_moved)
+        case "unix":
+            writes = redirect_writes(command)
+            place = sandbox_path if path_space == "sandbox" else _host_path
+    paths: list[Path] = []
+    unplaced: list[str] = []
+    for write in writes:
+        path = None if write.path is None else place(write.path)
+        if path is None:
+            unplaced.append(write.spelling)
+        else:
+            paths.append(path)
+    return ShellWrites(tuple(dict.fromkeys(paths)), tuple(dict.fromkeys(unplaced)))
+
+
+def _host_path(target: str) -> Path:
+    """``target`` as the file it opens, following this host's links."""
+    try:
+        return Path(target).resolve()
+    except (OSError, RuntimeError):
+        return Path(os.path.normpath(target))
+
+
+def _powershell_path(target: str) -> Path | None:
+    """A drive- or share-rooted ``target``; ``None`` for any other spelling.
+
+    ``\\x`` and ``/x`` are on whichever drive is current when it runs, ``C:x``
+    under that drive's current directory, and a ``\\\\?\\`` or ``\\\\.\\`` device
+    path skips the normalisation every other path goes through.
+    """
+    windows = windows_drive_path(target)
+    return None if windows is None else _host_path(windows)
+
+
+def _git_bash_path(target: str, *, temp_moved: bool) -> Path | None:
+    """``target`` as Git Bash opens it, where that is fixed; else ``None``."""
+    windows = git_bash_windows_path(target, temp_moved=temp_moved)
+    return None if windows is None else _host_path(windows)
+
+
+def windows_drive_path(target: str) -> str | None:
+    """``target`` if it names a file from a drive or share root, else ``None``."""
+    pure = PureWindowsPath(target)
+    if not (pure.drive and pure.root) or pure.drive.startswith(_DEVICE_PREFIXES):
+        return None
+    return target
+
+
+_DEVICE_PREFIXES = ("\\\\?\\", "\\\\.\\")
+# The variables a Windows or MSYS runtime may read its temporary directory from.
+_TEMP_VARIABLES = frozenset({"tmp", "temp", "tmpdir"})
+_MSYS_DRIVE = re.compile(r"/([A-Za-z])(?=/|$)")
+_DRIVE_ROOT = re.compile(r"[A-Za-z]:[\\/]")
+
+
+def git_bash_windows_path(target: str, *, temp_moved: bool) -> str | None:
+    """The Windows path Git Bash opens for ``target``, where that is fixed.
+
+    Git Bash mounts each drive at ``/<letter>`` and its ``/tmp`` at the
+    temporary directory, unless the process moves ``TMP``, ``TEMP`` or
+    ``TMPDIR``. Any other POSIX path lies under a mount Vibe does not read, and
+    with ``..`` in it the mount it ends up under depends on how the runtime
+    folds it.
+    """
+    if ".." in re.split(r"[\\/]", target):
+        return None
+    if drive := _MSYS_DRIVE.match(target):
+        return f"{drive.group(1).upper()}:{target[drive.end() :] or '/'}"
+    if target == "/tmp" or target.startswith("/tmp/"):
+        return None if temp_moved else tempfile.gettempdir() + target[len("/tmp") :]
+    return target if _DRIVE_ROOT.match(target) else None
+
+
+def _outside_workdir_refusal(paths: Sequence[str]) -> PermissionContext:
+    """The refusal sent back to the model as a tool error, so the turn keeps going."""
+    verb = "is" if len(paths) == 1 else "are"
+    return PermissionContext(
+        permission=ToolPermission.NEVER,
+        reason=(
+            f"Access denied: {', '.join(paths)} {verb} outside the working "
+            'directory, and outside_workdir = "deny" forbids access there. Do not '
+            "retry this path or work around the restriction; use paths inside the "
+            "working directory. Only the user can open access, by allowlisting the "
+            "path or changing outside_workdir in the Vibe configuration."
+        ),
+    )
+
+
+def _apply_outside_workdir_policy(
+    context: PermissionContext, policy: OutsideWorkdirPolicy
+) -> PermissionContext:
+    """Turn an outside-workdir prompt into a refusal when the policy denies it.
+
+    Only an ``ask`` reaches here with outside paths still in it: allowlisted
+    paths and added directories never become a permission to begin with.
+    """
+    if policy is not OutsideWorkdirPolicy.DENY:
+        return context
+    if context.permission is not ToolPermission.ASK:
+        return context
+    outside = [
+        # The refusal is the model's only feedback, and it must not reveal where
+        # a symlink resolves: report the spelling the call supplied.
+        rp.supplied_pattern or rp.invocation_pattern
+        for rp in context.required_permissions
+        if rp.scope is PermissionScope.OUTSIDE_DIRECTORY
+    ]
+    if not outside:
+        return context
+    return _outside_workdir_refusal(outside)
+
+
 class UnifiedPermissionResolver:
     """Answers the Runtime's ``ask`` with Vibe's per-call permission rules.
 
@@ -243,6 +423,7 @@ class UnifiedPermissionResolver:
         provided_names: ProvidedToolNames | None = None,
         *,
         path_space: PathSpace = "host",
+        command_environment: CommandEnvironment = "unix",
     ) -> None:
         self._tools = tools
         self._store = store
@@ -251,6 +432,9 @@ class UnifiedPermissionResolver:
         # The session workspace's: sandbox paths name files the host's file
         # system cannot resolve, so they are normalized instead.
         self._path_space: PathSpace = path_space
+        # The shell every command of the session runs in, so the one whose
+        # reading of a command's redirects counts.
+        self._command_environment: CommandEnvironment = command_environment
 
     @property
     def store(self) -> PermissionStore:
@@ -260,6 +444,23 @@ class UnifiedPermissionResolver:
     def provided_names(self) -> ProvidedToolNames:
         return self._provided_names
 
+    def under(
+        self, tools: ToolManager, config: ConfigOrchestrator[VibeConfigSchema]
+    ) -> UnifiedPermissionResolver:
+        """The same session's rules read against another configuration.
+
+        Shares this resolver's store, so a grant answers both, and its workspace
+        and shell, which belong to the session rather than to a configuration.
+        """
+        return UnifiedPermissionResolver(
+            tools,
+            self._store,
+            config,
+            self._provided_names,
+            path_space=self._path_space,
+            command_environment=self._command_environment,
+        )
+
     def vibe_tool_names(self, builtin: str) -> tuple[str, ...]:
         sources = RUST_BUILTIN_TOOL_SOURCES.get(
             cast(RustRuntimeBuiltinToolName, builtin), frozenset()
@@ -267,7 +468,26 @@ class UnifiedPermissionResolver:
         available = self._tools.available_tools
         return tuple(sorted(name for name in sources if name in available))
 
-    async def resolve(  # noqa: PLR0911 - explicit deny/ask/allow ladder
+    async def resolve(
+        self, builtin: str, arguments: Mapping[str, Any]
+    ) -> PermissionOutcome:
+        """Decide one call, and say where a shell command it asks about writes.
+
+        The harness sends a shell write to the user when it lands outside the
+        writable roots or cannot be placed, so every ``ask`` about a shell
+        command carries its redirects from a root -- whichever branch asked.
+        """
+        outcome = await self._decide(builtin, arguments)
+        if outcome.decision != "ask" or builtin not in _SHELL_COMMAND_BUILTINS:
+            return outcome
+        writes = self._shell_writes(arguments)
+        return replace(
+            outcome,
+            shell_write_paths=writes.paths,
+            unplaced_shell_writes=writes.unplaced,
+        )
+
+    async def _decide(  # noqa: PLR0911 - explicit deny/ask/allow ladder
         self, builtin: str, arguments: Mapping[str, Any]
     ) -> PermissionOutcome:
         """Decide one call the way ``AgentLoop._should_execute_tool`` would.
@@ -358,13 +578,28 @@ class UnifiedPermissionResolver:
             )
         return PermissionOutcome(decision="allow", authorized_path=authorized_path)
 
+    def _shell_writes(self, arguments: Mapping[str, Any]) -> ShellWrites:
+        """Where the command's redirects write, read by the shell that runs it."""
+        command = arguments.get("command")
+        if not isinstance(command, str):
+            return ShellWrites()
+        env = arguments.get("env")
+        return shell_writes(
+            command,
+            environment=self._command_environment,
+            path_space=self._path_space,
+            process_env=env if isinstance(env, Mapping) else None,
+        )
+
     def _resolve_provided_tool(self, route: str) -> PermissionOutcome:
         """A provided tool has no call-scoped rules, so its permission is the verdict."""
         name = self._provided_names.resolve(route)
         permission = self._tools.get_tool_config(
             name,
             default_permission=(
-                ToolPermission.ALWAYS if name == CRON_TOOL_NAME else ToolPermission.ASK
+                ToolPermission.ALWAYS
+                if name in _ALLOWED_BY_DEFAULT
+                else ToolPermission.ASK
             ),
         ).permission
         match permission:
@@ -387,8 +622,9 @@ class UnifiedPermissionResolver:
         ask unscoped instead of running the call off the command alone. A
         working directory that is the shell's own adds nothing the tool does
         not already run in, so only a start run from somewhere else counts as
-        hidden. A configured deny of the command still denies, and the ask
-        carrying no permissions means ``grant`` records nothing -- the answer
+        hidden. A configured deny of the command still denies, as does a working
+        directory outside the workdir under ``outside_workdir = "deny"``, and the
+        ask carrying no permissions means ``grant`` records nothing -- the answer
         releases exactly this call.
         """
         if builtin != "process.start":
@@ -417,7 +653,36 @@ class UnifiedPermissionResolver:
             )
             if _OUTCOME_BY_PERMISSION.get(context.permission) == "deny":
                 return PermissionOutcome(decision="deny", reason=context.reason)
+            if refusal := self._start_cwd_refusal(name, arguments.get("cwd")):
+                return PermissionOutcome(decision="deny", reason=refusal.reason)
         return PermissionOutcome(decision="ask")
+
+    def move_to(self, cwd: Path, workspace_roots: Sequence[Path]) -> None:
+        self._tools.move_to(cwd, workspace_roots)
+
+    def _start_cwd_refusal(self, name: str, cwd: object) -> PermissionContext | None:
+        """Refuse a start run from outside the working directory, if the policy does.
+
+        The tool reads the command's paths from its own directory, so a working
+        directory elsewhere is an outside access no command rule sees.
+        """
+        tool_config = self._tools.get_tool_config(name)
+        if not isinstance(cwd, str) or (
+            self._outside_workdir_policy(tool_config) is not OutsideWorkdirPolicy.DENY
+        ):
+            return None
+        try:
+            tool = self._tools.get(name)
+            target = str(resolve_tool_path(cwd, tool.cwd))
+        except (NoSuchToolError, ValueError, OSError):
+            return None
+        if (
+            is_path_within_workdir(target, workspace=tool.workspace)
+            or is_scratchpad_path(target, scratchpad_dir=tool.scratchpad_dir)
+            or not ungranted_paths({target: cwd}, tool_config.allowlist, tool.workspace)
+        ):
+            return None
+        return _outside_workdir_refusal([cwd])
 
     def _fallback_permission(
         self, builtin: str, arguments: Mapping[str, Any]
@@ -505,9 +770,8 @@ class UnifiedPermissionResolver:
         self, name: str, pair: tuple[BaseTool, BaseModel] | None
     ) -> PermissionContext:
         """One Vibe tool's verdict on this call, falling back to its config."""
-        configured = PermissionContext(
-            permission=self._tools.get_tool_config(name).permission
-        )
+        tool_config = self._tools.get_tool_config(name)
+        configured = PermissionContext(permission=tool_config.permission)
         if pair is None:
             return configured
         tool, args = pair
@@ -534,7 +798,14 @@ class UnifiedPermissionResolver:
             # `ask` through would turn a configured refusal into a prompt nobody
             # authorised -- legacy prompts there, this is deliberately stricter.
             return configured
-        return resolved
+        return _apply_outside_workdir_policy(
+            resolved, self._outside_workdir_policy(tool_config)
+        )
+
+    def _outside_workdir_policy(
+        self, tool_config: BaseToolConfig
+    ) -> OutsideWorkdirPolicy:
+        return tool_config.outside_workdir or self._config.config.outside_workdir
 
     async def grant(
         self,
@@ -632,21 +903,28 @@ class UnifiedPermissionResolver:
             )
         if not patterns:
             return
-        update = self._config.config.build_tool_allowlist_update(
-            name,
-            patterns,
-            current_allowlist=self._tools.get_tool_config(name).allowlist,
+        stored = stored_tool_allowlist_patterns(name, patterns)
+        path = f"/tools/{name}/allowlist"
+        # Merge into the file's list, not this session's copy; unset means the default.
+        mutation = await self._config.mutate_field(
+            path,
+            lambda persisted: (
+                persisted
+                if set(stored) <= set(persisted)
+                else sorted({*persisted, *stored})
+            ),
+            default=type(self._tools.get_tool_config(name))().allowlist,
         )
-        if update is None:
-            return
-        await self._config.set_field_or_warn(
-            f"/tools/{name}/allowlist", update["tools"][name]["allowlist"]
-        )
+        if mutation.failures:
+            logger.warning("Failed to persist %s: %s", path, mutation.failures[0])
 
 
 __all__ = [
     "ALLOWLIST_EXEMPTED_BUILTINS",
     "RUST_BUILTIN_TOOL_SOURCES",
+    "CommandEnvironment",
     "ProvidedToolNames",
+    "ShellWrites",
     "UnifiedPermissionResolver",
+    "shell_writes",
 ]

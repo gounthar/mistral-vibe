@@ -14,21 +14,22 @@ import subprocess
 import tempfile
 
 from e2e.app_server.config import (
-    BATCH_KEYS,
+    ACK_PREFIX,
+    CLIENT_BIN,
     COLUMNS,
-    IDLE_MARKER,
+    FENCE_KEY,
     MINIMAL_HOME_CONFIG,
     REPLAY_BIN,
     REPLAY_NOW_MS,
     ROWS,
-    VIBE_DIR,
+    WORKSPACE_DIR,
 )
 from e2e.app_server.replay import replay_fixture
 from e2e.app_server.scenario import Action, AppServerEvent, Request, Scenario
 from e2e.pty.capture import CaptureSpec, Launcher, capture, exec_launch
 from e2e.pty.screen import Snapshot
 
-# Both clients probe the terminal background (OSC 11) and fall back to the OS
+# The client probes the terminal background (OSC 11) and falls back to the OS
 # appearance, so a scenario that renders before the config lands would follow
 # the host. Answer dark by default; a scenario overrides it by query string.
 _DEFAULT_TERMINAL_RESPONSES = {"\x1b]11;?\x07": "\x1b]11;rgb:0000/0000/0000\x1b\\"}
@@ -37,8 +38,9 @@ _DEFAULT_TERMINAL_RESPONSES = {"\x1b]11;?\x07": "\x1b]11;rgb:0000/0000/0000\x1b\
 # setup/status (the base fixture's hasApiKey:true keeps the wizard closed),
 # but only the onboarding scenarios pin it via request_methods — adding it
 # here would churn ~150 unrelated goldens with an identical empty-params frame.
-_PARITY_METHODS = frozenset({
+_COMPARED_METHODS = frozenset({
     "callback/result",
+    "config/model/write",
     "config/write",
     "connector_catalog/toggle",
     "feedback/record",
@@ -62,7 +64,7 @@ _PARITY_METHODS = frozenset({
 
 # Telemetry whose properties vary per run (startup timings, generated recording
 # and message ids) never reaches the goldens, even when a scenario opts into
-# `telemetry/record` parity.
+# comparing `telemetry/record`.
 _VOLATILE_TELEMETRY_EVENTS = frozenset({
     "vibe.startup",
     "vibe.at_mention_inserted",
@@ -78,6 +80,9 @@ class Capture:
     snapshots: list[Snapshot]
     actions: list[Action]
     requests: list[Request]
+    final: Snapshot
+    """The last settled frame, which screen and clipboard expectations check."""
+    titles: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -89,10 +94,8 @@ class HeadlessCapture:
     requests: list[Request]
 
 
-def capture_scenario(
-    command: tuple[str, ...], scenario: Scenario, launch: Launcher = exec_launch
-) -> Capture:
-    """Capture one Vibe scenario with one client command."""
+def capture_scenario(scenario: Scenario, launch: Launcher = exec_launch) -> Capture:
+    """Capture one Vibe scenario with the client binary."""
     with _isolated_home() as home, replay_fixture(scenario) as fixture:
         step_dir, step_fifo, step_fd = (
             _step_fifo() if _has_releases(scenario) else (None, None, None)
@@ -103,15 +106,16 @@ def capture_scenario(
         if step_fifo is not None:
             env["VIBE_REPLAY_STEP_FIFO"] = step_fifo
         spec = CaptureSpec(
-            command=command + scenario.client_args,
-            cwd=os.fspath(VIBE_DIR),
+            command=(os.fspath(CLIENT_BIN), *scenario.client_args),
+            cwd=os.fspath(WORKSPACE_DIR),
             env=env,
             rows=ROWS,
             columns=COLUMNS,
-            idle_marker=IDLE_MARKER,
+            ack_prefix=ACK_PREFIX,
+            fence_key=FENCE_KEY,
             steps=tuple(step.text for step in scenario.steps),
             resizes=tuple(step.resize for step in scenario.steps),
-            batch_keys=None if scenario.settle_per_key else BATCH_KEYS,
+            settle_per_key=scenario.settle_per_key,
             exit_after_last_step=scenario.exit_after_last_step,
             terminal_responses=tuple(
                 (query.encode(), response.encode())
@@ -126,19 +130,21 @@ def capture_scenario(
             ),
         )
         try:
-            snapshots = capture(
+            frames = capture(
                 spec,
                 releases=tuple(step.release for step in scenario.steps),
                 releases_after=tuple(step.release_after for step in scenario.steps),
-                capture_startup=scenario.capture_startup,
-                capture_steps=scenario.capture_steps,
+                startup_label=scenario.startup_snapshot,
+                step_labels=tuple(step.snapshot for step in scenario.steps),
                 step_fd=step_fd,
                 launch=launch,
             )
             return Capture(
-                snapshots,
+                frames.snapshots,
                 _read_actions(action_log),
                 _read_requests(request_log, scenario.request_methods),
+                frames.final,
+                frames.titles,
             )
         finally:
             if step_fd is not None:
@@ -160,9 +166,7 @@ def _headless_events(scenario: Scenario) -> list[AppServerEvent]:
     return events
 
 
-def capture_headless_scenario(
-    command: tuple[str, ...], scenario: Scenario
-) -> HeadlessCapture:
+def capture_headless_scenario(scenario: Scenario) -> HeadlessCapture:
     """Capture JSONL before releasing the scenario's final `turn/completed`."""
     events = _headless_events(scenario)
 
@@ -173,8 +177,8 @@ def capture_headless_scenario(
         env = _environment(home, fixture, scenario.env, action_log, request_log)
         env["VIBE_REPLAY_STEP_FIFO"] = step_fifo
         process = subprocess.Popen(
-            command + scenario.client_args,
-            cwd=VIBE_DIR,
+            (CLIENT_BIN, *scenario.client_args),
+            cwd=WORKSPACE_DIR,
             env=env,
             stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE,
@@ -244,10 +248,14 @@ def _environment(
     request_log: Path,
 ) -> dict[str, str]:
     environment = os.environ.copy()
+    # The pin is server-owned (clients learn it via setup/status); a host-set value would leak into goldens.
+    environment.pop("VIBE_CUSTOM_CONSOLE_URL", None)
+    # A host tmux would receive copies through `tmux load-buffer` instead of the PTY.
+    environment.pop("TMUX", None)
+    environment.pop("TMUX_PANE", None)
     environment.update({
         "TERM": "xterm-256color",
-        # Pin truecolor so Textual never downsamples RGB themes to the 256-color
-        # cube (ratatui keeps truecolor); the host's COLORTERM must not decide parity.
+        # Pin truecolor so the host's COLORTERM never decides the rendered colors.
         "COLORTERM": "truecolor",
         # Pin a non-VS Code terminal the detector maps by name, so the host's
         # TERM_PROGRAM never decides the promo banner and terminal detection
@@ -265,6 +273,10 @@ def _environment(
         "VIBE_REPLAY_NOW_MS": str(REPLAY_NOW_MS),
         "VIBE_E2E_ACTION_LOG": os.fspath(action_log),
         "VIBE_REPLAY_REQUEST_LOG": os.fspath(request_log),
+        # Replay types at machine speed, so the trust gate answers at once.
+        "VIBE_TEST_TRUST_GRACE_MS": "0",
+        # Pin the terminal key so the PTY's device name never reaches a golden.
+        "VIBE_TERMINAL_KEY": "e2e-terminal",
         **overrides,
         # Keep clipboard assertions inside the PTY instead of mutating the host.
         "SSH_TTY": "/dev/pts/0",
@@ -280,12 +292,12 @@ def _read_actions(path: Path) -> list[Action]:
 
 
 def _read_requests(path: Path, extra_methods: frozenset[str]) -> list[Request]:
-    """Return RPCs whose wire contract must match between clients."""
-    methods = _PARITY_METHODS | extra_methods
+    """Return the RPCs whose wire contract the goldens pin."""
+    methods = _COMPARED_METHODS | extra_methods
     return [
         request
         for request in _read_logged_requests(path)
-        if _parity_request(request, methods)
+        if _compared_request(request, methods)
     ]
 
 
@@ -300,7 +312,7 @@ def _read_logged_requests(path: Path) -> list[Request]:
     ]
 
 
-def _parity_request(request: Request, methods: frozenset[str]) -> bool:
+def _compared_request(request: Request, methods: frozenset[str]) -> bool:
     if request.method != "telemetry/record":
         return request.method in methods
     if request.params.get("name") in _VOLATILE_TELEMETRY_EVENTS:

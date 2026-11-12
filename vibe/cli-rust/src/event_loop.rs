@@ -9,8 +9,7 @@ use tokio::sync::{mpsc, watch};
 use crate::app::App;
 use crate::commands::CommandEvent;
 use crate::config;
-use crate::resume_picker::Event as ResumeEvent;
-use crate::server::{method, Client, Notification, SHUTDOWN_GRACE};
+use crate::server::{method, Client, Notification, SESSION_STOP_GRACE};
 use crate::session_exit;
 use crate::startup::StartupEvent;
 use crate::voice::VoiceEvent;
@@ -24,36 +23,16 @@ pub mod notifications;
 mod steady;
 mod suspend;
 
-/// Re-exported for the pre-TUI update prompt, which shares the replay harness's
-/// idle-marker protocol.
-pub use helpers::emit_idle_marker;
-
 const NOTIF_DRAIN_CAP: u32 = 512;
 pub(crate) const REDRAW_INTERVAL: Duration = Duration::from_micros(16_667);
-const IDLE_MARKER: &[u8] = b"\x1b]5379;vibe-idle\x07";
-// The replay harness's batch-marker keys, shared with the wizard flow:
-// the harness brackets a batched input step in them so a step's keys produce
-// one marker instead of one per key. They ride the input stream, so they are
-// ordered against the keys they bracket without any timing assumption.
-// `pub`, not `pub(crate)`: the pre-TUI update prompt shares the protocol.
-pub const HOLD_KEY: u8 = 23;
-pub const RELEASE_KEY: u8 = 24;
 /// Bounded command-result channel; slash-command results are sparse, drop on full.
 pub const COMMAND_CHANNEL_CAP: usize = 16;
 /// Bounded voice-event channel; transcription deltas burst, drop on full.
 pub const VOICE_CHANNEL_CAP: usize = 256;
-/// Bounded prompt-queue channel; one answer per accepted prompt.
-pub const QUEUE_CHANNEL_CAP: usize = 32;
-/// Bounded approval result/preview channel; one response and one preview are expected.
-pub const APPROVAL_CHANNEL_CAP: usize = 4;
-/// Bounded feedback-result channel; at most one eligibility or record request is active.
-pub const FEEDBACK_CHANNEL_CAP: usize = 2;
-/// Bounded narrator channel; one summary and one clip are live, and senders await rather than drop.
-pub const NARRATOR_CHANNEL_CAP: usize = 2;
 /// How the steady loop ended: a plain quit, or the handshake's missing-key
-/// verdict — the wizard is a pre-session surface (Python `run_onboarding`
-/// runs from the entrypoint, never inside the TUI), so the loop hands its
-/// parts back to `main` for the wizard round and its child.
+/// verdict — the wizard is a pre-session surface that never runs inside the
+/// TUI, so the loop hands its parts back to `main` for the wizard round and
+/// its child.
 pub enum LoopExit {
     /// The user exited or an error ended the run.
     Quit,
@@ -112,27 +91,24 @@ pub struct EventSources {
     pub notifications: mpsc::Receiver<Notification>,
     pub ready: mpsc::Receiver<StartupEvent>,
     pub config: mpsc::Receiver<config::Loaded>,
-    pub theme: mpsc::Receiver<crate::theme_picker::Event>,
-    pub model: mpsc::Receiver<crate::model_picker::Event>,
-    pub log_level: mpsc::Receiver<crate::log_level_picker::Event>,
-    pub thinking: mpsc::Receiver<crate::thinking_picker::Event>,
-    pub agents: mpsc::Receiver<crate::agents::Event>,
-    pub resume: mpsc::Receiver<ResumeEvent>,
-    pub rewind: mpsc::Receiver<crate::rewind::Event>,
-    pub mcp: mpsc::Receiver<crate::mcp::Event>,
-    pub mcp_oauth: mpsc::Receiver<crate::mcp_oauth::Event>,
-    pub connector_auth: mpsc::Receiver<crate::connector_auth::Event>,
+    pub events: mpsc::Receiver<crate::ui_event::UiEvent>,
     pub commands: mpsc::Receiver<CommandEvent>,
-    pub queue: mpsc::Receiver<crate::message_queue::QueueEvent>,
-    pub approval: mpsc::Receiver<crate::approval::Event>,
-    pub feedback: mpsc::Receiver<crate::feedback::Event>,
-    pub paste_image: mpsc::Receiver<crate::paste_image::Event>,
-    pub narrator: mpsc::Receiver<crate::turn_summary::Event>,
     pub voice: mpsc::Receiver<VoiceEvent>,
     pub telemetry: mpsc::Receiver<crate::telemetry::TelemetryEvent>,
-    pub files: watch::Receiver<u64>,
-    pub subagents: mpsc::Receiver<crate::subagents::Event>,
-    pub older_history: mpsc::Receiver<crate::older_history::Event>,
+}
+
+impl EventSources {
+    /// Whether every queued event has been applied (the file index feed is checked beside it).
+    /// A deferred notification parks the stream on the user, so it is not waited for.
+    fn is_drained(&self, notifications_parked: bool) -> bool {
+        (notifications_parked || self.notifications.is_empty())
+            && self.ready.is_empty()
+            && self.config.is_empty()
+            && self.events.is_empty()
+            && self.commands.is_empty()
+            && self.voice.is_empty()
+            && self.telemetry.is_empty()
+    }
 }
 
 impl EventLoop {
@@ -168,8 +144,8 @@ impl EventLoop {
         Ok(None)
     }
 
-    /// Run to an exit; the summary is read only on a clean exit (Python prints
-    /// the resume block only when `run_textual_ui` returned a summary).
+    /// Run to an exit; the summary is read only on a clean exit, the only case
+    /// that prints the resume block.
     pub async fn run(mut self) -> RunOutcome {
         let result = match self.steady().await {
             Ok(LoopExit::Quit) => Ok(()),
@@ -182,11 +158,12 @@ impl EventLoop {
             }
             Err(error) => Err(error),
         };
-        // Python `shutdown_cleanup`: stop narration so the clip ends with the TUI
-        // and `read_aloud.ended` is queued before the session/stop telemetry flush.
+        // Stop narration so the clip ends with the TUI and `read_aloud.ended` is
+        // queued before the session/stop telemetry flush.
         crate::turn_summary::cancel(&mut self.app);
         // Closing input cancels the stream without joining an OS reader thread.
         self.input.close();
+        crate::terminal_notifier::shutdown(&mut self.app.terminal_notifier);
         drop(self.terminal_guard);
         crate::terminal::release(self.terminal);
         // Read the exit summary while the server is still alive, before the
@@ -195,17 +172,15 @@ impl EventLoop {
             Ok(()) => Some(session_exit::exit_summary(&self.app, &self.client).await),
             Err(_) => None,
         };
-        // Python prints the resume block right after the TUI comes down and
-        // only then runs the worktree cleanup (`_cleanup_worktree_on_exit`
-        // lives in the `finally`, after `print_session_resume_message`).
+        // The resume block prints right after the TUI comes down, before the
+        // worktree cleanup.
         if result.is_ok() {
             session_exit::print_session_resume_message(summary.as_ref());
         }
         // Worktree exit cleanup runs while the server still serves requests:
         // session/stop is its exit signal, and the remove questions must be
-        // answered before it (Python asks with the engine still alive). The
-        // server discounts this session's own worktree holder, so a clean
-        // created worktree removes without a prompt.
+        // answered before it. The server discounts this session's own worktree
+        // holder, so a clean created worktree removes without a prompt.
         if result.is_ok() {
             crate::worktree_exit::cleanup_on_exit(&self.app, &self.client, &mut self.shutdown)
                 .await;
@@ -216,7 +191,7 @@ impl EventLoop {
             let stop = stop_session(&self.client, &sid, &mut self.sources.telemetry);
             tokio::select! {
                 _ = stop => {}
-                _ = tokio::time::sleep(SHUTDOWN_GRACE) => {}
+                _ = crate::clock::sleep_real(SESSION_STOP_GRACE) => {}
                 _ = self.shutdown.wait() => {}
             }
         }
@@ -234,6 +209,7 @@ impl EventLoop {
                 None => tracing::debug!("app-server SIGKILLed after grace"),
             }
         }
+        crate::observability::memory::log_exit_rss();
         RunOutcome::Finished { result, summary }
     }
 }

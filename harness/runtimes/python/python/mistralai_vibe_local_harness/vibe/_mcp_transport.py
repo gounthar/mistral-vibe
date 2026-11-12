@@ -1,26 +1,24 @@
-"""MCP SDK and HTTPX boundary for Unified Harness transports."""
+"""MCP SDK and HTTPX2 boundary for Unified Harness transports."""
 
 from __future__ import annotations
 
 import asyncio
 from contextlib import AsyncExitStack
-from datetime import timedelta
 import importlib.metadata
-import ipaddress
 import logging
 import tempfile
 from typing import Any, Self, cast
-from urllib.parse import urlparse
-from urllib.request import getproxies
 
 import anyio
-import httpx
+import httpx2
 from mcp import ClientSession
 from mcp.client.auth import OAuthFlowError
 from mcp.client.stdio import StdioServerParameters, stdio_client
 from mcp.client.streamable_http import streamable_http_client
+from mcp.types import PaginatedRequestParams
 from pydantic import JsonValue, TypeAdapter
 
+from mistralai_vibe_local_harness.vibe._http_transport import env_proxy_transport
 from mistralai_vibe_local_harness.vibe._mcp_models import (
     JsonObject,
     JsonSchema,
@@ -123,7 +121,7 @@ async def call_http(
             result = await session.call_tool(
                 tool_name,
                 cast(dict[str, Any], arguments),
-                read_timeout_seconds=_timeout(server.tool_timeout_s),
+                read_timeout_seconds=server.tool_timeout_s,
             )
             return _normalize_result(result)
     except asyncio.CancelledError:
@@ -155,20 +153,20 @@ class _HttpSessionContext:
                     authorized_url=cast(str, server.url),
                     follow_redirects=True,
                     headers=dict(self._authorization.headers),
-                    timeout=httpx.Timeout(
+                    timeout=httpx2.Timeout(
                         server.startup_timeout_s, read=server.tool_timeout_s
                     ),
                     policy=self._http_transport_policy,
                 )
             )
-            read, write, _ = await self._stack.enter_async_context(
+            read, write = await self._stack.enter_async_context(
                 streamable_http_client(cast(str, server.url), http_client=client)
             )
             session = await self._stack.enter_async_context(
                 ClientSession(
                     read,
                     write,
-                    read_timeout_seconds=_timeout(server.startup_timeout_s),
+                    read_timeout_seconds=server.startup_timeout_s,
                     sampling_callback=cast(Any, self._sampling_callback),
                 )
             )
@@ -270,7 +268,7 @@ class _StdioConnection(MCPClientConnection):
                 ClientSession(
                     read,
                     write,
-                    read_timeout_seconds=_timeout(server.startup_timeout_s),
+                    read_timeout_seconds=server.startup_timeout_s,
                     sampling_callback=cast(Any, sampling_callback),
                 )
             )
@@ -299,9 +297,7 @@ class _StdioConnection(MCPClientConnection):
     ) -> MCPNormalizedResult:
         try:
             result = await self._session.call_tool(
-                name,
-                cast(dict[str, Any], arguments),
-                read_timeout_seconds=_timeout(timeout_s),
+                name, cast(dict[str, Any], arguments), read_timeout_seconds=timeout_s
             )
             return _normalize_result(result)
         except asyncio.CancelledError:
@@ -331,13 +327,15 @@ async def _list_all_tools(
             raise MCPRuntimeFailure(
                 "mcp_pagination_limit", "MCP tools/list returned too many pages"
             )
-        page = await session.list_tools(cursor)
+        page = await session.list_tools(
+            params=None if cursor is None else PaginatedRequestParams(cursor=cursor)
+        )
         descriptors.extend(_normalize_descriptor(tool) for tool in page.tools)
         if len(descriptors) > _MAX_DISCOVERED_TOOLS:
             raise MCPRuntimeFailure(
                 "mcp_descriptor_limit", "MCP server returned too many tools"
             )
-        next_cursor = page.nextCursor
+        next_cursor = page.next_cursor
         if next_cursor is None:
             return tuple(descriptors)
         if next_cursor in seen_cursors:
@@ -389,7 +387,7 @@ def _normalize_result(value: object) -> MCPNormalizedResult:
             raise MCPRuntimeFailure(
                 "mcp_invalid_result", "MCP tool result has an unsupported content block"
             )
-        content.append(cast(JsonObject, normalized))
+        content.append(_without_unset_fields(normalized))
     structured = _JSON_VALUE.validate_python(raw.get("structuredContent"))
     meta_raw = _JSON_VALUE.validate_python(raw.get("_meta"))
     if meta_raw is not None and not isinstance(meta_raw, dict):
@@ -403,6 +401,34 @@ def _normalize_result(value: object) -> MCPNormalizedResult:
         meta=cast(JsonObject | None, meta_raw),
         is_error=is_error,
     )
+
+
+def _without_unset_fields(block: dict[str, JsonValue]) -> JsonObject:
+    """``block`` without the null fields the SDK dump fills in for unset ones.
+
+    The dump keeps ``None`` fields, so a resource link without icons arrives
+    as ``"icons": null`` where the Harness block wants a list, and would fail
+    the whole call. Only the block and its SDK-modelled parts (annotations,
+    embedded resource, icons) are cleaned: ``_meta`` and the other values are
+    the server's own JSON and keep their nulls.
+    """
+    cleaned: JsonObject = {}
+    for key, value in block.items():
+        if value is None:
+            continue
+        if key in {"annotations", "resource"} and isinstance(value, dict):
+            value = _without_nulls(value)
+        elif key == "icons" and isinstance(value, list):
+            value = [
+                _without_nulls(icon) if isinstance(icon, dict) else icon
+                for icon in value
+            ]
+        cleaned[key] = value
+    return cleaned
+
+
+def _without_nulls(value: dict[str, JsonValue]) -> JsonObject:
+    return {key: inner for key, inner in value.items() if inner is not None}
 
 
 def _model_dump(value: object) -> dict[str, Any]:
@@ -423,8 +449,8 @@ def _translate_failure(exc: BaseException, *, operation: str) -> MCPRuntimeFailu
     flattened = _flatten_exceptions(exc)
     for nested in flattened:
         if (
-            isinstance(nested, httpx.HTTPStatusError)
-            and nested.response.status_code == httpx.codes.UNAUTHORIZED
+            isinstance(nested, httpx2.HTTPStatusError)
+            and nested.response.status_code == httpx2.codes.UNAUTHORIZED
         ):
             return MCPAuthorizationRejected(
                 f"MCP {operation} requires authorization", reason="http_unauthorized"
@@ -433,14 +459,14 @@ def _translate_failure(exc: BaseException, *, operation: str) -> MCPRuntimeFailu
             return MCPAuthorizationRejected(
                 f"MCP {operation} requires authorization", reason="mcp_unauthorized"
             )
-        if isinstance(nested, httpx.HTTPStatusError):
+        if isinstance(nested, httpx2.HTTPStatusError):
             return MCPHTTPStatusFailure(
                 nested.response.status_code,
                 f"MCP {operation} failed with an HTTP error",
             )
         if isinstance(nested, MCPRuntimeFailure):
             return nested
-        if isinstance(nested, TimeoutError | httpx.TimeoutException):
+        if isinstance(nested, TimeoutError | httpx2.TimeoutException):
             return MCPRuntimeFailure(
                 "mcp_timeout", f"MCP {operation} timed out", retryable=True
             )
@@ -470,48 +496,25 @@ def _is_cancellation(exc: BaseException) -> bool:
     )
 
 
-def _timeout(seconds: float) -> timedelta:
-    return timedelta(seconds=seconds)
-
-
 def _build_http_client(
     *,
     authorized_url: str,
     follow_redirects: bool,
     headers: dict[str, str],
-    timeout: httpx.Timeout,
+    timeout: httpx2.Timeout,
     policy: MCPHTTPTransportPolicy,
-) -> httpx.AsyncClient:
+) -> httpx2.AsyncClient:
     if not any(k.lower() == "user-agent" for k in headers):
         headers["User-Agent"] = _VIBE_CLI_USER_AGENT
     verify = build_ssl_context(use_system_trust_store=policy.enable_system_trust_store)
-    proxy_info = getproxies()
-    proxies = {
-        scheme: proxy_url
-        for scheme in ("http", "https", "all")
-        if (proxy_url := _normalize_proxy_url(proxy_info.get(scheme)))
-    }
-    transport = None
-    if proxies:
-        transport = _EnvProxyTransport(
-            proxies,
-            tuple(
-                part.strip()
-                for part in proxy_info.get("no", "").split(",")
-                if part.strip()
-            ),
-            trust_env=False,
-            verify=verify,
-        )
     redirect_guard = _AuthorizationRedirectGuard(authorized_url, tuple(headers))
-    return httpx.AsyncClient(
-        event_hooks={"request": [redirect_guard]},
+    return httpx2.AsyncClient(
+        event_hooks={"request": [redirect_guard], "response": [_raise_for_status]},
         follow_redirects=follow_redirects,
         headers=headers,
         timeout=timeout,
         trust_env=False,
-        transport=transport,
-        verify=verify if transport is None else True,
+        transport=env_proxy_transport(verify=verify),
     )
 
 
@@ -520,9 +523,9 @@ async def _build_http_client_off_loop(
     authorized_url: str,
     follow_redirects: bool,
     headers: dict[str, str],
-    timeout: httpx.Timeout,
+    timeout: httpx2.Timeout,
     policy: MCPHTTPTransportPolicy,
-) -> httpx.AsyncClient:
+) -> httpx2.AsyncClient:
     return await asyncio.to_thread(
         _build_http_client,
         authorized_url=authorized_url,
@@ -535,136 +538,28 @@ async def _build_http_client_off_loop(
 
 class _AuthorizationRedirectGuard:
     def __init__(self, authorized_url: str, header_names: tuple[str, ...]) -> None:
-        self._authorized_origin = _url_origin(httpx.URL(authorized_url))
+        self._authorized_origin = _url_origin(httpx2.URL(authorized_url))
         self._header_names = header_names
 
-    async def __call__(self, request: httpx.Request) -> None:
+    async def __call__(self, request: httpx2.Request) -> None:
         if _url_origin(request.url) == self._authorized_origin:
             return
         for name in self._header_names:
             request.headers.pop(name, None)
 
 
-def _url_origin(url: httpx.URL) -> tuple[str, str, int | None]:
+async def _raise_for_status(response: httpx2.Response) -> None:
+    # mcp 2 answers an HTTP error on a POST with a generic JSON-RPC error;
+    # raising keeps the status, which tells a rejected credential from a
+    # missing route.
+    if response.request.method == "POST" and response.is_error:
+        await response.aread()
+        response.raise_for_status()
+
+
+def _url_origin(url: httpx2.URL) -> tuple[str, str, int | None]:
     port = url.port or {"http": 80, "https": 443}.get(url.scheme)
     return url.scheme.lower(), (url.host or "").lower(), port
-
-
-class _EnvProxyTransport(httpx.AsyncBaseTransport):
-    def __init__(
-        self, proxies: dict[str, str], no_proxy: tuple[str, ...], **kwargs: Any
-    ) -> None:
-        self._no_proxy = no_proxy
-        self._direct = httpx.AsyncHTTPTransport(**kwargs)
-        self._proxies = {
-            scheme: httpx.AsyncHTTPTransport(proxy=proxy, **kwargs)
-            for scheme, proxy in proxies.items()
-        }
-
-    async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
-        if _should_bypass_proxy(request.url, self._no_proxy):
-            return await self._direct.handle_async_request(request)
-        transport = self._proxies.get(request.url.scheme) or self._proxies.get("all")
-        return await (transport or self._direct).handle_async_request(request)
-
-    async def aclose(self) -> None:
-        transports = [self._direct, *self._proxies.values()]
-        for transport in dict.fromkeys(transports):
-            await transport.aclose()
-
-
-def _normalize_proxy_url(value: str | None) -> str | None:
-    if value is None or not (value := value.strip()):
-        return None
-    if "://" in value:
-        return value
-    return f"http://{value}"
-
-
-def _should_bypass_proxy(url: httpx.URL, no_proxy: tuple[str, ...]) -> bool:
-    host = url.host
-    if host is None:
-        return False
-    host = host.strip("[]").lower()
-    port = url.port or {"http": 80, "https": 443}.get(url.scheme)
-    return any(
-        _no_proxy_rule_matches(rule.lower(), host, url.scheme, port)
-        for rule in no_proxy
-    )
-
-
-def _no_proxy_rule_matches(rule: str, host: str, scheme: str, port: int | None) -> bool:
-    if rule == "*":
-        return True
-    if (matches := _ip_network_rule_matches(rule, host)) is not None:
-        return matches
-    parsed_rule = _parse_no_proxy_host_rule(rule, scheme)
-    if parsed_rule is None:
-        return False
-    rule, rule_port = parsed_rule
-    if rule_port is not None and rule_port != port:
-        return False
-    if (matches := _ip_literal_rule_matches(rule, host)) is not None:
-        return matches
-    return _host_rule_matches(rule, host)
-
-
-def _ip_network_rule_matches(rule: str, host: str) -> bool | None:
-    try:
-        network = ipaddress.ip_network(rule.strip("[]"), strict=False)
-    except ValueError:
-        return None
-    try:
-        ip = ipaddress.ip_address(host)
-    except ValueError:
-        return False
-    return ip in network
-
-
-def _ip_literal_rule_matches(rule: str, host: str) -> bool | None:
-    try:
-        rule_ip = ipaddress.ip_address(rule)
-    except ValueError:
-        return None
-    try:
-        host_ip = ipaddress.ip_address(host)
-    except ValueError:
-        return False
-    return host_ip == rule_ip
-
-
-def _host_rule_matches(rule: str, host: str) -> bool:
-    if rule.startswith("."):
-        return host.endswith(rule)
-    return host == rule or host.endswith(f".{rule}")
-
-
-def _parse_no_proxy_host_rule(rule: str, scheme: str) -> tuple[str, int | None] | None:
-    port: int | None = None
-    if "://" in rule:
-        parsed = urlparse(rule)
-        if parsed.scheme and parsed.scheme != scheme:
-            return None
-        try:
-            port = parsed.port
-        except ValueError:
-            return None
-        rule = parsed.hostname or ""
-    elif rule.startswith("["):
-        parsed = urlparse(f"//{rule}")
-        try:
-            port = parsed.port
-        except ValueError:
-            return None
-        rule = parsed.hostname or rule
-    elif rule.count(":") == 1:
-        rule_host, _, raw_rule_port = rule.partition(":")
-        if raw_rule_port.isdigit():
-            rule = rule_host
-            port = int(raw_rule_port)
-    if not rule:
-        return None
-    return rule, port
 
 
 def _log_stderr(stderr: Any) -> None:

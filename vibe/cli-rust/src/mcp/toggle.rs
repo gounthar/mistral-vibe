@@ -1,4 +1,4 @@
-//! `d`/`e` toggles of the `/mcp` browser (Python `_set_highlighted_disabled`).
+//! `d`/`e` toggles of the `/mcp` browser.
 
 use std::sync::Arc;
 
@@ -6,11 +6,10 @@ use crate::server::{method, Client, MCPSourceKind, MCPSourceStatus, MCPSourceSum
 use serde_json::json;
 
 use super::rows::{self, Row};
-use super::{Event, TOAST_SECS};
-use crate::app::{App, ToastSeverity};
-use crate::input::deliver;
+use super::Event;
+use crate::app::{App, Severity};
 
-/// One toggle request (Python `MCPToggled`), kept to undo its paint on rejection.
+/// One toggle request, kept to undo its paint on rejection.
 pub struct Toggle {
     pub name: String,
     pub kind: MCPSourceKind,
@@ -21,7 +20,10 @@ pub struct Toggle {
 /// Only a disable is painted up front: whether an enabled source connects is
 /// up to discovery and auth, so its status waits for the server's answer.
 pub fn set_disabled(app: &mut App, client: &Arc<Client>, disabled: bool) {
-    let (name, kind, tool_name) = match rows::rows(&app.mcp).into_iter().nth(app.mcp.selected) {
+    let (name, kind, tool_name) = match rows::rows(&app.mcp)
+        .into_iter()
+        .nth(app.mcp.list.selected())
+    {
         Some(Row::Source(row)) => (row.name, Some(row.kind), None),
         Some(Row::Tool(row)) => match app.mcp.viewing_name.clone() {
             Some(name) => (name, app.mcp.viewing_kind, Some(row.name)),
@@ -65,17 +67,17 @@ fn reject_plugin_toggle(app: &mut App, name: &str, kind: MCPSourceKind) -> bool 
     else {
         return false;
     };
-    app.show_toast(
-        format!("{name} is managed by the {plugin} plugin and cannot be toggled here."),
-        ToastSeverity::Warning,
-        TOAST_SECS,
+    crate::notices::inline(
+        app,
+        Severity::Warning,
+        &format!("{name} is managed by the {plugin} plugin and cannot be toggled here."),
     );
     true
 }
 
 /// Send a toggle; its answer carries the runtime the browser then adopts.
 fn request_toggle(app: &mut App, client: &Arc<Client>, toggle: Toggle, disabled: bool) {
-    let (Some(session_id), Some(tx)) = (app.session.session_id.clone(), app.mcp.tx.clone()) else {
+    let Some(session_id) = app.session.session_id.clone() else {
         return;
     };
     let (method, mut params) = match toggle.kind {
@@ -95,16 +97,14 @@ fn request_toggle(app: &mut App, client: &Arc<Client>, toggle: Toggle, disabled:
     };
     params["sessionId"] = json!(session_id);
     let client = client.clone();
-    let pending = app.commit_started();
-    tokio::spawn(async move {
-        let event = match client.request(method, params).await {
+    crate::ui_event::spawn(app, async move {
+        match client.request(method, params).await {
             Ok(value) => Event::Toggled(value),
             Err(error) => Event::ToggleFailed {
                 toggle,
                 message: error.to_string(),
             },
-        };
-        deliver(Some(tx), event, &pending).await;
+        }
     });
 }
 

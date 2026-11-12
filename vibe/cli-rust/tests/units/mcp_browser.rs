@@ -1,11 +1,13 @@
-//! MCP browser rows, wire tolerance and runtime adoption match Python `MCPApp`.
-
-use std::sync::Arc;
+//! MCP browser rows, wire tolerance and runtime adoption.
 
 use serde_json::{json, Value};
-use vibe_rs::app::App;
+use vibe_rs::app::{App, Severity};
 use vibe_rs::mcp::{self, rows, rows::Row};
-use vibe_rs::server::{Client, MCPSourceKind, MCPSourceStatus, MCPState};
+use vibe_rs::server::{MCPSourceKind, MCPSourceStatus, MCPState};
+use vibe_rs::ui_event::{self, UiEvent};
+
+use crate::feedback_support::{errors, notice, warnings};
+use crate::support::stub;
 
 fn source(name: &str, kind: &str, extra: Value) -> Value {
     let mut source = json!({
@@ -38,16 +40,16 @@ fn open_app(runtime: &Value) -> App {
 }
 
 /// Route the browser's own requests through a channel the test drains.
-fn with_channel(app: &mut App) -> tokio::sync::mpsc::Receiver<mcp::Event> {
+fn with_channel(app: &mut App) -> tokio::sync::mpsc::Receiver<UiEvent> {
     let (tx, rx) = tokio::sync::mpsc::channel(8);
-    app.mcp.tx = Some(tx);
+    app.events = Some(tx);
     rx
 }
 
-fn drain(app: &mut App, rx: &mut tokio::sync::mpsc::Receiver<mcp::Event>) {
-    let client = Arc::new(Client::stub());
+fn drain(app: &mut App, rx: &mut tokio::sync::mpsc::Receiver<UiEvent>) {
+    let client = stub();
     while let Ok(event) = rx.try_recv() {
-        mcp::apply_event(app, &client, event);
+        ui_event::apply(app, &client, event);
     }
 }
 
@@ -74,6 +76,180 @@ fn malformed_source_is_skipped_and_new_fields_default() {
     assert_eq!(state.sources[0].label(), "fs");
     assert!(state.sources[0].plugin_name.is_none());
     assert!(state.manage_connectors_url.is_none());
+    assert!(!state.private_connectors_hidden);
+}
+
+#[test]
+fn private_connectors_warning_leads_connectors_without_taking_the_highlight() {
+    let app = open_app(&runtime(
+        vec![source("gh", "connector", json!({}))],
+        json!({
+            "privateConnectorsHidden": true,
+            "manageConnectorsUrl": "https://studio.example/connectors",
+        }),
+    ));
+    let rows = rows::rows(&app.mcp);
+    let warning = connector_lead(&rows);
+    assert!(matches!(rows[warning], Row::PrivateConnectorsHidden));
+    assert!(matches!(&rows[warning + 1], Row::Detail(hint) if hint == rows::KEY_HINT));
+    assert!(matches!(rows[warning + 2], Row::Manage));
+    assert!(matches!(&rows[app.mcp.list.selected()], Row::Source(row) if row.name == "gh"));
+}
+
+#[test]
+fn private_connectors_warning_shows_without_any_connector() {
+    let app = open_app(&runtime(
+        vec![source("fs", "server", json!({}))],
+        json!({"privateConnectorsHidden": true}),
+    ));
+    let rows = rows::rows(&app.mcp);
+    assert!(matches!(&rows[3], Row::Header(title) if title == "Available Connectors"));
+    assert!(matches!(rows[4], Row::PrivateConnectorsHidden));
+    assert!(matches!(&rows[5], Row::Detail(hint) if hint == rows::KEY_HINT));
+    assert_eq!(rows.len(), 6);
+}
+
+#[test]
+fn private_connectors_warning_shows_when_no_source_is_visible() {
+    let state =
+        serde_json::from_value(json!({"sources": [], "privateConnectorsHidden": true})).unwrap();
+    let mut app = App::default();
+    let event = mcp::Event::Opened {
+        response: None,
+        state,
+        initial_source: String::new(),
+        reopened: false,
+    };
+    mcp::apply_event(&mut app, &stub(), event);
+    assert!(app.mcp.open);
+    let rows = rows::rows(&app.mcp);
+    assert!(matches!(
+        rows[connector_lead(&rows)],
+        Row::PrivateConnectorsHidden
+    ));
+}
+
+#[test]
+fn private_connectors_warning_stays_while_search_matches_nothing() {
+    let mut app = open_app(&runtime(
+        vec![source("gh", "connector", json!({}))],
+        json!({"privateConnectorsHidden": true}),
+    ));
+    app.mcp.search.query = "zzz".to_owned();
+    let rows = rows::rows(&app.mcp);
+    assert!(matches!(rows[1], Row::PrivateConnectorsHidden));
+    assert!(matches!(&rows[2], Row::Detail(hint) if hint == rows::KEY_HINT));
+    assert_eq!(rows.len(), 3);
+}
+
+#[test]
+fn the_key_hint_shows_only_when_connectors_fail_or_are_scoped() {
+    let has_hint = |extra: Value| {
+        let app = open_app(&runtime(vec![source("gh", "connector", json!({}))], extra));
+        rows::rows(&app.mcp)
+            .iter()
+            .any(|row| matches!(row, Row::Detail(hint) if hint == rows::KEY_HINT))
+    };
+    assert!(!has_hint(json!({})));
+    assert!(has_hint(json!({"connectorError": "HTTP 401"})));
+    assert!(has_hint(json!({"privateConnectorsHidden": true})));
+}
+
+fn shared_only_app() -> App {
+    let needs_auth = json!({"status": "needs_auth", "tools": []});
+    open_app(&runtime(
+        vec![
+            source("weather", "server", needs_auth.clone()),
+            source("gmail", "connector", needs_auth),
+            source("gh", "connector", json!({})),
+        ],
+        json!({"privateConnectorsHidden": true}),
+    ))
+}
+
+#[test]
+fn shared_only_key_greys_out_connectors_that_need_a_login() {
+    let app = shared_only_app();
+    let blocked: Vec<(String, bool, bool, String)> = source_rows(&app)
+        .into_iter()
+        .map(|row| (row.name, row.blocked, row.action.is_some(), row.status))
+        .collect();
+    assert_eq!(
+        blocked,
+        [
+            ("weather".to_owned(), false, true, "needs auth".to_owned()),
+            ("gh".to_owned(), false, false, "connected".to_owned()),
+            (
+                "gmail".to_owned(),
+                true,
+                false,
+                "needs a personal API key".to_owned()
+            ),
+        ]
+    );
+}
+
+#[test]
+fn connector_needing_a_login_is_not_blocked_for_personal_keys() {
+    let needs_auth = json!({"status": "needs_auth", "tools": []});
+    let app = open_app(&runtime(
+        vec![source("gmail", "connector", needs_auth)],
+        json!({}),
+    ));
+    assert!(!source_rows(&app)[0].blocked);
+    assert_eq!(
+        source_rows(&app)[0].action,
+        Some(rows::SourceAction::ConnectorAuth)
+    );
+}
+
+#[test]
+fn enter_on_a_blocked_connector_explains_instead_of_connecting() {
+    let mut app = shared_only_app();
+    let mut rx = with_channel(&mut app);
+    while !matches!(&rows::rows(&app.mcp)[app.mcp.list.selected()], Row::Source(row) if row.name == "gmail")
+    {
+        mcp::navigate(&mut app, true);
+    }
+    assert_eq!(mcp::help_text(&app)[1].1, "why blocked");
+    mcp::select(&mut app);
+    drain(&mut app, &mut rx);
+    assert!(app.mcp.open && !app.connector_auth.open);
+    assert_eq!(app.mcp.viewing_name.as_deref(), Some("gmail"));
+    let rows = rows::rows(&app.mcp);
+    assert!(matches!(&rows[..], [Row::Hint { key, .. }] if key == "vibe --setup"));
+}
+
+#[test]
+fn private_connectors_warning_survives_a_runtime_without_it() {
+    let mut app = open_app(&runtime(
+        vec![source("gh", "connector", json!({}))],
+        json!({"privateConnectorsHidden": true}),
+    ));
+    mcp::apply_runtime(
+        &mut app,
+        &runtime(vec![source("gh", "connector", json!({}))], json!({})),
+    );
+    assert!(app.mcp.state.private_connectors_hidden);
+}
+
+#[test]
+fn private_connectors_block_survives_a_reread_without_the_flag() {
+    let mut app = shared_only_app();
+    let needs_auth = json!({"status": "needs_auth", "tools": []});
+    let state = serde_json::from_value(json!({
+        "sources": [source("gmail", "connector", needs_auth)],
+    }))
+    .unwrap();
+    let event = mcp::Event::Opened {
+        response: None,
+        state,
+        initial_source: String::new(),
+        reopened: false,
+    };
+    mcp::apply_event(&mut app, &stub(), event);
+    assert!(app.mcp.state.private_connectors_hidden);
+    assert!(source_rows(&app)[0].blocked);
 }
 
 #[test]
@@ -94,7 +270,7 @@ fn connectors_render_search_and_title_by_display_name() {
 }
 
 #[test]
-fn display_name_lookup_casefolds_like_python() {
+fn display_name_lookup_casefolds() {
     let state: MCPState = serde_json::from_value(json!({
         "sources": [source("st_alias", "connector", json!({"displayName": "Straße"}))],
     }))
@@ -126,8 +302,8 @@ fn manage_row_leads_connectors_but_never_takes_the_initial_highlight() {
         json!({"manageConnectorsUrl": "https://studio.example/connectors"}),
     ));
     let rows = rows::rows(&app.mcp);
-    assert!(matches!(rows[1], Row::Manage));
-    assert!(matches!(&rows[app.mcp.selected], Row::Source(row) if row.name == "gh"));
+    assert!(matches!(rows[connector_lead(&rows)], Row::Manage));
+    assert!(matches!(&rows[app.mcp.list.selected()], Row::Source(row) if row.name == "gh"));
 }
 
 #[test]
@@ -143,7 +319,7 @@ fn viewed_source_that_vanished_falls_back_to_the_list() {
     );
     assert!(app.mcp.viewing_name.is_none());
     assert!(
-        matches!(&rows::rows(&app.mcp)[app.mcp.selected], Row::Source(row) if row.name == "fs")
+        matches!(&rows::rows(&app.mcp)[app.mcp.list.selected()], Row::Source(row) if row.name == "fs")
     );
 }
 
@@ -169,9 +345,41 @@ fn closed_browser_ignores_runtime_updates() {
 fn refreshing_label_only_shows_in_the_list_view() {
     let mut app = open_app(&runtime(vec![source("fs", "server", json!({}))], json!({})));
     app.mcp.refreshing = true;
-    assert_eq!(rows::title(&app.mcp), "MCP Servers  (refreshing)");
+    assert_eq!(
+        rows::title(&app.mcp),
+        "MCP Servers & Connectors  (refreshing)"
+    );
     app.mcp.viewing_name = Some("fs".to_owned());
     assert_eq!(rows::title(&app.mcp), "MCP Server: fs");
+}
+
+/// The first row under the "Available Connectors" header.
+fn connector_lead(rows: &[Row]) -> usize {
+    1 + rows
+        .iter()
+        .position(|row| matches!(row, Row::Header(title) if title == "Available Connectors"))
+        .expect("connectors section")
+}
+
+#[test]
+fn an_empty_catalog_shows_both_sections_with_their_empty_notes() {
+    let app = open_app(&runtime(vec![], json!({})));
+    let notes: Vec<String> = rows::rows(&app.mcp)
+        .iter()
+        .filter_map(|row| match row {
+            Row::Header(text) | Row::Note(text) => Some(text.clone()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        notes,
+        [
+            "Local MCP Servers",
+            "No local MCP servers configured.",
+            "Available Connectors",
+            "No connectors available.",
+        ]
+    );
 }
 
 fn status(app: &App, name: &str) -> MCPSourceStatus {
@@ -186,13 +394,14 @@ fn status(app: &App, name: &str) -> MCPSourceStatus {
 
 #[test]
 fn rejected_toggle_restores_the_server_state_and_warns() {
-    let client = Arc::new(Client::stub());
+    let client = stub();
     let mut app = open_app(&runtime(vec![source("fs", "server", json!({}))], json!({})));
     mcp::set_disabled(&mut app, &client, true);
     assert_eq!(status(&app, "fs"), MCPSourceStatus::Disabled);
     mcp::apply_event(&mut app, &client, toggle_failed("fs", None));
     assert_eq!(status(&app, "fs"), MCPSourceStatus::Connected);
-    assert_eq!(app.overlays.toasts.back().unwrap().text, "rejected");
+    assert_eq!(notice(&app), Some((Severity::Error, "rejected")));
+    assert!(errors(&app).is_empty());
 }
 
 fn toggle_failed(name: &str, tool_name: Option<&str>) -> mcp::Event {
@@ -208,7 +417,7 @@ fn toggle_failed(name: &str, tool_name: Option<&str>) -> mcp::Event {
 
 #[test]
 fn rejected_toggle_keeps_the_paint_of_toggles_still_in_flight() {
-    let client = Arc::new(Client::stub());
+    let client = stub();
     let sources = vec![
         source("a", "server", json!({})),
         source("b", "server", json!({})),
@@ -224,7 +433,7 @@ fn rejected_toggle_keeps_the_paint_of_toggles_still_in_flight() {
 
 #[test]
 fn rejected_tool_toggle_restores_only_that_tool() {
-    let client = Arc::new(Client::stub());
+    let client = stub();
     let tools = json!({"tools": [{"name": "read"}, {"name": "write"}]});
     let mut app = open_app(&runtime(vec![source("fs", "server", tools)], json!({})));
     mcp::select(&mut app);
@@ -242,25 +451,26 @@ fn rejected_tool_toggle_restores_only_that_tool() {
 
 #[test]
 fn enable_waits_for_the_server_before_painting_a_status() {
-    let client = Arc::new(Client::stub());
     let disabled = json!({"status": "disabled"});
     let mut app = open_app(&runtime(vec![source("fs", "server", disabled)], json!({})));
-    mcp::set_disabled(&mut app, &client, false);
+    mcp::set_disabled(&mut app, &stub(), false);
     assert_eq!(status(&app, "fs"), MCPSourceStatus::Disabled);
 }
 
 #[test]
 fn plugin_server_toggles_are_refused_locally() {
-    let client = Arc::new(Client::stub());
     let plugin = json!({"pluginName": "devtools"});
     let mut app = open_app(&runtime(vec![source("fs", "server", plugin)], json!({})));
-    mcp::set_disabled(&mut app, &client, true);
+    mcp::set_disabled(&mut app, &stub(), true);
     assert_eq!(status(&app, "fs"), MCPSourceStatus::Connected);
-    let toast = &app.overlays.toasts.back().unwrap().text;
     assert_eq!(
-        toast,
-        "fs is managed by the devtools plugin and cannot be toggled here."
+        notice(&app),
+        Some((
+            Severity::Warning,
+            "fs is managed by the devtools plugin and cannot be toggled here."
+        ))
     );
+    assert!(warnings(&app).is_empty());
 }
 
 fn opened(app: &mut App, reopened: bool) {
@@ -273,7 +483,7 @@ fn opened(app: &mut App, reopened: bool) {
         initial_source: "weather".to_owned(),
         reopened,
     };
-    mcp::apply_event(app, &Arc::new(Client::stub()), event);
+    mcp::apply_event(app, &stub(), event);
 }
 
 #[test]
@@ -332,6 +542,112 @@ fn help_offers_connect_only_for_sources_enter_hands_to_auth() {
     assert_eq!(mcp::help_text(&app)[1].1, "connect");
 }
 
+/// DeepWiki is connecting; weather and wiki still need a login and a connection.
+fn unusable_runtime() -> Value {
+    let needs_auth = json!({"status": "needs_auth", "tools": []});
+    let needs_connect = json!({"status": "needs_connect", "tools": []});
+    runtime(
+        vec![
+            source("weather", "server", needs_auth),
+            source("deepwiki", "connector", needs_connect.clone()),
+            source("wiki", "connector", needs_connect),
+        ],
+        json!({}),
+    )
+}
+
+fn connecting_app() -> (App, tokio::sync::mpsc::Receiver<UiEvent>) {
+    let mut app = open_app(&unusable_runtime());
+    let rx = with_channel(&mut app);
+    app.mcp.connecting = Some("deepwiki".to_owned());
+    (app, rx)
+}
+
+fn view(app: &mut App, name: &str, kind: MCPSourceKind) {
+    app.mcp.viewing_name = Some(name.to_owned());
+    app.mcp.viewing_kind = Some(kind);
+}
+
+fn notes(app: &App) -> Vec<String> {
+    rows::rows(&app.mcp)
+        .into_iter()
+        .filter_map(|row| match row {
+            Row::Note(note) => Some(note),
+            _ => None,
+        })
+        .collect()
+}
+
+#[test]
+fn pending_action_names_the_flow_each_unusable_source_starts() {
+    let (app, _rx) = connecting_app();
+    let actions: Vec<_> = app
+        .mcp
+        .state
+        .sources
+        .iter()
+        .map(|source| rows::pending_action(&app.mcp.state, source))
+        .collect();
+    assert_eq!(
+        actions,
+        [
+            Some(rows::SourceAction::McpOAuth),
+            Some(rows::SourceAction::Connect),
+            Some(rows::SourceAction::Connect),
+        ]
+    );
+}
+
+#[test]
+fn only_the_connector_in_flight_reads_connecting() {
+    let (mut app, _rx) = connecting_app();
+    view(&mut app, "deepwiki", MCPSourceKind::Connector);
+    assert_eq!(notes(&app), ["Connecting..."]);
+    view(&mut app, "wiki", MCPSourceKind::Connector);
+    assert_eq!(notes(&app), ["Not connected"]);
+}
+
+#[test]
+fn a_connect_in_flight_does_not_block_another_source_login() {
+    let (mut app, mut rx) = connecting_app();
+    view(&mut app, "weather", MCPSourceKind::Server);
+    mcp::apply_runtime(&mut app, &unusable_runtime());
+    drain(&mut app, &mut rx);
+    assert!(app.mcp_oauth.open);
+    assert_eq!(app.mcp_oauth.server_name, "weather");
+}
+
+#[test]
+fn a_failed_connect_leaves_another_viewed_connector_alone() {
+    let (mut app, _rx) = connecting_app();
+    view(&mut app, "wiki", MCPSourceKind::Connector);
+    app.mcp.connecting = Some("wiki".to_owned());
+    let failed = mcp::Event::ConnectFailed {
+        name: "deepwiki".to_owned(),
+        message: "Could not connect DeepWiki (HTTP 503).".to_owned(),
+    };
+    mcp::apply_event(&mut app, &stub(), failed);
+    assert_eq!(app.mcp.viewing_name.as_deref(), Some("wiki"));
+    assert_eq!(app.mcp.connecting.as_deref(), Some("wiki"));
+    assert_eq!(
+        notice(&app),
+        Some((Severity::Error, "Could not connect DeepWiki (HTTP 503)."))
+    );
+}
+
+#[test]
+fn a_failed_connect_returns_from_its_own_view() {
+    let (mut app, _rx) = connecting_app();
+    view(&mut app, "deepwiki", MCPSourceKind::Connector);
+    let failed = mcp::Event::ConnectFailed {
+        name: "deepwiki".to_owned(),
+        message: "Could not connect DeepWiki (HTTP 503).".to_owned(),
+    };
+    mcp::apply_event(&mut app, &stub(), failed);
+    assert_eq!(app.mcp.viewing_name, None);
+    assert_eq!(app.mcp.connecting, None);
+}
+
 fn open_named(query: &str) -> App {
     let gmail = source("gm_9c1b", "connector", json!({"displayName": "Gmail"}));
     let state = serde_json::from_value(json!({"sources": [gmail]})).unwrap();
@@ -342,15 +658,8 @@ fn open_named(query: &str) -> App {
         initial_source: query.to_owned(),
         reopened: false,
     };
-    mcp::apply_event(&mut app, &Arc::new(Client::stub()), event);
+    mcp::apply_event(&mut app, &stub(), event);
     app
-}
-
-#[test]
-fn named_open_resolves_the_shown_display_name() {
-    let app = open_named("gmail");
-    assert_eq!(app.mcp.viewing_name.as_deref(), Some("gm_9c1b"));
-    assert_eq!(rows::title(&app.mcp), "Connector: Gmail");
 }
 
 #[test]
@@ -394,12 +703,11 @@ async fn toggle_response_without_runtime_rereads_the_catalog() {
     let mut rx = with_channel(&mut app);
     app.session.session_id = Some("session".to_owned());
 
-    mcp::apply_event(
-        &mut app,
-        &Arc::new(Client::stub()),
-        mcp::Event::Toggled(json!({})),
-    );
+    mcp::apply_event(&mut app, &stub(), mcp::Event::Toggled(json!({})));
 
     let event = tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv()).await;
-    assert!(matches!(event, Ok(Some(mcp::Event::Error(_)))));
+    assert!(matches!(
+        event,
+        Ok(Some(UiEvent::Mcp(mcp::Event::Error(_))))
+    ));
 }

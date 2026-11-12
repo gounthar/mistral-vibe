@@ -10,6 +10,7 @@ from mistralai_vibe_local_harness.protocol import (
     RustContentBlock,
     RustProtocolError,
     RustProvidedToolCallAction,
+    RustTextContentBlock,
     RustToolFailedEvent,
     RustToolFailureResult,
     RustToolSucceededEvent,
@@ -42,7 +43,8 @@ async def execute_provided_tool_action(
         result = await call(
             action.call.group_name, action.call.tool_name, action.call.arguments
         )
-        content = _CONTENT_BLOCKS.validate_python(list(result.content))
+        # Servers may speak a newer MCP; fields we do not know are not an error.
+        content = _CONTENT_BLOCKS.validate_python(list(result.content), extra="ignore")
     except failure_type as exc:
         return _failed(
             action,
@@ -61,7 +63,9 @@ async def execute_provided_tool_action(
                 _meta=result.meta,
                 error=RustProtocolError(
                     code=tool_error_code,
-                    message=tool_error_message,
+                    # The server's own text is what explains the failure; callers
+                    # that only read the error, like run_typescript, need it here.
+                    message=_error_text(content) or tool_error_message,
                     retryable=False,
                     details=None,
                 ),
@@ -75,6 +79,12 @@ async def execute_provided_tool_action(
             structured_content=result.structured_content,
             _meta=result.meta,
         ),
+    )
+
+
+def _error_text(content: list[RustContentBlock]) -> str:
+    return "".join(
+        block.text for block in content if isinstance(block, RustTextContentBlock)
     )
 
 
