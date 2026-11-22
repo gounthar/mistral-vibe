@@ -56,10 +56,10 @@ from mistralai_vibe_local_harness.session_protocol import (
     TokenUsage,
 )
 from mistralai_vibe_local_harness.vibe._fact_recorder import FactRecorder
-from mistralai_vibe_local_harness.vibe._file_images import is_file_image
 from mistralai_vibe_local_harness.vibe._observability import (
     add_uncorrelated_tool_result,
 )
+from mistralai_vibe_local_harness.vibe._public_content import public_content_block
 from mistralai_vibe_local_harness.vibe._runtime_config import CompletionDelta
 from mistralai_vibe_local_harness.vibe._storage import (
     ProjectionDelta,
@@ -227,6 +227,9 @@ class SessionProjector:
         token_usage = state.session.token_usage
         context_usage = state.session.context_usage
         preview = state.session.preview or first_user_message_preview(entries)
+        # Turns whose model call a pre_llm_call hook skipped: the Core discards
+        # that call in the transition that completes the Turn.
+        model_call_skipped: set[str] = set()
         for observation in transition.observations:
             if isinstance(observation, RustTurnStartedObservation):
                 latest_turn = InProgressPublicTurn(
@@ -448,6 +451,8 @@ class SessionProjector:
             ):
                 # A hook retry discards a candidate mid-turn: settle its streamed
                 # entries now, not at the end of the turn.
+                if observation.cause.type == "skipped":
+                    model_call_skipped.add(observation.turn_id)
                 entries = [
                     _settled_provisional_entry(
                         entry,
@@ -479,7 +484,12 @@ class SessionProjector:
                     else entry
                     for entry in entries
                 ]
-                if observation.stop_reason == "skipped":
+                # Only a pre_agent_turn skip drops the user message: a skipped
+                # model call (pre_llm_call) ends a Turn the Core keeps.
+                if (
+                    observation.stop_reason == "skipped"
+                    and observation.turn_id not in model_call_skipped
+                ):
                     entries = _with_skipped_user_message(
                         entries, observation.turn_id, observed_at
                     )
@@ -495,6 +505,11 @@ class SessionProjector:
                     stop_reason=_completed_stop_reason(observation),
                     skip_reason=_skip_reason(observation),
                     reject_reason=_reject_reason(observation),
+                    repeated_tool_failure=(
+                        _output_text(observation)
+                        if observation.stop_reason == "repeated_tool_failure"
+                        else None
+                    ),
                 )
             elif isinstance(observation, RustTurnInterruptedObservation):
                 started_at = _started_at(latest_turn, observation.turn_id, observed_at)
@@ -635,6 +650,23 @@ class SessionProjector:
             state.session.id, model, _model_change_count(entries) + 1, observed_at
         )
         entries.append(entry)
+        public = state.model_copy(
+            update={
+                "session": state.session.model_copy(update={"updated_at": observed_at}),
+                "history": state.history.model_copy(update={"entries": entries}),
+            }
+        )
+        return self._advance(public)
+
+    def apply_resumed(self, turn_id: str, *, observed_at: int) -> ProjectionUpdate:
+        """Record that a restart cut this turn and it carried on."""
+        state = self._projection.snapshot
+        entries = list(state.history.entries)
+        entries.append(
+            _resumed_entry(
+                state.session.id, turn_id, _resumed_count(entries) + 1, observed_at
+            )
+        )
         public = state.model_copy(
             update={
                 "session": state.session.model_copy(update={"updated_at": observed_at}),
@@ -969,7 +1001,7 @@ def _message_entry(
             "relatedEntryId": None,
             "inputEntryId": input_entry_id,
             "role": role,
-            "content": [_public_content_block(part) for part in content],
+            "content": [public_content_block(part) for part in content],
             "source": source,
             **(
                 {"userDisplayContent": user_display_content}
@@ -1379,83 +1411,6 @@ def _text_preview(parts: Sequence[str]) -> str:
     return text
 
 
-def _public_content_block(part: Any) -> JsonValue:
-    serialized = part.model_dump(mode="json", by_alias=True, exclude_none=True)
-    # An image kept with its file shows as the image it was sent as.
-    if isinstance(part, RustImageContentBlock) or is_file_image(part):
-        data, mime_type = (
-            (part.data, part.mime_type)
-            if isinstance(part, RustImageContentBlock)
-            else (part.resource.blob, part.resource.mime_type)
-        )
-        return cast(
-            JsonValue,
-            {
-                "type": "image",
-                "attachment": {
-                    "source": {"kind": "inline", "data": data},
-                    "alias": "image",
-                    "mimeType": mime_type,
-                },
-            },
-        )
-    if isinstance(serialized, dict) and serialized.get("type") == "resource_link":
-        return cast(
-            JsonValue,
-            {
-                "type": "resource",
-                "resource": {
-                    "kind": "link",
-                    "uri": serialized["uri"],
-                    **({"name": serialized["name"]} if serialized.get("name") else {}),
-                    **(
-                        {"title": serialized["title"]}
-                        if serialized.get("title")
-                        else {}
-                    ),
-                    **(
-                        {"description": serialized["description"]}
-                        if serialized.get("description")
-                        else {}
-                    ),
-                    **(
-                        {"mediaType": serialized["mimeType"]}
-                        if serialized.get("mimeType")
-                        else {}
-                    ),
-                    **(
-                        {"size": serialized["size"]}
-                        if serialized.get("size") is not None
-                        else {}
-                    ),
-                },
-            },
-        )
-    if isinstance(serialized, dict) and serialized.get("type") == "resource":
-        resource = serialized.get("resource")
-        if isinstance(resource, dict):
-            return cast(
-                JsonValue,
-                {
-                    "type": "resource",
-                    "resource": {
-                        "kind": "text" if "text" in resource else "blob",
-                        "uri": resource["uri"],
-                        **(
-                            {"mediaType": resource["mimeType"]}
-                            if resource.get("mimeType")
-                            else {}
-                        ),
-                        **({"text": resource["text"]} if "text" in resource else {}),
-                        **({"blob": resource["blob"]} if "blob" in resource else {}),
-                    },
-                },
-            )
-    if isinstance(serialized, dict):
-        serialized.pop("_meta", None)
-    return cast(JsonValue, serialized)
-
-
 def _running_effect_entry(
     session_id: str,
     entries: Sequence[JsonObject],
@@ -1480,6 +1435,8 @@ def _running_effect_entry(
             "title": tool_name,
             "detail": detail,
             "state": {"status": "running", "outputText": ""},
+            # The model's call ID, which the call's hook notices name.
+            "toolCallId": action.call_id,
         },
     )
 
@@ -1545,6 +1502,36 @@ def _model_change_entry(
             "kind": "model_change",
             "message": f"Model changed to {model}",
             "details": {"model": model},
+        },
+    )
+
+
+def _resumed_count(entries: Sequence[JsonObject]) -> int:
+    return sum(
+        1
+        for entry in entries
+        if entry.get("type") == "checkpoint" and entry.get("kind") == "resumed"
+    )
+
+
+def _resumed_entry(
+    session_id: str, turn_id: str, sequence: int, observed_at: int
+) -> JsonObject:
+    return cast(
+        JsonObject,
+        {
+            "type": "checkpoint",
+            "id": f"checkpoint-resumed-{sequence}",
+            "sessionId": session_id,
+            "turnId": turn_id,
+            "createdAt": observed_at,
+            "updatedAt": observed_at,
+            "generationStatus": "completed",
+            "relatedEntryId": None,
+            "inputEntryId": None,
+            "kind": "resumed",
+            "message": "Resumed after a restart",
+            "details": {},
         },
     )
 
@@ -1804,6 +1791,8 @@ def _completed_effect_entry(  # noqa: PLR0914 - one cohesive effect entry
             "title": tool_name,
             "detail": {**detail, "display": display},
             "state": effect_state,
+            # A call a pre_tool hook denied names its hook line by this ID too.
+            "toolCallId": observation.call_id,
         },
     )
 

@@ -13,7 +13,8 @@ import difflib
 from typing import Any, Final, Protocol
 import uuid
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic_core import to_json
 
 from vibe.app_server._session_spawn import MAX_SESSION_HOPS, MAX_TURN_STARTED_SESSIONS
 from vibe.app_server.protocol import (
@@ -41,6 +42,13 @@ from vibe.app_server.protocol import (
     SessionPeerSendParams,
     SessionPeerSendResponse,
 )
+
+VIBE_BOT_SENDER_PREFIX: Final = "vibebot:"
+
+
+def is_vibe_bot_sender(session_id: str) -> bool:
+    return session_id.startswith(VIBE_BOT_SENDER_PREFIX)
+
 
 LIST_SESSIONS_TOOL_NAME = "list_sessions"
 READ_SESSION_TOOL_NAME = "read_session"
@@ -86,9 +94,10 @@ for an update it does not need to act on. The other session knows the message \
 comes from this one, so write only the message itself, self-contained, without \
 saying who sends it. It returns once the message is delivered, not when it is \
 answered: tell the user it was sent. Leave `session_id` out to message the \
-session that started this one. A session this one started reports back \
-with its own message, which arrives as a new turn here, so do not read it \
-over and over to wait for it. Never send a message to this session itself. \
+session that started this one. When a turn this session started there ends, \
+its final reply comes back here on its own, so do not read it over and over \
+to wait for it, and do not send your own final reply back with this tool. \
+Never send a message to this session itself. \
 After {MAX_SESSION_HOPS} messages and starts between sessions in a row \
 without the user writing, sending is refused until the user writes: tell the \
 user instead. One turn sends at most {MAX_TURN_STARTED_SESSIONS} 'start_turn' \
@@ -118,6 +127,16 @@ again when it next finishes a turn. {SESSION_REFERENCE}"""
 DEFAULT_LIST_LIMIT: Final = 20
 MAX_LIST_LIMIT: Final = 50
 MAX_MESSAGE_CHARS: Final = 4000
+# The Agents Session API's default `SessionIntakeLimits.pending_bytes`: the
+# UTF-8 JSON bytes a session's waiting commands may hold together, so one
+# command over it is refused for good, and a smaller one while the target is
+# busy may be refused for retry. The reserve is a margin for the command
+# wrapper and the session_message header, not a measured size.
+_SESSION_API_COMMAND_BYTES: Final = 1024 * 1024
+_COMMAND_WRAPPER_RESERVE_BYTES: Final = 16 * 1024
+MAX_SEND_MESSAGE_BYTES: Final = (
+    _SESSION_API_COMMAND_BYTES - _COMMAND_WRAPPER_RESERVE_BYTES
+)
 DEFAULT_MESSAGE_LIMIT: Final = 10
 MAX_MESSAGE_LIMIT: Final = 50
 MAX_SESSIONS_PER_CALL: Final = 50
@@ -193,7 +212,7 @@ class SendToSessionArgs(BaseModel):
         ),
     )
     message: str = Field(
-        min_length=1, max_length=MAX_MESSAGE_CHARS, description="The message to send."
+        min_length=1, description="The message to send, at most about 1 MB."
     )
     delivery: PeerDelivery = Field(
         description=(
@@ -201,6 +220,17 @@ class SendToSessionArgs(BaseModel):
             "when it is only for its next turn to read."
         )
     )
+
+    @field_validator("message")
+    @classmethod
+    def _fits_a_session_command(cls, message: str) -> str:
+        size = len(to_json(message))
+        if size > MAX_SEND_MESSAGE_BYTES:
+            raise ValueError(
+                f"The message is {size} bytes as UTF-8 JSON; the limit is "
+                f"{MAX_SEND_MESSAGE_BYTES}. Send a shorter message."
+            )
+        return message
 
 
 class ArchiveSessionsArgs(BaseModel):
@@ -365,9 +395,12 @@ async def run_send_to_session(
             "messages until the user does. Tell the user instead.",
             reason=SESSION_LIMIT_HOPS,
         )
+    starter = None if peer.starter_of is None else peer.starter_of(session_id)
+    # A Vibebot session talks to its bot's threads, which its bot resolves.
+    to_bot = starter is not None and is_vibe_bot_sender(starter)
     target = (
         await _resolve_one(args.session_id, session_id, peers)
-        if args.session_id is not None
+        if args.session_id is not None and not to_bot
         else _starter(session_id, peer)
     )
     starts_turn = args.delivery == "start_turn"
@@ -396,6 +429,9 @@ async def run_send_to_session(
                 idempotency_key=str(
                     uuid.uuid5(_IDEMPOTENCY_NAMESPACE, f"{session_id}/{invocation_id}")
                 ),
+                bot_to=args.session_id
+                if to_bot and args.session_id != starter
+                else None,
             )
         )
 

@@ -14,6 +14,9 @@ pub(crate) fn cancel_capture(app: &mut App, keep_selection: bool) {
                 | MouseTarget::Trust
                 | MouseTarget::BottomBar
                 | MouseTarget::Loading
+                | MouseTarget::CodePreview
+                | MouseTarget::GoalRow
+                | MouseTarget::RailWindow
                 | MouseTarget::Question
                 | MouseTarget::Approval
                 | MouseTarget::BottomApp
@@ -23,11 +26,15 @@ pub(crate) fn cancel_capture(app: &mut App, keep_selection: bool) {
                 | MouseTarget::ThinkingPicker
                 | MouseTarget::LogLevelPicker
                 | MouseTarget::ArtifactsModal
+                | MouseTarget::Loops
+                | MouseTarget::GoalConfirm
                 | MouseTarget::ResumePicker
                 | MouseTarget::Mcp
                 | MouseTarget::Plugins
+                | MouseTarget::TrustedFolders
                 | MouseTarget::Skills
                 | MouseTarget::SkillsBody
+                | MouseTarget::LoopsDetails
                 | MouseTarget::McpOAuth
                 | MouseTarget::ConnectorAuth
         ) {

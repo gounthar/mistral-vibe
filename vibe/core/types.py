@@ -17,11 +17,14 @@ from pydantic import (
     ConfigDict,
     Field,
     JsonValue,
+    ValidationError,
     model_validator,
 )
 
 from vibe.core.experiments.models import EvalResponse
 from vibe.core.session.artifacts import SessionArtifact, WorktreeArtifact
+from vibe.core.skills.models import ManifestEntry
+from vibe.observability.logging import logger
 from vibe.user_content import UserDisplayContent, UserResource
 from vibe.utils.tool_presentation import ToolCallPresentation, ToolResultPresentation
 
@@ -74,6 +77,30 @@ class SessionProject(BaseModel):
     id: str | None = None
 
 
+class OwedReply(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    to_session_id: str
+    turn_id: str
+    hops: int = 1
+    # Saved as soon as the turn ends, so a send retried later, or after a
+    # restart, still reports that turn and not what the session did since.
+    text: str | None = None
+
+
+def _readable_skill_pins(raw: Any) -> Any:
+    """An unreadable pick is dropped, so it never makes the session unreadable."""
+    if not isinstance(raw, list):
+        return raw
+    pins: list[ManifestEntry] = []
+    for item in raw:
+        try:
+            pins.append(ManifestEntry.model_validate(item))
+        except ValidationError:
+            logger.warning("Dropping an unreadable session skill pick: %r", item)
+    return pins
+
+
 class SessionMetadata(BaseModel):
     session_id: str
     parent_session_id: str | None = None
@@ -118,6 +145,9 @@ class SessionMetadata(BaseModel):
     # opens, so a resume after the switch changed records the new path. ``None``
     # for sessions written before this field existed.
     runtime_path: Literal["session_api", "direct"] | None = None
+    # The runtime that owns this session, fixed at creation. ``None`` for older
+    # sessions, which are local. Opens read it with ``_session_runtime_owner``.
+    runtime: Literal["local", "target"] | None = None
     import_provenance: dict[str, JsonValue] | None = None
     created_worktree: WorktreeContext | None = None
     # The project the session was started in, written once; None for unstamped sessions.
@@ -126,6 +156,12 @@ class SessionMetadata(BaseModel):
     # Absent from sessions written before this field existed; defaults to [].
     artifacts: list[SessionArtifact] = Field(default_factory=list)
     worktrees: list[WorktreeArtifact] = Field(default_factory=list)
+    owed_replies: list[OwedReply] = Field(default_factory=list)
+    # Registry skills picked for this session only (``skills/import`` with scope
+    # ``session``); reopening the session restores them.
+    skill_pins: Annotated[
+        list[ManifestEntry], BeforeValidator(_readable_skill_pins)
+    ] = Field(default_factory=list)
 
 
 class FunctionCall(BaseModel):

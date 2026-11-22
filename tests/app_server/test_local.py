@@ -24,6 +24,8 @@ from vibe.app_server.protocol import (
     SessionOptions,
     WorkspaceGitCheckoutsParams,
     WorkspaceGitCheckoutsResponse,
+    WorkspaceWorktreeAutoUpdateParams,
+    WorkspaceWorktreeAutoUpdateResponse,
     WorkspaceWorktreeLimitUpdateParams,
     WorkspaceWorktreeLimitUpdateResponse,
     WorkspaceWorktreeListParams,
@@ -623,6 +625,31 @@ async def test_passive_host_updates_worktree_limit(
 
 
 @pytest.mark.asyncio
+async def test_passive_host_updates_auto_worktree(
+    config_dir: Path, process_services: ProcessServices
+) -> None:
+    handler = HostRequestHandler(
+        HarnessFilesManager(sources=("user",)),
+        org_config=process_services.org_config,
+        worktrees=process_services.worktrees,
+        experiments=process_services.experiments,
+        model_catalog=process_services.model_catalog,
+    )
+
+    result = await handler.dispatch(
+        "workspace/git/worktrees/auto/update",
+        WorkspaceWorktreeAutoUpdateParams(auto=True).model_dump(
+            mode="json", by_alias=True
+        ),
+    )
+
+    response = cast(WorkspaceWorktreeAutoUpdateResponse, result.response)
+    assert response.auto is True
+    assert response.failures == []
+    assert "auto_worktree = true" in (config_dir / "config.toml").read_text()
+
+
+@pytest.mark.asyncio
 async def test_passive_host_reports_the_repository_counterpart(
     tmp_path: Path, process_services: ProcessServices
 ) -> None:
@@ -1007,14 +1034,14 @@ async def test_config_load_is_bound_to_harness_cwd(
     config_dir = project / ".vibe"
     config_dir.mkdir(parents=True)
     with (config_dir / "config.toml").open("wb") as file:
-        tomli_w.dump({"default_agent": "ask"}, file)
+        tomli_w.dump({"default_approval_policy": "ask"}, file)
     trusted_folders_manager.trust_for_session(project)
     monkeypatch.chdir(tmp_path)
 
     harness_files = HarnessFilesManager(sources=("project",), cwd=project)
 
     loaded = await runtime.build_default_orchestrator(harness_files=harness_files)
-    assert loaded.config.default_agent == "ask"
+    assert loaded.config.default_approval_policy == "ask"
 
     monkeypatch.setenv("VIBE_DEFAULT_AGENT", "lean")
     loaded = await runtime.build_default_orchestrator(harness_files=harness_files)

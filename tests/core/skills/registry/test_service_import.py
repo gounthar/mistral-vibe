@@ -18,9 +18,10 @@ from tests.skills.registry.test_service import (
     _skill_payload,
 )
 from vibe.core.skills.manager import SkillManager
+from vibe.core.skills.models import ManifestEntry
 from vibe.core.skills.parser import parse_skill_markdown
 from vibe.core.skills.registry import _manifest, _resolved, _service, _store
-from vibe.core.skills.registry._manifest import ManifestEntry, SkillManifest
+from vibe.core.skills.registry._manifest import SkillManifest
 
 
 @pytest.mark.asyncio
@@ -101,6 +102,52 @@ async def test_import_skill_refuses_a_scope_another_skill_of_its_name_holds(
     manifest = _manifest.load_sync(_manifest.global_manifest_path())
     assert [(e.name, e.skill_id) for e in manifest.skills] == [("sk", "other")]
     assert not await _store.is_materialized("cid", 3)
+
+
+_BROKEN_MANIFEST = '[[skills]]\nname = "kept"\nskill_id = "k"\nversion = 1\n[[[\n'
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_import_skill_leaves_a_manifest_it_cannot_read_unchanged(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(_service, "_resolve_endpoint", _endpoint)
+    respx.get(f"{_URL}/cid").mock(
+        return_value=httpx.Response(200, json=_skill_payload("cid", "sk", version=3))
+    )
+    path = _manifest.global_manifest_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(_BROKEN_MANIFEST, encoding="utf-8")
+
+    with pytest.raises(_service.RegistrySkillsError, match="invalid TOML"):
+        await _service.import_skill(_config(), "cid", version=3)
+
+    assert path.read_text(encoding="utf-8") == _BROKEN_MANIFEST
+
+
+def test_remove_skill_leaves_a_manifest_it_cannot_read_unchanged() -> None:
+    path = _manifest.global_manifest_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(_BROKEN_MANIFEST, encoding="utf-8")
+
+    with pytest.raises(_service.RegistrySkillsError, match="left unchanged"):
+        _service.remove_skill("kept")
+
+    assert path.read_text(encoding="utf-8") == _BROKEN_MANIFEST
+
+
+def test_an_unreadable_manifest_is_a_config_issue() -> None:
+    path = _manifest.global_manifest_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(_BROKEN_MANIFEST, encoding="utf-8")
+    config = build_test_vibe_config(experimental_enable_registry_skills=True)
+
+    issues = SkillManager(lambda: config).config_issues
+
+    assert [(issue.file, issue.message.split(":")[0]) for issue in issues] == [
+        (path, "Shared skills not loaded")
+    ]
 
 
 @pytest.mark.asyncio
@@ -216,6 +263,45 @@ async def test_import_skill_custom_alias(monkeypatch: pytest.MonkeyPatch) -> Non
 
 @pytest.mark.asyncio
 @respx.mock
+async def test_a_session_import_pins_the_fetched_version_and_writes_no_manifest(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(_service, "_resolve_endpoint", _endpoint)
+    respx.get(f"{_URL}/cid").mock(
+        return_value=httpx.Response(200, json=_skill_payload("cid", "sk", version=4))
+    )
+
+    entry = await _service.import_session_skill(_config(), "cid")
+
+    assert (entry.name, entry.version) == ("sk", 4)
+    assert await _store.is_materialized("cid", 4)
+    assert not _manifest.global_manifest_path().exists()
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_a_session_import_uses_the_connections_credential(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    seen: list[object] = []
+
+    def endpoint(config: Any, credentials: Any = None) -> _service._Endpoint:
+        seen.append(credentials)
+        return _endpoint(config)
+
+    monkeypatch.setattr(_service, "_resolve_endpoint", endpoint)
+    respx.get(f"{_URL}/cid").mock(
+        return_value=httpx.Response(200, json=_skill_payload("cid", "sk"))
+    )
+    sign_in: Any = object()
+
+    await _service.import_session_skill(_config(), "cid", credentials=sign_in)
+
+    assert seen == [sign_in]
+
+
+@pytest.mark.asyncio
+@respx.mock
 async def test_set_skill_version_delegates(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(_service, "_resolve_endpoint", _endpoint)
     await _pin(ManifestEntry(name="sk", skill_id="cid", version="latest"))
@@ -307,3 +393,46 @@ async def test_import_project_scope_uses_given_roots(
     # The global manifest is untouched.
     global_manifest = _manifest.load_sync(_manifest.global_manifest_path())
     assert not any(e.name == "sk" for e in global_manifest.skills)
+
+
+@pytest.mark.asyncio
+async def test_restoring_picks_already_in_the_store_asks_nothing(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A reopen that a cleanup took nothing from must not hold the first turn."""
+    await _store.materialize(make_item(skill_id="cid", version=1), "sk")
+
+    def no_endpoint(*_: Any) -> None:
+        raise AssertionError("resolved an endpoint with nothing to fetch")
+
+    monkeypatch.setattr(_service, "_resolve_endpoint", no_endpoint)
+
+    missing = await _service.restore_session_skills(
+        build_test_vibe_config(), [ManifestEntry(name="sk", skill_id="cid", version=1)]
+    )
+
+    assert missing == []
+    assert "Could not restore" not in caplog.text
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_restoring_returns_the_picks_it_could_not_fetch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(_service, "_resolve_endpoint", _endpoint)
+    respx.get(f"{_URL}/ok").mock(
+        return_value=httpx.Response(200, json=_skill_payload("ok", "fine", version=1))
+    )
+    respx.get(f"{_URL}/down").mock(return_value=httpx.Response(503))
+
+    missing = await _service.restore_session_skills(
+        build_test_vibe_config(),
+        [
+            ManifestEntry(name="fine", skill_id="ok", version=1),
+            ManifestEntry(name="broken", skill_id="down", version=1),
+        ],
+    )
+
+    assert missing == ["broken"]
+    assert await _store.is_materialized("ok", 1)

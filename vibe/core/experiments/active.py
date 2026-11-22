@@ -13,6 +13,10 @@ class ExperimentSurface(StrEnum):
 
 class ExperimentName(StrEnum):
     SYSTEM_PROMPT = "vibe_cli_system_prompt"
+    # The behavior part of the system prompt, so a new one ships without a
+    # release. A non-blank value takes precedence over the SYSTEM_PROMPT
+    # variant's; the app server still appends the client surface block.
+    SYSTEM_PROMPT_BEHAVIOR = "vibe_cli_system_prompt_behavior"
     MANAGED_SHELL_TOOLS = "vibe_cli_managed_shell_tools"
     CLI_MODEL_ROUTING = "vibe_cli_default_routing_model"
     SMART_APPROVE = "vibe_cli_smart_approve"
@@ -23,13 +27,14 @@ class ExperimentName(StrEnum):
     CLI_EXTRA_MODELS = "vibe_cli_extra_models"
     REGISTRY_SKILLS = "vibe_cli_registry_skills"
     MISTRAL_MCP_CONNECTOR = "vibe_cli_mistral_mcp_connector"
-    LOCAL_RUNTIME_SESSION_API = "vibe_cli_local_runtime_session_api_migration"
     MODEL_CATALOG = "vibe_cli_model_catalog"
     MODEL_CATALOG_FILTER = "vibe_cli_model_catalog_filter"
+    STORAGE_USAGE = "vibe_storage_usage"
 
 
 DEFAULT_VARIANTS: Final[dict[ExperimentName, object]] = {
     ExperimentName.SYSTEM_PROMPT: "cli",
+    ExperimentName.SYSTEM_PROMPT_BEHAVIOR: "",
     ExperimentName.MANAGED_SHELL_TOOLS: "legacy",
     ExperimentName.CLI_MODEL_ROUTING: {},
     ExperimentName.SMART_APPROVE: False,
@@ -37,9 +42,9 @@ DEFAULT_VARIANTS: Final[dict[ExperimentName, object]] = {
     ExperimentName.CLI_EXTRA_MODELS: {},
     ExperimentName.REGISTRY_SKILLS: False,
     ExperimentName.MISTRAL_MCP_CONNECTOR: False,
-    ExperimentName.LOCAL_RUNTIME_SESSION_API: False,
     ExperimentName.MODEL_CATALOG: False,
     ExperimentName.MODEL_CATALOG_FILTER: {},
+    ExperimentName.STORAGE_USAGE: False,
 }
 
 assert all(name in DEFAULT_VARIANTS for name in ExperimentName), (
@@ -51,6 +56,8 @@ assert all(name in DEFAULT_VARIANTS for name in ExperimentName), (
 # silently in the direction that corrupts the readout.
 EXPERIMENT_SURFACES: Final[dict[ExperimentName, frozenset[ExperimentSurface]]] = {
     ExperimentName.SYSTEM_PROMPT: frozenset(ExperimentSurface),
+    # Only the Unified runtime composes the system prompt from this text.
+    ExperimentName.SYSTEM_PROMPT_BEHAVIOR: frozenset({ExperimentSurface.UNIFIED}),
     ExperimentName.CLI_MODEL_ROUTING: frozenset(ExperimentSurface),
     ExperimentName.CLI_EXTRA_MODELS: frozenset(ExperimentSurface),
     ExperimentName.REGISTRY_SKILLS: frozenset(ExperimentSurface),
@@ -62,10 +69,9 @@ EXPERIMENT_SURFACES: Final[dict[ExperimentName, frozenset[ExperimentSurface]]] =
     ExperimentName.SMART_APPROVE: frozenset({ExperimentSurface.UNIFIED}),
     ExperimentName.DEFAULT_AGENT: frozenset({ExperimentSurface.UNIFIED}),
     ExperimentName.MISTRAL_MCP_CONNECTOR: frozenset(ExperimentSurface),
-    # Only the Unified backend's app server talks to the local runtime.
-    ExperimentName.LOCAL_RUNTIME_SESSION_API: frozenset({ExperimentSurface.UNIFIED}),
     ExperimentName.MODEL_CATALOG: frozenset(ExperimentSurface),
     ExperimentName.MODEL_CATALOG_FILTER: frozenset(ExperimentSurface),
+    ExperimentName.STORAGE_USAGE: frozenset(ExperimentSurface),
 }
 
 assert all(name in EXPERIMENT_SURFACES for name in ExperimentName), (

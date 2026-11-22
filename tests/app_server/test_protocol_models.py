@@ -36,6 +36,7 @@ from vibe.app_server.protocol import (
     InitializeParams,
     InvalidParamsData,
     InvalidParamsIssue,
+    LoopsCreateParams,
     MessageAnnotations,
     PageRequest,
     ProtocolError,
@@ -242,7 +243,8 @@ def test_agent_config_carries_app_server_and_vibe_launch_fields() -> None:
         "instructions": "Use the project conventions.",
         "workdir": "/workspace",
         "workspaceRoots": ["/workspace", "/shared"],
-        "agent": "ask",
+        "agent": "reviewer",
+        "approvalPolicy": "ask",
         "tools": [
             {
                 "name": "select_customer",
@@ -258,6 +260,7 @@ def test_agent_config_carries_app_server_and_vibe_launch_fields() -> None:
     assert config.completion.model == "mistral-large-latest"
     assert config.workdir == "/workspace"
     assert config.workspace_roots == ["/workspace", "/shared"]
+    assert (config.agent, config.approval_policy) == ("reviewer", "ask")
     assert config.tools[0].input_schema == {"type": "object"}
 
 
@@ -288,6 +291,7 @@ def test_session_start_wraps_vibe_configuration_in_agent_config() -> None:
             "workspaceRoots": [],
             "worktree": None,
             "agent": None,
+            "approvalPolicy": None,
             "autoApprove": False,
             "enabledTools": None,
             "disabledTools": [],
@@ -310,6 +314,7 @@ def test_session_start_wraps_vibe_configuration_in_agent_config() -> None:
         "sessionOnly": False,
         "firstTurn": None,
         "startedBySessionId": None,
+        "spawnedBySessionId": None,
     }
 
 
@@ -1031,3 +1036,21 @@ def test_cumulative_budgets_validate_values_in_every_mode() -> None:
         AgentConfig(max_session_tokens=-1)
     with pytest.raises(ValueError, match="finite number"):
         AgentConfig(max_price=float("nan"))
+
+
+@pytest.mark.parametrize(
+    "schedule", [{"interval": "30s", "cron": "0 9 * * *"}, {}], ids=["both", "neither"]
+)
+def test_loops_create_takes_exactly_one_schedule(schedule: dict[str, str]) -> None:
+    with pytest.raises(ValidationError, match="Exactly one of interval or cron"):
+        LoopsCreateParams.model_validate({"sessionId": "s", "prompt": "p", **schedule})
+
+
+def test_loops_create_keeps_an_interval_only_payload_unchanged() -> None:
+    params = LoopsCreateParams(session_id="s", interval="30s", prompt="p")
+
+    assert params.model_dump(mode="json", by_alias=True) == {
+        "sessionId": "s",
+        "interval": "30s",
+        "prompt": "p",
+    }

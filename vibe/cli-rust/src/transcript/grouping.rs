@@ -24,6 +24,8 @@ pub struct Group<'a> {
     pub reasoning: bool,
     /// A reasoning row of the live group is still streaming.
     pub thinking: bool,
+    /// Hook lines in the group: the header counts them when it has nothing else.
+    pub hooks: usize,
 }
 
 impl Group<'_> {
@@ -33,6 +35,12 @@ impl Group<'_> {
         labels.extend(segments(&self.kinds, false));
         if self.reasoning {
             labels.push(if self.thinking { "thinking" } else { "thought" }.to_owned());
+        }
+        // Model-call hooks can line up with no tool between them.
+        if labels.is_empty() && self.hooks > 0 {
+            let noun = if self.hooks == 1 { "hook" } else { "hooks" };
+            let verb = if self.finalized { "ran" } else { "running" };
+            labels.push(format!("{verb} {} {noun}", self.hooks));
         }
         let mut label = labels.join(", ");
         if let Some(first) = label.get_mut(0..1) {
@@ -108,7 +116,7 @@ pub fn effect_kind(entry: &HistoryEntry) -> Option<&str> {
 /// Whether the entry paints no transcript row: a callback (the approval panel
 /// is transient), a server notice that only drives side effects (`push_notice`
 /// in `ui/transcript/entry/notice.rs` is the dispatch this must mirror), a
-/// server checkpoint other than a painted compaction or model change, or an
+/// server checkpoint other than a painted compaction, resume or model change, or an
 /// unrecognized type. Such rows must not break a run of tool calls into
 /// consecutive blocks: all calls between them collapse into one block.
 pub fn renders_nothing(entry: &HistoryEntry, local: bool) -> bool {
@@ -118,10 +126,13 @@ pub fn renders_nothing(entry: &HistoryEntry, local: bool) -> bool {
     match entry {
         HistoryEntry::Callback(_) | HistoryEntry::Unknown => true,
         HistoryEntry::Checkpoint(checkpoint) => {
-            !local && !(checkpoint.kind == "model_change" || paints_compaction(checkpoint))
+            !local
+                && !(checkpoint.kind == "model_change"
+                    || paints_compaction(checkpoint)
+                    || paints_resumed(checkpoint))
         }
-        // A fired loop paints on its prompt, so no server notice paints a row.
-        HistoryEntry::Notice(_) => !local,
+        // A fired loop paints on its prompt; goal notices are the only server notices with a row.
+        HistoryEntry::Notice(_) => !local && !super::goal_notice::is_goal(entry),
         _ => false,
     }
 }
@@ -131,6 +142,11 @@ pub fn renders_nothing(entry: &HistoryEntry, local: bool) -> bool {
 pub fn paints_compaction(checkpoint: &CheckpointEntry) -> bool {
     checkpoint.kind == "compaction"
         && checkpoint.details.get("trigger").and_then(Value::as_str) != Some("manual")
+}
+
+/// Whether a server checkpoint marks a turn carried on after a restart.
+pub fn paints_resumed(checkpoint: &CheckpointEntry) -> bool {
+    checkpoint.kind == "resumed"
 }
 
 /// Whether a settled compaction checkpoint records a failed attempt.
@@ -239,22 +255,6 @@ pub(super) fn is_hidden_hook_notice(entry: &HistoryEntry, prior: &[StoredEntry])
     }
 }
 
-/// The pre-tool hook notices render above the paired tool row: the entry id
-/// they insert ahead of, when it exists.
-pub(super) fn pre_tool_anchor(entry: &HistoryEntry) -> Option<String> {
-    let HistoryEntry::Notice(notice) = entry else {
-        return None;
-    };
-    let detail = notice.detail.as_ref()?;
-    if detail.scope.as_deref() != Some("pre_tool") {
-        return None;
-    }
-    match detail.kind.as_deref() {
-        Some(kind) if kind.starts_with("hook_") => detail.tool_call_id.clone(),
-        _ => None,
-    }
-}
-
 /// A completed hook mounts its system message line only when the
 /// content and hook name are set and the `(scope, toolCallId)` container a
 /// `hook_run_started` opened is still registered.
@@ -270,6 +270,7 @@ fn container_key(detail: &NoticeDetail) -> String {
     match detail.scope.as_deref() {
         Some("post_agent") => "agent_turn".to_owned(),
         Some("pre_agent") => "agent_turn_start".to_owned(),
+        Some(scope @ ("pre_llm" | "post_llm")) => scope.to_owned(),
         scope => format!(
             "{}:{}",
             scope.unwrap_or(""),
@@ -278,26 +279,24 @@ fn container_key(detail: &NoticeDetail) -> String {
     }
 }
 
-/// Whether a `hook_run_started` opened the key and no `hook_run_completed`
-/// closed it yet (`_hook_containers` is popped by the run's completion).
+/// Whether the key's latest run event is a `hook_run_started`, not a
+/// `hook_run_completed` (`_hook_containers` is popped by the run's completion).
 fn container_open(detail: &NoticeDetail, prior: &[StoredEntry]) -> bool {
     let key = container_key(detail);
-    let mut open = false;
-    for stored in prior {
-        let HistoryEntry::Notice(notice) = &stored.typed else {
-            continue;
-        };
-        let Some(prior_detail) = notice.detail.as_ref() else {
-            continue;
-        };
-        if container_key(prior_detail) != key {
-            continue;
-        }
-        match prior_detail.kind.as_deref() {
-            Some("hook_run_started") => open = true,
-            Some("hook_run_completed") => open = false,
-            _ => {}
-        }
-    }
-    open
+    prior
+        .iter()
+        .rev()
+        .find_map(|stored| {
+            let HistoryEntry::Notice(notice) = &stored.typed else {
+                return None;
+            };
+            let prior_detail = notice.detail.as_ref()?;
+            let open = match prior_detail.kind.as_deref() {
+                Some("hook_run_started") => true,
+                Some("hook_run_completed") => false,
+                _ => return None,
+            };
+            (container_key(prior_detail) == key).then_some(open)
+        })
+        .unwrap_or(false)
 }

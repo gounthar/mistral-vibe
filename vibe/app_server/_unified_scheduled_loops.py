@@ -11,7 +11,14 @@ from typing import Literal
 
 from croniter import CroniterError, croniter
 from dateutil.tz import gettz
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    ValidationError,
+    field_validator,
+    model_validator,
+)
 
 from vibe.core.loop import (
     MAX_LOOPS_PER_SESSION,
@@ -20,6 +27,7 @@ from vibe.core.loop import (
     parse_interval,
 )
 from vibe.utils.io import atomic_replace, file_write_lock, read_safe_async
+from vibe.utils.platform import PRIVATE_DIRECTORY_MODE
 
 
 class ScheduledLoopStoreError(RuntimeError):
@@ -86,6 +94,14 @@ class ScheduledPrompt(BaseModel):
             return now + self.interval_seconds
         assert self.cron is not None
         return _next_cron_fire(self.cron, now)
+
+
+def _readable(error: ValidationError) -> str:
+    """The validators' own messages, without Pydantic's wrapping."""
+    return " ".join(
+        str(detail.get("ctx", {}).get("error", detail["msg"]))
+        for detail in error.errors()
+    )
 
 
 class _StoredLoopsV1(BaseModel):
@@ -205,6 +221,8 @@ class UnifiedScheduledLoops:
                     created_at=now,
                 )
                 loop.next_fire_at = loop.next_fire_after(now)
+            except ValidationError as exc:
+                raise LoopError(_readable(exc)) from exc
             except (ValueError, OverflowError) as exc:
                 raise LoopError(str(exc)) from exc
             await self._commit([*self._loops, loop])
@@ -294,7 +312,9 @@ class UnifiedScheduledLoops:
         if not self._persistent():
             return
         try:
-            self._path.parent.mkdir(parents=True, mode=0o700, exist_ok=True)
+            self._path.parent.mkdir(
+                parents=True, mode=PRIVATE_DIRECTORY_MODE, exist_ok=True
+            )
             # Scheduled loops reference session content, so the store file is
             # created owner-only; an existing file keeps its current mode.
             self._path.touch(mode=0o600, exist_ok=True)

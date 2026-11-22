@@ -4,13 +4,17 @@ use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::style::Color;
 
-use crate::selection::cells::{is_blank, skip_blanks_right, word_end, word_start};
+use crate::selection::cells::is_blank;
 use crate::selection::region::RowSpan;
+use crate::selection::row_ranges::{chrome_at, in_raw, RowChrome};
+use crate::selection::snap::snap;
 use crate::selection::Granularity;
 use crate::ui::theme;
 
 /// Leading chrome glyphs, each followed by its own padding column (body text may open with one too).
-const CHROME_GLYPHS: [&str; 6] = ["⎢", "⎣", "⏵", "⏷", "■", "▌"];
+const CHROME_GLYPHS: [&str; 4] = ["⏵", "⏷", "■", "▌"];
+/// Entry border glyphs, chrome only inside the entry's border columns: tool output often draws them too.
+const BORDER_GLYPHS: [&str; 2] = ["│", "└"];
 /// Prompt and settled markers, chrome only in the first column: deeper in, a wrapped `>` or `/ path` row is content.
 const MARKER_GLYPHS: [&str; 3] = [">", "/", "✓"];
 const CHROME_WIDTH: u16 = 2;
@@ -23,12 +27,12 @@ const EDGE: [&str; 5] = ["─", "┌", "┐", "└", "┘"];
 const RAIL: &str = "│";
 
 /// A row under the selection: its selectable body `[lo, hi]` and clipped `[x0, x1]`.
-struct Row {
-    y: u16,
-    lo: u16,
-    hi: u16,
-    x0: u16,
-    x1: u16,
+pub(super) struct Row {
+    pub y: u16,
+    pub lo: u16,
+    pub hi: u16,
+    pub x0: u16,
+    pub x1: u16,
 }
 
 /// The selection endpoints and how the region maps them onto rows.
@@ -45,7 +49,8 @@ pub fn resolve(
     granularity: Granularity,
     buf: &Buffer,
     chat: Rect,
-    gutters: &[(u16, u16, u16)],
+    row_chrome: &[RowChrome],
+    raw: &[(u16, u16)],
     copy_blank_rows: bool,
 ) -> Vec<RowSpan> {
     let (anchor, head) = span.selection;
@@ -55,17 +60,25 @@ pub fn resolve(
     let rows: Vec<Row> = flow
         .into_iter()
         .filter_map(|span| {
+            let (indent, border, gutter) = chrome_at(row_chrome, span.0);
+            // A row a `Worked for` group indents selects as if painted without that indent.
+            let indent = indent.min(chat.width);
+            let chat = Rect {
+                x: chat.x + indent,
+                width: chat.width - indent,
+                ..chat
+            };
             body(
                 buf,
                 chat,
                 span,
-                gutter_at(gutters, span.0),
+                (border, gutter),
                 copy_blank_rows,
-                span_chrome,
+                span_chrome && !in_raw(raw, span.0),
             )
         })
         .collect();
-    snap(buf, rows, granularity)
+    snap(buf, rows, granularity, |y| in_raw(raw, y))
 }
 
 /// Inclusive per-row flow-selection spans `(y, x0, x1)`, clamped to `chat`.
@@ -103,20 +116,12 @@ fn flow(
         .collect()
 }
 
-/// The diff gutter width covering screen row `y`, or 0 outside an edit-diff view.
-fn gutter_at(gutters: &[(u16, u16, u16)], y: u16) -> u16 {
-    gutters
-        .iter()
-        .find(|(top, bottom, _)| y >= *top && y < *bottom)
-        .map_or(0, |(_, _, gutter)| *gutter)
-}
-
 /// Clip one flow span to the row's selectable body, dropping pure-chrome rows.
 fn body(
     buf: &Buffer,
     chat: Rect,
     span: RowSpan,
-    gutter: u16,
+    (border, gutter): (u16, u16),
     copy_blank_rows: bool,
     chrome: bool,
 ) -> Option<Row> {
@@ -163,6 +168,7 @@ fn body(
     let mut lo = first_x.min(content_start);
     let is_chrome = |x: u16, symbol: &str| {
         (CHROME_GLYPHS.contains(&symbol)
+            || (BORDER_GLYPHS.contains(&symbol) && x < chat.x.saturating_add(border))
             // A fence's leading rail opens the row: content quoting a rail,
             // in whatever color, never does.
             || (x == first_x && fence_glyph(buf, x, y))
@@ -170,16 +176,19 @@ fn body(
             && is_blank(buf, x.saturating_add(1), y)
     };
     if chrome && is_chrome(first_x, first_symbol) {
-        // Expanded tool groups nest their own border around an effect's border
-        // (`⎢ ⎢ `). Exclude every leading chrome run before applying the
-        // diff's line-number gutter.
-        let chrome_end = visible
+        // Skip nested borders (`│ │ `), then a diff row's gutter; a header ends on its arrow.
+        let run = visible
             .iter()
-            .take_while(|(x, symbol)| is_chrome(*x, symbol))
-            .map(|(x, _)| x.saturating_add(CHROME_WIDTH))
+            .take_while(|(x, symbol)| is_chrome(*x, symbol));
+        let (end, last) = run
             .last()
-            .unwrap_or(first_x.saturating_add(CHROME_WIDTH));
-        lo = chrome_end.saturating_add(gutter);
+            .map_or((first_x, first_symbol), |&(x, symbol)| (x, symbol));
+        let gutter = if BORDER_GLYPHS.contains(&last) {
+            gutter
+        } else {
+            0
+        };
+        lo = end.saturating_add(CHROME_WIDTH).saturating_add(gutter);
     }
     x0 = x0.max(lo);
     if x0 > x1 {
@@ -271,27 +280,5 @@ fn content_end(buf: &Buffer, first_x: u16, last_x: u16, y: u16, boxed: bool) -> 
     end
 }
 
-/// Widen the outer ends to whole words or whole rows.
-fn snap(buf: &Buffer, mut rows: Vec<Row>, granularity: Granularity) -> Vec<RowSpan> {
-    let last = match (granularity, rows.len()) {
-        (Granularity::Char, _) | (_, 0) => return finish(rows),
-        (_, len) => len - 1,
-    };
-    if granularity == Granularity::Paragraph {
-        let first = &mut rows[0];
-        first.x0 = skip_blanks_right(buf, first.lo, first.hi, first.y);
-        rows[last].x1 = rows[last].hi;
-        return finish(rows);
-    }
-    let start = &mut rows[0];
-    start.x0 = word_start(buf, start.x0, start.lo, start.y);
-    let end = &mut rows[last];
-    end.x1 = word_end(buf, end.x1, end.hi, end.y);
-    finish(rows)
-}
-
-fn finish(rows: Vec<Row>) -> Vec<RowSpan> {
-    rows.into_iter()
-        .map(|row| (row.y, row.x0, row.x1))
-        .collect()
-}
+#[cfg(test)]
+mod tests;

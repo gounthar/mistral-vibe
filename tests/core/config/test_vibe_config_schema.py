@@ -13,6 +13,7 @@ from pydantic.fields import FieldInfo
 import pytest
 import tomli_w
 
+from tests.conftest import build_test_vibe_config
 from vibe.core.config import (
     MissingAPIKeyError,
     ModelConfig,
@@ -21,6 +22,7 @@ from vibe.core.config import (
 )
 from vibe.core.config.layers.environment import EnvironmentLayer
 from vibe.core.config.layers.user import UserConfigLayer
+from vibe.core.config.models import ModelRequirement
 from vibe.core.config.orchestrator import ConfigOrchestrator
 from vibe.core.config.schema import MergeFieldMetadata
 from vibe.core.config.vibe_schema import VibeConfigSchema, outside_workdir_denied
@@ -100,9 +102,33 @@ provider = "mistral"
     assert config.active_model == "codestral"
     assert config.models["codestral"].alias == "codestral"
     assert "bash" in config.disabled_tools
-    assert config.default_agent == "ask"
+    assert config.default_agent == "default"
+    assert config.default_approval_policy == "ask"
     assert "search" in config.enabled_skills
     assert config.enable_otel is True
+
+
+@pytest.mark.asyncio
+async def test_a_toml_model_without_a_temperature_samples_at_1(tmp_path: Path) -> None:
+    toml_path = tmp_path / "config.toml"
+    toml_path.write_text(
+        """\
+[[models]]
+alias = "unrestricted"
+name = "mistral-large-4-unrestricted"
+provider = "mistral"
+"""
+    )
+
+    from vibe.core.config.layers.user import UserConfigLayer
+    from vibe.core.config.orchestrator import ConfigOrchestrator
+
+    layer = UserConfigLayer(path=toml_path)
+    orchestrator = await ConfigOrchestrator[VibeConfigSchema].create(
+        schema=VibeConfigSchema, layers=[layer], default_layer_resolver=lambda: layer
+    )
+
+    assert orchestrator.config.models["unrestricted"].temperature == 1.0
 
 
 @pytest.mark.asyncio
@@ -192,15 +218,15 @@ def test_duplicate_model_alias_last_wins() -> None:
     assert config.models["same"].name == "model-b"
 
 
-def test_unknown_active_model_falls_back_to_default(
-    caplog: pytest.LogCaptureFixture,
-) -> None:
-    with caplog.at_level("WARNING"):
-        config = VibeConfigSchema(active_model="does-not-exist")
+def test_unknown_active_model_falls_back_to_default() -> None:
+    config = VibeConfigSchema(active_model="does-not-exist")
 
     assert config.active_model == ""
     assert config.get_active_model().alias == config.resolve_default_model_alias()
-    assert "Model 'does-not-exist' is not available" in caplog.text
+    assert any(
+        warning.startswith("Model 'does-not-exist' is not available")
+        for warning in config.validation_warnings
+    )
 
 
 def test_unknown_active_model_uses_routed_default() -> None:
@@ -222,8 +248,27 @@ def test_active_model_defaults_to_unpinned_sentinel() -> None:
     assert config.active_model == ""
 
 
-def test_default_agent_is_accept_edits() -> None:
-    assert VibeConfigSchema().default_agent == "accept-edits"
+def test_the_defaults_are_the_default_agent_under_accept_edits() -> None:
+    config = VibeConfigSchema()
+
+    assert config.default_agent == "default"
+    assert config.default_approval_policy == "accept-edits"
+
+
+def test_a_default_agent_naming_a_policy_sets_the_default_policy() -> None:
+    config = VibeConfigSchema.model_validate({"default_agent": "auto-approve"})
+
+    assert config.default_agent == "default"
+    assert config.default_approval_policy == "auto-approve"
+
+
+def test_an_explicit_default_policy_wins_over_a_policy_default_agent() -> None:
+    config = VibeConfigSchema.model_validate({
+        "default_agent": "auto-approve",
+        "default_approval_policy": "ask",
+    })
+
+    assert config.default_approval_policy == "ask"
 
 
 def test_file_watcher_for_autocomplete_is_enabled_by_default() -> None:
@@ -232,6 +277,10 @@ def test_file_watcher_for_autocomplete_is_enabled_by_default() -> None:
 
 def test_file_autocomplete_defaults_to_enabled() -> None:
     assert VibeConfigSchema().enable_file_autocomplete is True
+
+
+def test_system_trust_store_is_enabled_by_default() -> None:
+    assert VibeConfigSchema().enable_system_trust_store is True
 
 
 def test_pr_monitoring_is_enabled_by_default() -> None:
@@ -291,30 +340,62 @@ def test_subagent_limits_reject_non_positive_values(setting: dict[str, object]) 
         VibeConfigSchema.model_validate(setting)
 
 
-def test_default_model_carries_the_sourced_values() -> None:
-    # The default model is what a fresh install runs; a typo in a price,
-    # level set, or window would otherwise ship silently. Sources: Mistral's
-    # model card (prices, 256k window) and the API docs (reasoning_effort:
-    # none and high).
-    from vibe.core.config.vibe_schema import DEFAULT_ACTIVE_MODEL_CONFIG, DEFAULT_MODELS
+def test_built_in_models_carry_the_sourced_values() -> None:
+    # A typo in a price, level set, or window would otherwise ship silently.
+    from vibe.core.config.vibe_schema import (
+        DEFAULT_ACTIVE_MODEL_CONFIG,
+        DEFAULT_MODELS,
+        MEDIUM_3_5_MODEL_CONFIG,
+    )
 
-    assert DEFAULT_MODELS == [DEFAULT_ACTIVE_MODEL_CONFIG]
-    default = DEFAULT_ACTIVE_MODEL_CONFIG
-    assert (default.name, default.alias) == (
+    assert DEFAULT_MODELS == [DEFAULT_ACTIVE_MODEL_CONFIG, MEDIUM_3_5_MODEL_CONFIG]
+    large = DEFAULT_ACTIVE_MODEL_CONFIG
+    assert (large.name, large.alias) == ("mistral-large-4-0", "mistral-large-4-0")
+    assert large.display_name == "Mistral Large 4"
+    assert large.temperature == 1.0
+    assert (large.input_price, large.output_price, large.cached_input_price) == (
+        0.7,
+        2.1,
+        0.07,
+    )
+    assert large.thinking == "high"
+    assert list(large.thinking_levels) == ["low", "medium", "high"]
+    assert large.max_context_length == 1048576
+    assert large.auto_compact_threshold == 400000
+    assert large.supports_images is True
+    medium = MEDIUM_3_5_MODEL_CONFIG
+    assert (medium.name, medium.alias) == (
         "mistral-vibe-cli-latest",
         "mistral-medium-3.5",
     )
-    assert default.display_name == "Mistral Medium 3.5"
-    assert default.temperature == 1.0
-    assert (default.input_price, default.output_price, default.cached_input_price) == (
+    assert medium.display_name == "Mistral Medium 3.5"
+    assert medium.temperature == 1.0
+    assert (medium.input_price, medium.output_price, medium.cached_input_price) == (
         1.5,
         7.5,
         0.15,
     )
-    assert default.thinking == "high"
-    assert list(default.thinking_levels) == ["off", "high"]
-    assert default.max_context_length == 262144
-    assert default.supports_images is True
+    assert medium.thinking == "high"
+    assert list(medium.thinking_levels) == ["off", "high"]
+    assert medium.max_context_length == 262144
+    assert medium.supports_images is True
+
+
+def test_mistral_large_4_is_the_default_and_listed_first() -> None:
+    from vibe.core.config.vibe_schema import MEDIUM_3_5_MODEL_CONFIG
+
+    config = VibeConfigSchema()
+
+    assert list(config.models) == ["mistral-large-4-0", MEDIUM_3_5_MODEL_CONFIG.alias]
+    assert config.resolve_default_model_alias() == "mistral-large-4-0"
+    assert config.validation_warnings == ()
+
+
+def test_a_pin_on_medium_3_5_keeps_it_over_the_default() -> None:
+    config = VibeConfigSchema(active_model="mistral-medium-3.5")
+
+    assert config.get_active_model().alias == "mistral-medium-3.5"
+    assert config.validation_warnings == ()
 
 
 def test_unpinned_active_model_resolves_to_default_model() -> None:
@@ -325,20 +406,17 @@ def test_unpinned_active_model_resolves_to_default_model() -> None:
     assert config.get_active_model().alias == DEFAULT_ACTIVE_MODEL_CONFIG.alias
 
 
-def test_unpinned_active_model_falls_back_to_first_configured_model(
-    caplog: pytest.LogCaptureFixture,
-) -> None:
+def test_unpinned_active_model_falls_back_to_first_configured_model() -> None:
     models = [
         ModelConfig(name="model-a", provider="mistral", alias="a"),
         ModelConfig(name="model-b", provider="mistral", alias="b"),
     ]
-    with caplog.at_level("WARNING"):
-        config = VibeConfigSchema.model_validate({"active_model": "", "models": models})
+    config = VibeConfigSchema.model_validate({"active_model": "", "models": models})
 
     assert config.active_model == ""
     assert config.get_active_model().alias == "a"
     assert config.resolve_default_model_alias() == "a"
-    assert "is not available" not in caplog.text
+    assert config.missing_model_warnings == ()
 
 
 def test_routed_default_model_resolves_when_unpinned() -> None:
@@ -638,18 +716,14 @@ def test_user_model_entry_wins_over_routed_extra_injection() -> None:
     assert config.models[_EXTRA_MODEL_ALIAS].name == "my-own-model"
 
 
-def test_known_active_model_is_not_overridden(caplog: pytest.LogCaptureFixture) -> None:
+def test_known_active_model_is_not_overridden() -> None:
     models = [
         ModelConfig(name="model-a", provider="mistral", alias="a"),
         ModelConfig(name="model-b", provider="mistral", alias="b"),
     ]
-    with caplog.at_level("WARNING"):
-        config = VibeConfigSchema.model_validate({
-            "active_model": "b",
-            "models": models,
-        })
+    config = VibeConfigSchema.model_validate({"active_model": "b", "models": models})
     assert config.active_model == "b"
-    assert "is not available" not in caplog.text
+    assert config.missing_model_warnings == ()
 
 
 def test_allowed_model_names_filter_available_models() -> None:
@@ -1032,6 +1106,44 @@ def test_vision_fallback_skips_models_the_allowlist_excludes() -> None:
     })
 
     assert config.get_vision_fallback_model() is None
+
+
+def test_vision_fallback_skips_models_that_require_an_upgrade() -> None:
+    models = [
+        ModelConfig(name="blind-model", provider="mistral", alias="blind"),
+        ModelConfig(
+            name="locked-model",
+            provider="mistral",
+            alias="locked",
+            supports_images=True,
+            requires=ModelRequirement(kind="higher_plan"),
+        ),
+        ModelConfig(
+            name="sees-model", provider="mistral", alias="sees", supports_images=True
+        ),
+    ]
+
+    config = VibeConfigSchema.model_validate({
+        "active_model": "blind",
+        "models": models,
+    })
+
+    fallback = config.get_vision_fallback_model()
+    assert fallback is not None
+    assert fallback.alias == "sees"
+
+
+def test_a_config_of_locked_models_still_has_an_active_model() -> None:
+    locked = ModelRequirement(kind="higher_plan")
+    models = [
+        ModelConfig(name="glm", provider="mistral", alias="glm", requires=locked),
+        ModelConfig(name="large", provider="mistral", alias="large", requires=locked),
+    ]
+
+    config = VibeConfigSchema.model_validate({"active_model": "", "models": models})
+
+    assert config.resolve_default_model_alias() == "glm"
+    assert config.get_active_model().alias == "glm"
 
 
 def test_explicit_vision_model_wins_over_the_provider_scan() -> None:
@@ -1486,3 +1598,85 @@ async def test_a_non_positive_context_window_is_reported_as_a_validation_error(
             )
 
     assert "max_context_length" in str(exc_info.value)
+
+
+@pytest.mark.parametrize(
+    "layer", ["project-toml", "overrides", "agent-profile", "environment", "growthbook"]
+)
+def test_the_vibebot_ceiling_is_set_only_by_the_users_own_config(layer: str) -> None:
+    """The bot's start, a repo, or a session's overrides can never raise how
+    much a Vibebot-started session may do on this machine (review B1).
+    """
+    layers = VibeConfigSchema.prepare_layers([
+        ("user-toml", {"vibe_bot_max_approval_policy": "smart-approve"}),
+        (layer, {"vibe_bot_max_approval_policy": "auto-approve", "vim_mode": True}),
+    ])
+
+    assert layers == [
+        ("user-toml", {"vibe_bot_max_approval_policy": "smart-approve"}),
+        (layer, {"vim_mode": True}),
+    ]
+
+
+@pytest.mark.parametrize(
+    ("user", "admin", "runs"),
+    [
+        ("smart-approve", "ask", "ask"),
+        ("smart-approve", "accept-edits", "accept-edits"),
+        ("ask", "auto-approve", "ask"),
+        (None, "auto-approve", "ask"),
+        ("accept-edits", "smart-approve", "accept-edits"),
+    ],
+)
+def test_an_admin_can_only_lower_the_vibebot_ceiling(
+    user: str | None, admin: str, runs: str
+) -> None:
+    """Gabriel's review: the stricter of the user's ceiling and the admin's wins."""
+    layers = VibeConfigSchema.prepare_layers([
+        ("default", {}),
+        ("user-toml", {"vibe_bot_max_approval_policy": user} if user else {}),
+        ("admin", {"vibe_bot_max_approval_policy": admin}),
+    ])
+
+    merged = [data.get("vibe_bot_max_approval_policy") for _, data in layers]
+    effective = next((v for v in reversed(merged) if v is not None), "ask")
+    assert effective == runs
+
+
+@pytest.mark.parametrize(
+    "layer",
+    [
+        "project-toml",
+        "overrides",
+        "agent-profile",
+        "environment",
+        "growthbook",
+        "admin",
+    ],
+)
+def test_the_vibebot_local_tools_are_exposed_only_by_the_users_own_config(
+    layer: str,
+) -> None:
+    """A repository or a remote layer can never hand the bot a local tool."""
+    entry = {"server": "grafana", "tools": ["query_*"], "approval": "allow"}
+    layers = VibeConfigSchema.prepare_layers([
+        ("user-toml", {"vibe_bot_local_tools": [entry]}),
+        (layer, {"vibe_bot_local_tools": [{"server": "shell"}], "vim_mode": True}),
+    ])
+
+    assert layers == [
+        ("user-toml", {"vibe_bot_local_tools": [entry]}),
+        (layer, {"vim_mode": True}),
+    ]
+
+
+def test_a_vibebot_local_tools_entry_asks_by_default_and_caps_its_result_size() -> None:
+    config = build_test_vibe_config(
+        vibe_bot_local_tools=[{"server": "grafana", "tools": ["query_prometheus"]}]
+    )
+
+    [entry] = config.vibe_bot_local_tools
+    assert entry.approval == "ask"
+    assert config.vibe_bot_local_tool_max_bytes == 8 * 1024
+    with pytest.raises(ValidationError):
+        build_test_vibe_config(vibe_bot_local_tool_max_bytes=64 * 1024 + 1)

@@ -513,7 +513,7 @@ fn pending_agent_message_survives_restore_and_is_seen_once_before_new_input() {
     assert_eq!(runtime.inspection_value()["has_pending_model_input"], true);
 
     assert_eq!(
-        runtime.checkpoint_value()["notifications"][0]["notification"]["source"],
+        runtime.checkpoint_value()["pending_input"][0]["notification"]["source"],
         json!({
             "type":"agent_message", "sender_agent_path":"/root/child",
         }),
@@ -576,6 +576,10 @@ fn agent_results_survive_restore_and_are_seen_once_before_new_input() {
             "Status: stopped, output limit reached before the agent finished its reply\nTo let it continue with its history, send a message to /root/child.",
         ),
         (
+            json!({"outcome":"completed", "output":[{"type":"text", "text":"Stopped this turn."}], "stop_reason":"repeated_tool_failure"}),
+            "Status: stopped, the same tool call failed repeatedly before the agent finished\nPartial output: [{\"type\":\"text\",\"text\":\"Stopped this turn.\"}]\nTo let it continue with its history, send a message to /root/child.",
+        ),
+        (
             json!({"outcome":"completed", "output":[{"type":"text", "text":"Skipped by policy"}], "stop_reason":"skipped"}),
             "Status: completed\nOutput: [{\"type\":\"text\",\"text\":\"Skipped by policy\"}]",
         ),
@@ -617,7 +621,7 @@ fn agent_results_survive_restore_and_are_seen_once_before_new_input() {
         );
         assert_eq!(runtime.inspection_value()["has_pending_model_input"], true);
         assert_eq!(
-            runtime.checkpoint_value()["notifications"][0]["notification"]["source"],
+            runtime.checkpoint_value()["pending_input"][0]["notification"]["source"],
             source
         );
 

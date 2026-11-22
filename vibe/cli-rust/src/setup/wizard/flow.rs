@@ -83,7 +83,7 @@ pub async fn run_wizard(
                 state.redraw_pending = true;
             }
             _ = chat_tick.tick() => {
-                if app.view.banner.tick(crate::clock::now()) {
+                if app.view.banner.tick() {
                     state.redraw_pending = true;
                 }
             }
@@ -225,6 +225,7 @@ fn draw(
                 f.buffer_mut(),
                 crate::mouse::MouseTarget::OnboardingLinks,
             );
+            app.view.wide_cells.refresh(f.buffer_mut());
         })
     })??;
     crate::pointer::sync(app);

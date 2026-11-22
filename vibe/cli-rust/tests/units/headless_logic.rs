@@ -9,7 +9,7 @@ use vibe_rs::headless_output::{denied_tool_warning, last_assistant_text, turn_en
 use vibe_rs::headless_prompt::{parse_piped_prompt, PipedPrompt, MAX_STDIN_PROMPT_BYTES};
 use vibe_rs::headless_trust::warning_from;
 use vibe_rs::run_export::{RunOutcome, RunWarning};
-use vibe_rs::server::{AgentConfig, RpcError};
+use vibe_rs::server::{AgentConfig, PublicTurn, RpcError};
 use vibe_rs::utils::paths::user_home_from;
 
 #[test]
@@ -111,14 +111,19 @@ fn agent_config_includes_budget_fields_when_set() {
 }
 
 #[test]
-fn agent_config_includes_agent_and_auto_approve() {
+fn agent_config_includes_agent_policy_and_auto_approve() {
     let config = AgentConfig {
-        agent: Some("ask".into()),
+        agent: Some("lean".into()),
+        approval_policy: Some("ask".into()),
         auto_approve: true,
         ..Default::default()
     };
     let json = serde_json::to_value(&config).unwrap();
-    assert_eq!(json.get("agent").and_then(Value::as_str), Some("ask"));
+    assert_eq!(json.get("agent").and_then(Value::as_str), Some("lean"));
+    assert_eq!(
+        json.get("approvalPolicy").and_then(Value::as_str),
+        Some("ask")
+    );
     assert_eq!(json.get("autoApprove").and_then(Value::as_bool), Some(true));
 }
 
@@ -246,6 +251,42 @@ fn last_assistant_text_skips_a_draft_a_hook_sent_back_for_a_retry() {
         }
     ]);
     assert_eq!(last_assistant_text(&history).as_deref(), Some("Before."));
+}
+
+#[test]
+fn last_assistant_text_skips_a_draft_a_hook_rejected() {
+    let history = serde_json::json!([
+        {
+            "type": "message",
+            "role": "assistant",
+            "content": [{"type": "text", "text": "Let me check."}],
+            "outcome": {"type": "committed"}
+        },
+        {
+            "type": "message",
+            "role": "assistant",
+            "content": [{"type": "text", "text": "Unsafe draft."}],
+            "outcome": {"type": "discarded", "cause": "failure"}
+        }
+    ]);
+    assert_eq!(
+        last_assistant_text(&history).as_deref(),
+        Some("Let me check.")
+    );
+}
+
+#[test]
+fn a_turn_a_hook_ended_answers_with_the_hook_reason() {
+    let turn = PublicTurn::read(&serde_json::json!({
+        "turn": {"id": "t1", "status": "completed", "skipReason": "model budget spent"}
+    }));
+    assert_eq!(turn.hook_answer(), Some("model budget spent"));
+    let rejected = PublicTurn::read(&serde_json::json!({
+        "turn": {"id": "t1", "status": "completed", "rejectReason": "unsafe answer"}
+    }));
+    assert_eq!(rejected.hook_answer(), Some("unsafe answer"));
+    let answered = PublicTurn::read(&serde_json::json!({"turn": {"id": "t1"}}));
+    assert_eq!(answered.hook_answer(), None);
 }
 
 #[test]
@@ -446,7 +487,9 @@ fn headless_options_with_budgets() -> HeadlessOptions {
         output_dir: None,
         system_prompt: None,
         model: None,
+        thinking: None,
         agent: None,
+        approval_policy: None,
         auto_approve: false,
         enabled_tools: vec![],
         disabled_tools: vec![],

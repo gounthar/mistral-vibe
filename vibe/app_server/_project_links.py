@@ -65,9 +65,17 @@ class _GitUnavailableInCheckout(GitRepositoryError):
     pass
 
 
+# Likewise: projects/create refuses a disk root (`C:\`, `/`, a bare UNC share),
+# so inspection rejects it before the client asks.
+class _DiskRoot(GitRepositoryError):
+    pass
+
+
 def _reject_reason(error: GitRepositoryError) -> ProjectLinksResolveRootRejectReason:
     if isinstance(error, _GitUnavailableInCheckout):
         return "git_unavailable"
+    if isinstance(error, _DiskRoot):
+        return "disk_root"
     return "nested_unresolvable"
 
 
@@ -76,6 +84,14 @@ def _is_inside_git_checkout(directory: Path) -> bool:
         os.path.lexists(candidate / ".git")
         for candidate in (directory, *directory.parents)
     )
+
+
+def folder_has_commits(folder: Path) -> bool:
+    try:
+        with GitRepo.open(folder) as repository:
+            return repository.has_commits()
+    except GitError:
+        return False
 
 
 def _inspection_dict(inspected: _InspectedDirectory) -> dict[str, Any]:
@@ -102,6 +118,8 @@ def _read_inspected_directory(path: Path) -> _InspectedDirectory:
         raise GitRepositoryError(str(exc)) from exc
     if not directory_path.is_dir():
         raise GitRepositoryError("Not a directory")
+    if directory_path.parent == directory_path:
+        raise _DiskRoot("A disk root can't be a project")
 
     plain_directory = _InspectedDirectory(
         path=directory_path, name=directory_path.name, git=None
@@ -359,12 +377,7 @@ class ProjectLinksController:
     @staticmethod
     def _local_link_dict(link: ProjectLink) -> dict[str, Any]:
         path = project_link_path(link)
-        try:
-            with GitRepo.open(path) as repository:
-                has_commits = repository.has_commits()
-        except GitError:
-            has_commits = False
-        return {"directoryPath": str(path), "hasCommits": has_commits}
+        return {"directoryPath": str(path), "hasCommits": folder_has_commits(path)}
 
     @staticmethod
     def _link_dict(link: ProjectLink, directory_path: Path) -> dict[str, Any]:

@@ -19,6 +19,11 @@ from pathlib import Path
 from typing import Any, Protocol
 
 from vibe.app_server._dispatch import DispatchResult, RequestFailure, method_not_found
+from vibe.app_server._local_skills import (
+    ENTRY_FILE,
+    delete_skill_folder,
+    listed_skill_folder,
+)
 from vibe.app_server._model import ProtocolModel, validate_wire
 from vibe.app_server._skill_toggles import set_skill_enabled
 from vibe.app_server.models import (
@@ -36,6 +41,7 @@ from vibe.app_server.protocol import (
     SkillsCatalogResponse,
     SkillsConvertLocalParams,
     SkillsConvertResponse,
+    SkillsDeleteLocalParams,
     SkillsDetailParams,
     SkillsDetailResponse,
     SkillsImportParams,
@@ -44,6 +50,7 @@ from vibe.app_server.protocol import (
     SkillsListParams,
     SkillsListResponse,
     SkillsRemoveParams,
+    SkillsSessionImportResponse,
     SkillsSetAliasParams,
     SkillsSetEnabledParams,
     SkillsSetLatestParams,
@@ -56,7 +63,7 @@ from vibe.app_server.protocol import (
 from vibe.core.config import VibeConfigSchema
 from vibe.core.config.orchestrator import ConfigOrchestrator
 from vibe.core.platform_auth import PlatformCredentialFactory
-from vibe.core.skills.models import SkillScope
+from vibe.core.skills.models import ManifestEntry, SkillScope
 from vibe.core.skills.registry import (
     RegistrySkillsError,
     check_new_versions,
@@ -65,6 +72,7 @@ from vibe.core.skills.registry import (
     get_skill_body,
     get_skill_details,
     has_registry_endpoint,
+    import_session_skill,
     import_skill,
     list_catalog,
     list_skill_versions,
@@ -74,6 +82,7 @@ from vibe.core.skills.registry import (
     set_skill_latest,
     set_skill_version,
 )
+from vibe.observability.logging import logger
 
 __all__ = ["SkillsController", "SkillsHost"]
 
@@ -106,8 +115,18 @@ class SkillsHost(Protocol):
         """Project roots a scoped install may write into."""
         ...
 
-    def require_idle(self) -> None:
-        """Raise if a mutation would land mid-turn."""
+    @property
+    def local_skill_dirs(self) -> list[Path]:
+        """The folders local skills are read from, as configured, links unresolved."""
+        ...
+
+    @property
+    def sandboxed(self) -> bool:
+        """A sandboxed session runs only the skills copied in as it opened."""
+        ...
+
+    def require_no_session_rewrite(self) -> None:
+        """Raise while a compaction or a relocation rewrites the session."""
         ...
 
     def require_session(self, session_id: str) -> None:
@@ -118,15 +137,42 @@ class SkillsHost(Protocol):
         """The catalogue behind ``/skill-name``, de-duped, project-wins."""
         ...
 
-    def installed_skills(self) -> list[SkillSummary]:
+    def installed_skills(self) -> SkillsInstalledResponse:
         """Rows for the browser: one per name, scope and source, each marked
-        active when its name resolves to it.
+        active when its name resolves to it, and the skills that failed to load.
         """
         ...
 
-    async def refresh(self) -> RuntimeSnapshot:
-        """Re-read the workspace after a mutation and return the new snapshot."""
+    @property
+    def session_skill_pins(self) -> tuple[ManifestEntry, ...]:
+        """The registry skills picked for this session only."""
         ...
+
+    async def save_session_skill_pins(self, pins: tuple[ManifestEntry, ...]) -> None:
+        """Keep ``pins`` for the session and its next open; ``refresh`` applies them."""
+        ...
+
+    async def refresh(self) -> RuntimeMutationResponse:
+        """Re-read the workspace after a mutation and return the new snapshot.
+
+        During a turn the change is held until the turn ends: ``status`` is then
+        ``PENDING``, and ``runtime`` already shows the change.
+        """
+        ...
+
+
+def _loaded_pick(runtime: RuntimeSnapshot, entry: ManifestEntry) -> str | None:
+    return next(
+        (
+            skill.name
+            for skill in runtime.skills
+            if skill.scope == "session"
+            and skill.registry is not None
+            and skill.registry.skill_id == entry.skill_id
+            and skill.registry.version == entry.version
+        ),
+        None,
+    )
 
 
 class SkillsController:
@@ -195,6 +241,11 @@ class SkillsController:
                     validate_wire(SkillsConvertLocalParams, raw_params)
                 )
                 runtime_updated = True
+            case "skills/deleteLocal":
+                response = await self._delete_local(
+                    validate_wire(SkillsDeleteLocalParams, raw_params)
+                )
+                runtime_updated = True
             case "skills/setEnabled":
                 response = await self._set_enabled(
                     validate_wire(SkillsSetEnabledParams, raw_params)
@@ -214,7 +265,7 @@ class SkillsController:
 
     def _installed(self, params: SkillsInstalledParams) -> SkillsInstalledResponse:
         self._host.require_session(params.session_id)
-        return SkillsInstalledResponse(skills=self._host.installed_skills())
+        return self._host.installed_skills()
 
     async def _catalog(self, params: SkillsCatalogParams) -> SkillsCatalogResponse:
         self._host.require_session(params.session_id)
@@ -308,6 +359,8 @@ class SkillsController:
 
     async def _import(self, params: SkillsImportParams) -> RuntimeMutationResponse:
         self._begin_mutation(params.session_id)
+        if params.scope == "session":
+            return await self._import_for_session(params)
         try:
             await import_skill(
                 self._host.config,
@@ -321,6 +374,53 @@ class SkillsController:
         except RegistrySkillsError as exc:
             raise RequestFailure(ProtocolErrorCode.INVALID_PARAMS, exc.reason) from exc
         return await self._refreshed()
+
+    async def _import_for_session(
+        self, params: SkillsImportParams
+    ) -> SkillsSessionImportResponse:
+        if self._host.sandboxed:
+            raise RequestFailure(
+                ProtocolErrorCode.INVALID_PARAMS,
+                "a sandboxed session cannot pick a skill for itself",
+            )
+        try:
+            entry = await import_session_skill(
+                self._host.config,
+                params.skill_id,
+                version=params.version,
+                alias=params.alias,
+                credentials=self._host.credentials,
+            )
+        except RegistrySkillsError as exc:
+            raise RequestFailure(ProtocolErrorCode.INVALID_PARAMS, exc.reason) from exc
+        before = self._host.session_skill_pins
+        kept = tuple(pin for pin in before if pin.skill_id != entry.skill_id)
+        await self._host.save_session_skill_pins((*kept, entry))
+        try:
+            refreshed = await self._host.refresh()
+            loaded = _loaded_pick(refreshed.runtime, entry)
+            if loaded is None:
+                raise RequestFailure(
+                    ProtocolErrorCode.INVALID_PARAMS,
+                    f"skill {entry.name!r} did not load in this session: the"
+                    " configuration filters it out or it could not be read",
+                )
+        except BaseException:
+            await self._restore_session_skill_pins(before)
+            raise
+        return SkillsSessionImportResponse(
+            runtime=refreshed.runtime, status=refreshed.status, skill_name=loaded
+        )
+
+    async def _restore_session_skill_pins(
+        self, pins: tuple[ManifestEntry, ...]
+    ) -> None:
+        """A refused or failed pick leaves the session on the picks it had."""
+        await self._host.save_session_skill_pins(pins)
+        try:
+            await self._host.refresh()
+        except Exception:
+            logger.exception("Failed to reload the session's skills after a pick")
 
     async def _set_version(
         self, params: SkillsSetVersionParams
@@ -409,9 +509,46 @@ class SkillsController:
             )
         except (RegistrySkillsError, OSError) as exc:
             raise RequestFailure(ProtocolErrorCode.INVALID_PARAMS, str(exc)) from exc
+        refreshed = await self._host.refresh()
         return SkillsConvertResponse(
-            converted=target is not None, runtime=await self._host.refresh()
+            converted=target is not None,
+            runtime=refreshed.runtime,
+            status=refreshed.status,
         )
+
+    async def _delete_local(
+        self, params: SkillsDeleteLocalParams
+    ) -> RuntimeMutationResponse:
+        """Only a local skill file the session lists can be deleted, never a plugin's,
+        a built-in or a registry copy, so ``path`` cannot reach anything else.
+        """
+        self._begin_mutation(params.session_id)
+        if self._host.sandboxed:
+            raise RequestFailure(
+                ProtocolErrorCode.INVALID_PARAMS,
+                "skills of a sandboxed session are deleted inside the sandbox",
+            )
+        installed = self._host.installed_skills().skills
+        row = next(
+            (s for s in installed if s.source == "local" and s.path == params.path),
+            None,
+        )
+        if row is None:
+            raise RequestFailure(
+                ProtocolErrorCode.NOT_FOUND, f"no local skill at {params.path!r}"
+            )
+        folder = listed_skill_folder(Path(params.path), self._host.local_skill_dirs)
+        if folder is None:
+            raise RequestFailure(
+                ProtocolErrorCode.NOT_FOUND, f"no local skill at {params.path!r}"
+            )
+        try:
+            await asyncio.to_thread(delete_skill_folder, folder / ENTRY_FILE)
+        except OSError as exc:
+            raise RequestFailure(
+                ProtocolErrorCode.INTERNAL_ERROR, f"Cannot delete {row.name!r}: {exc}"
+            ) from exc
+        return await self._refreshed()
 
     def _require_toggleable(self, name: str) -> None:
         """Refuse a name the browser itself would not offer a toggle for.
@@ -421,7 +558,8 @@ class SkillsController:
         only hand-editing removes it. The browser already enforces this; the
         server has to as well, since it is the shared entry point.
         """
-        row = next((s for s in self._host.installed_skills() if s.name == name), None)
+        installed = self._host.installed_skills().skills
+        row = next((s for s in installed if s.name == name), None)
         if row is None:
             raise RequestFailure(
                 ProtocolErrorCode.INVALID_PARAMS, f"no installed skill named {name!r}"
@@ -433,11 +571,11 @@ class SkillsController:
             )
 
     def _begin_mutation(self, session_id: str) -> None:
-        self._host.require_idle()
         self._host.require_session(session_id)
+        self._host.require_no_session_rewrite()
 
     async def _refreshed(self) -> RuntimeMutationResponse:
-        return RuntimeMutationResponse(runtime=await self._host.refresh())
+        return await self._host.refresh()
 
     def _scope(self, scope: str) -> SkillScope:
         if scope == "project":

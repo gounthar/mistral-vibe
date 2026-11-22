@@ -4,6 +4,7 @@ import asyncio
 from collections.abc import Iterator
 from io import BytesIO
 import os
+from pathlib import Path
 import signal
 import sys
 import threading
@@ -11,9 +12,11 @@ from typing import Any, cast
 
 import pytest
 
+from tests.stubs.thread_signals import sigterm_another_thread_once_the_loop_waits
 from vibe.app_server import _termination, stdio
 from vibe.app_server._host import HostRequestHandler
 from vibe.app_server._process_services import ProcessServices
+from vibe.app_server._runtime import HarnessProcess, create_harness_server
 from vibe.app_server._session_backend_port import SessionBackendHost
 from vibe.app_server._termination import (
     TERMINATED_EXIT_CODE,
@@ -270,6 +273,24 @@ async def test_sigterm_ends_the_input_then_exits_once_serving_has_wound_down() -
 
 @posix_only
 @pytest.mark.asyncio
+async def test_sigterm_delivered_to_another_thread_still_ends_the_input() -> None:
+    _, transport = memory_transport_pair()
+    exits: list[int] = []
+    woken_by_fallback: list[bool] = []
+
+    with ending_on_sigterm(transport, exit_process=exits.append) as ending:
+        asyncio.get_running_loop().call_later(5, woken_by_fallback.append, True)
+        sender = sigterm_another_thread_once_the_loop_waits()
+        async for _ in ending.messages():
+            pass
+        sender.join()
+
+    assert woken_by_fallback == []
+    assert exits == [TERMINATED_EXIT_CODE]
+
+
+@posix_only
+@pytest.mark.asyncio
 async def test_a_shutdown_stuck_past_the_deadline_exits_anyway() -> None:
     _, transport = memory_transport_pair()
     exited = threading.Event()
@@ -282,6 +303,67 @@ async def test_a_shutdown_stuck_past_the_deadline_exits_anyway() -> None:
         os.kill(os.getpid(), signal.SIGTERM)
         # A shutdown that never ends.
         await _wait_for(exited.is_set)
+
+
+def _handle_with_a_second_signal_at(point: int, handler: Any) -> bool:
+    """Run ``handler`` as for a SIGTERM, handling another one at its
+    ``point``-th line, as Python does when it lands mid-handler. False once
+    ``point`` is past the handler's last line. What the handlers raise lands in
+    whatever the main thread was running, as a signal's does, and is dropped.
+    """
+    lines = 0
+    nested = False
+
+    def trace(_frame: object, event: str, _arg: object) -> Any:
+        nonlocal lines, nested
+        if event == "line" and not nested:
+            if lines == point:
+                nested = True
+                handler(signal.SIGTERM, None)
+            lines += 1
+        return trace
+
+    previous = sys.gettrace()
+    sys.settrace(trace)
+    try:
+        handler(signal.SIGTERM, None)
+    except Exception:
+        pass
+    finally:
+        sys.settrace(previous)
+    return nested
+
+
+@posix_only
+@pytest.mark.asyncio
+async def test_a_sigterm_landing_while_the_first_is_handled_still_ends_and_exits() -> (
+    None
+):
+    """As a process-group kill does under uv, which forwards its own SIGTERM."""
+
+    async def nest_at(point: int) -> bool:
+        _, transport = memory_transport_pair()
+        exited = threading.Event()
+        steps: list[str] = []
+        # Its shutdown failing is swallowed once SIGTERM came: hence the steps.
+        with ending_on_sigterm(
+            transport, deadline_s=0.05, exit_process=lambda _code: exited.set()
+        ) as ending:
+            nested = _handle_with_a_second_signal_at(
+                point, signal.getsignal(signal.SIGTERM)
+            )
+            async with asyncio.timeout(2):
+                async for _ in ending.messages():
+                    pass
+            steps.append("input ended")
+            await _wait_for(exited.is_set, timeout=2)
+            steps.append("deadline passed")
+        assert steps == ["input ended", "deadline passed"], point
+        return nested
+
+    point = 0
+    while await nest_at(point):
+        point += 1
 
 
 @posix_only
@@ -339,3 +421,90 @@ async def test_a_sigtermed_stdio_server_closes_as_on_the_end_of_its_stdin(
     assert exits == [TERMINATED_EXIT_CODE]
     # The real process exits instead: the loop would wait for the read.
     stdin.released.set()
+
+
+_FAKE_MODEL_CONFIG = """
+active_model = "fake-model"
+include_project_context = false
+[experiments]
+enable = false
+[telemetry]
+enable = false
+[[providers]]
+name = "fake"
+api_base = "http://127.0.0.1:1/v1"
+api_key_env_var = "TEST_FAKE_API_KEY"
+api_style = "openai"
+[[models]]
+name = "fake-model"
+provider = "fake"
+alias = "fake-model"
+thinking = "off"
+"""
+
+
+@pytest.mark.asyncio
+async def test_input_ending_while_a_stop_saves_the_session_ends_serving_cleanly(
+    config_dir: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    process_services: ProcessServices,
+) -> None:
+    pytest.importorskip("mistralai_vibe_local_harness.vibe")
+    import vibe.app_server._unified_harness_backend_adapter as adapter_module
+
+    monkeypatch.setenv("TEST_FAKE_API_KEY", "test")
+    (config_dir / "config.toml").write_text(_FAKE_MODEL_CONFIG)
+    client, transport = memory_transport_pair()
+    server = await create_harness_server(
+        transport,
+        transport_kind="stdio",
+        process=HarnessProcess(services=process_services),
+    )
+    serving = asyncio.create_task(server.serve())
+    incoming = client.messages()
+
+    async def request(
+        request_id: int, method: str, params: dict[str, Any]
+    ) -> dict[str, Any]:
+        await client.send({
+            "jsonrpc": "2.0",
+            "id": request_id,
+            "method": method,
+            "params": params,
+        })
+        async for message in incoming:
+            if message.get("id") == request_id:
+                assert "error" not in message, message
+                return message["result"]
+        raise AssertionError("Connection closed before responding")
+
+    await request(1, "initialize", {"clientInfo": {"name": "test", "version": "1"}})
+    await client.send({"jsonrpc": "2.0", "method": "initialized", "params": {}})
+    started = await request(2, "session/start", {"agentConfig": {"cwd": str(tmp_path)}})
+    persist = adapter_module.persist_metadata
+    saving = asyncio.Event()
+
+    async def hold_first_save(metadata: Any, session_dir: Path) -> None:
+        if not saving.is_set():
+            saving.set()
+            await asyncio.Event().wait()
+        await persist(metadata, session_dir)
+
+    monkeypatch.setattr(adapter_module, "persist_metadata", hold_first_save)
+    # As a session with a turn to save.
+    monkeypatch.setattr(
+        adapter_module.UnifiedHarnessBackendAdapter, "_persists_to_disk", lambda _: True
+    )
+    await client.send({
+        "jsonrpc": "2.0",
+        "id": 3,
+        "method": "session/stop",
+        "params": {"sessionId": started["state"]["session"]["id"]},
+    })
+    await asyncio.wait_for(saving.wait(), timeout=5)
+
+    # As the TUI does once its wait for the stop runs out.
+    await client.close()
+
+    await asyncio.wait_for(serving, timeout=10)

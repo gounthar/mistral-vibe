@@ -32,8 +32,10 @@ pub fn draw(app: &mut App, f: &mut Frame, area: Rect) {
     let full_w = area.width;
     let content_w = full_w.saturating_sub(1);
     let selected = app.queue.selected.clone();
-    let paused = app.queue.paused;
+    let paused = app.queue.header_shortcuts();
+    let queue_hints = crate::ui::loading::queue_hints(app);
     let rewind = app.rewind.entry_id.clone();
+    let raw = app.view.raw;
     let selected_table = app
         .selection
         .region
@@ -42,14 +44,9 @@ pub fn draw(app: &mut App, f: &mut Frame, area: Rect) {
         .map(|selection| (selection.key.clone(), selection.head_offset()));
     // The promo is width-wrapped, so each layout width gets its own banner rows.
     let empty = app.view.transcript.is_empty();
-    let config = &app.session.startup_config;
-    let banner_full = banner(app, app.view.banner.view(config, full_w), full_w, empty);
-    let banner_content = banner(
-        app,
-        app.view.banner.view(config, content_w),
-        content_w,
-        empty,
-    );
+    let banner_full = banner(app, full_w, empty);
+    let banner_content = banner(app, content_w, empty);
+    let details = layout::DetailsContext::of(app);
     let selecting = app
         .selection
         .region
@@ -62,31 +59,35 @@ pub fn draw(app: &mut App, f: &mut Frame, area: Rect) {
     // Only the transcript can re-render rows scrolled out of the viewport.
     view.selection_region.document = true;
     view.transcript_cache
-        .ensure_context(full_w, content_w, theme::active_index(), paused);
+        .ensure_context(full_w, content_w, theme::active_index(), paused, raw);
+    view.transcript_cache
+        .ensure_details(details.map(|context| context.running));
     view.selection_chrome.clear();
     view.selection_hangs.clear();
     view.entry_hitmap.clear();
     view.link_hitmap.clear();
-    view.diff_hitmap.clear();
+    view.chrome_hitmap.clear();
+    view.raw_hitmap.clear();
     view.table_hitmap.clear();
     view.entry_rows.clear();
+    view.banner_cat_area = None;
     let mouse_position = view.mouse_position;
     let pulse_frame = view.pulse_frame;
 
-    // Full width decides overflow, matching the historical measure order.
-    let total_full = document_height(
-        banner_full.lines(),
-        layout::build(
-            &mut view.transcript_cache,
-            &mut view.markdown_cache,
-            &view.expanded,
-            &view.transcript,
-            full_w,
-            paused,
-        ),
+    // Full width decides overflow; measuring stops once entries pass the rows under the banner.
+    let banner_rows = measure(banner_full.lines(), full_w).saturating_add(1);
+    let fitting = layout::build(
+        &mut view.transcript_cache,
+        &mut view.markdown_cache,
+        &view.expanded,
+        &view.transcript,
         full_w,
-    );
-    if !scroll_view(total_full, area.height, view.scroll).overflow {
+        (paused, raw, details),
+        area.height.saturating_sub(banner_rows),
+    )
+    .map(|layout| document_height(banner_full.lines(), layout, full_w))
+    .filter(|&total| !scroll_view(total, area.height, view.scroll).overflow);
+    if let Some(total_full) = fitting {
         // Short content flows from the top (banner top-left), no scrollbar; the queue stays at the bottom.
         view.scroll_to_entry = None;
         view.sticky_prompt = None;
@@ -110,9 +111,11 @@ pub fn draw(app: &mut App, f: &mut Frame, area: Rect) {
             Hitmaps {
                 entries: &mut view.entry_hitmap,
                 links: &mut view.link_hitmap,
-                diffs: &mut view.diff_hitmap,
+                chrome: &mut view.chrome_hitmap,
+                raws: &mut view.raw_hitmap,
                 tables: &mut view.table_hitmap,
                 rows: &mut view.entry_rows,
+                cat: &mut view.banner_cat_area,
                 hangs: selecting.then_some(&mut view.selection_hangs),
             },
             mouse_position,
@@ -129,6 +132,8 @@ pub fn draw(app: &mut App, f: &mut Frame, area: Rect) {
                 selected: selected.as_deref(),
                 selected_table: selected_table.as_ref(),
                 paused,
+                queue_hints,
+                raw,
                 rewind: rewind.as_deref(),
             },
         );
@@ -145,8 +150,10 @@ pub fn draw(app: &mut App, f: &mut Frame, area: Rect) {
         &view.expanded,
         &view.transcript,
         content_w,
-        paused,
-    );
+        (paused, raw, details),
+        u16::MAX,
+    )
+    .expect("an unbounded layout is cached");
     let total = document_height(banner_content.lines(), content_layout, content_w);
     let document_top = measure(banner_content.lines(), content_w).saturating_add(1);
     let pin = sticky::Geometry {
@@ -223,9 +230,11 @@ pub fn draw(app: &mut App, f: &mut Frame, area: Rect) {
         Hitmaps {
             entries: &mut view.entry_hitmap,
             links: &mut view.link_hitmap,
-            diffs: &mut view.diff_hitmap,
+            chrome: &mut view.chrome_hitmap,
+            raws: &mut view.raw_hitmap,
             tables: &mut view.table_hitmap,
             rows: &mut view.entry_rows,
+            cat: &mut view.banner_cat_area,
             hangs: selecting.then_some(&mut view.selection_hangs),
         },
         hovered,
@@ -242,6 +251,8 @@ pub fn draw(app: &mut App, f: &mut Frame, area: Rect) {
             selected: selected.as_deref(),
             selected_table: selected_table.as_ref(),
             paused,
+            queue_hints,
+            raw,
             rewind: rewind.as_deref(),
         },
     );
@@ -258,15 +269,18 @@ pub fn draw(app: &mut App, f: &mut Frame, area: Rect) {
     super::jump_to_bottom::draw(app, f, content_area);
 }
 
-/// The rows above the entries: `banner`, the promo with its links, then an empty child view's placeholder.
-fn banner(
-    app: &App,
-    mut banner: markdown::LinkedLines,
-    width: u16,
-    transcript_empty: bool,
-) -> markdown::LinkedLines {
+/// The rows above the entries: the welcome banner, naming a viewed child's own model, the promo and plan offer with their links, then an empty child view's placeholder.
+fn banner(app: &App, width: u16, transcript_empty: bool) -> markdown::LinkedLines {
+    let model = app.subagents.viewed_model();
+    let mut banner = app
+        .view
+        .banner
+        .view(&app.session.startup_config, model.as_deref(), width);
     if let Some(promo) = &app.view.promo {
         banner.append(markdown::guttered(promo, width, theme::ORANGE));
+    }
+    if let Some(offer) = crate::startup::banners::switch_key_offer(app) {
+        entry::startup::push_plan_offer(&mut banner, &offer, width);
     }
     // The subagent transcript placeholder (one blank row above) flows under the banner.
     if let (Some(child_id), true) = (

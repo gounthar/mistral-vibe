@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from collections.abc import Callable, Iterator, Mapping
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 import threading
@@ -16,6 +16,7 @@ from vibe.core.config.harness_files import (
 from vibe.core.skills.models import (
     REGISTRY_LATEST_ALIAS,
     InstalledSkill,
+    ManifestEntry,
     RegistryRef,
     SkillConfigIssue,
     SkillInfo,
@@ -30,7 +31,7 @@ from vibe.core.skills.parser import (
     parse_skill_markdown,
 )
 from vibe.core.skills.registry import _manifest, _resolved, _store
-from vibe.core.skills.registry.models import pinned_name
+from vibe.core.skills.registry.models import MAX_SKILL_NAME_LEN, pinned_name
 from vibe.core.utils import name_matches
 from vibe.observability.logging import logger
 from vibe.utils.io import read_safe
@@ -159,6 +160,21 @@ def _named_as_pinned(skill: SkillInfo, name: str) -> SkillInfo:
     return skill.model_copy(update={"name": named})
 
 
+_SESSION_PICK_SUFFIX = "-cloud"
+
+
+def _free_name(name: str, taken: set[str]) -> str:
+    """``name``, or ``name-cloud`` (then ``-cloud-2``...) when that is taken."""
+    if name not in taken:
+        return name
+    for n in range(1, len(taken) + 2):
+        suffix = _SESSION_PICK_SUFFIX if n == 1 else f"{_SESSION_PICK_SUFFIX}-{n}"
+        candidate = f"{name[: MAX_SKILL_NAME_LEN - len(suffix)].rstrip('-')}{suffix}"
+        if candidate not in taken:
+            return candidate
+    raise AssertionError("unreachable: one of len(taken) + 1 candidates is free")
+
+
 def _file_claimant(
     info: SkillInfo, by_file: Mapping[Path, SkillInfo]
 ) -> SkillInfo | None:
@@ -174,18 +190,26 @@ class SkillManager:
         *,
         harness_files: HarnessFilesManager | None = None,
         project_skills: Mapping[str, SkillInfo] | None = None,
+        session_pins: Sequence[ManifestEntry] = (),
     ) -> None:
         """``project_skills``, read in a sandbox, rank first among the project's, ahead
         of the files the host reads for it.
+
+        ``session_pins`` are registry skills picked for this session only. They load
+        with or without registry skills on, rank last, and never shadow a skill: one
+        whose name is taken loads as ``<name>-cloud``.
         """
         self._config_getter = config_getter
         self._harness_files = harness_files or get_harness_files_manager()
         self._project_skills = tuple((project_skills or {}).values())
+        self._session_pins = tuple(session_pins)
         self._search_paths = self._compute_search_paths(self._config)
         self._config_issues: list[SkillConfigIssue] = []
         self._shadowed: list[ShadowedSkill] = []
         self._claimants = list(self._find_claimants())
         self._discovered = self._discover_skills()
+        self._picked_as: dict[str, str] = {}
+        self._add_session_picks()
         self.available_skills: Mapping[str, SkillInfo] = MappingProxyType(
             self._apply_filters(self._discovered)
         )
@@ -211,11 +235,14 @@ class SkillManager:
         return tuple(self._shadowed)
 
     def _apply_filters(self, skills: dict[str, SkillInfo]) -> dict[str, SkillInfo]:
+        """A renamed session pick is filtered under the name it was picked as."""
         if self._config.enabled_skills:
             return {
                 name: info
                 for name, info in skills.items()
-                if name_matches(name, self._config.enabled_skills)
+                if name_matches(
+                    self._picked_as.get(name, name), self._config.enabled_skills
+                )
             }
         if self._config.disabled_skills:
             return {
@@ -273,6 +300,39 @@ class SkillManager:
                 by_file.setdefault(info.skill_path, info)
         return skills
 
+    def _add_session_picks(self) -> None:
+        """A pick of the skill a pin already loads under its name replaces that pin, so
+        the session runs the version it picked. A disabled skill still holds its name,
+        so the pick does not fall under the filter that disabled it.
+        """
+        taken = set(self._discovered)
+        for entry in self._session_pins:
+            info = self._load_registry_entry(entry, SkillScope.SESSION)
+            if info is None:
+                logger.info(
+                    "The session's skill %s (%s@%s) is not in the store yet; it loads"
+                    " once fetched",
+                    entry.name,
+                    entry.skill_id,
+                    entry.version,
+                )
+                continue
+            current = self._discovered.get(info.name)
+            if (
+                current is not None
+                and current.registry is not None
+                and current.registry.skill_id == entry.skill_id
+            ):
+                name = info.name
+            else:
+                name = _free_name(info.name, taken)
+                if name != info.name:
+                    self._picked_as[name] = info.name
+                    info = info.model_copy(update={"name": name})
+            taken.add(name)
+            self._discovered[name] = info
+            self._claimants.append(info)
+
     def _report_shadowed(
         self, loser: SkillInfo, winner: SkillInfo, *, loudly: bool
     ) -> None:
@@ -318,7 +378,7 @@ class SkillManager:
                 skill_file, source=SkillSource.LOCAL, scope=scope
             )
             if skill_info is not None:
-                skills.append(skill_info)
+                skills.append(skill_info.model_copy(update={"entry_path": skill_file}))
         return skills
 
     def _registry_sources(self) -> list[tuple[Path, SkillScope]]:
@@ -337,9 +397,21 @@ class SkillManager:
         return [
             info
             for path, scope in self._registry_sources()
-            for entry in _manifest.load_sync(path).skills
+            for entry in self._manifest_entries(path)
             if (info := self._load_registry_entry(entry, scope)) is not None
         ]
+
+    def _manifest_entries(self, path: Path) -> list[_manifest.ManifestEntry]:
+        try:
+            return _manifest.read_sync(path).skills
+        except _manifest.ManifestReadError as exc:
+            logger.warning("Ignoring unreadable skills manifest: %s", exc)
+            self._config_issues.append(
+                SkillConfigIssue(
+                    file=path, message=f"Shared skills not loaded: {exc.reason}"
+                )
+            )
+            return []
 
     def installed_skills(self) -> list[InstalledSkill]:
         """Everything installed, one entry per (name, scope, source), in the order
@@ -364,7 +436,7 @@ class SkillManager:
         return list(out.values())
 
     def _load_registry_entry(
-        self, entry: _manifest.ManifestEntry, scope: SkillScope
+        self, entry: ManifestEntry, scope: SkillScope
     ) -> SkillInfo | None:
         if not _store.is_safe_skill_id(entry.skill_id):
             logger.warning(

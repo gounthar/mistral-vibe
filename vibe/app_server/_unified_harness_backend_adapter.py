@@ -9,6 +9,8 @@ from collections.abc import (
     AsyncIterator,
     Awaitable,
     Callable,
+    Container,
+    Coroutine,
     Iterator,
     Mapping,
     Sequence,
@@ -22,6 +24,7 @@ from http import HTTPStatus
 import json
 import os
 from pathlib import Path
+import re
 import sys
 import time
 from typing import (
@@ -37,7 +40,7 @@ from typing import (
 )
 from uuid import uuid4
 
-from pydantic import JsonValue, ValidationError
+from pydantic import JsonValue, TypeAdapter, ValidationError
 
 from mistralai_vibe_local_harness.protocol import RustHarnessConfig
 import mistralai_vibe_local_harness.session_protocol as harness_session_protocol
@@ -138,6 +141,7 @@ from mistralai_vibe_local_harness.vibe.completion_profile import (
     PROCESS_CATALOGUE_CACHE,
     CompletionWarning,
     RuntimeWarningSink,
+    WarningCode,
 )
 from mistralai_vibe_local_harness.vibe.plugins import SessionPluginBinding
 from vibe.app_server._account import AccountController, AccountGateway
@@ -165,6 +169,7 @@ from vibe.app_server._completion_facts import (
     SavedCatalogue,
     compile_agent_route_facts,
 )
+from vibe.app_server._config_changes import ConfigChanges
 from vibe.app_server._config_errors import USER_CONFIG_ERRORS, user_config_error
 from vibe.app_server._config_introspect import (
     HIDDEN_SETTINGS,
@@ -172,6 +177,8 @@ from vibe.app_server._config_introspect import (
     build_field_wires,
     collect_layer_values,
     effective_config_response,
+    locking_layers,
+    shadowed_writes,
 )
 from vibe.app_server._config_paths import model_thinking_path
 from vibe.app_server._config_write import (
@@ -201,14 +208,33 @@ from vibe.app_server._enter_worktree import (
     EnterWorktreeError,
 )
 from vibe.app_server._error_message_cap import bounded_error_message
+from vibe.app_server._execution import raise_if_cancelled
 from vibe.app_server._experiments_service import (
     ExperimentsEvalFailedError,
     ExperimentsKey,
     ExperimentsService,
 )
 from vibe.app_server._feedback import FeedbackController
+from vibe.app_server._goal import GOAL_TOOL_NAMES, GoalController
+from vibe.app_server._goal_engine import (
+    TurnEnd,
+    TurnOrigin,
+    continuation_message,
+    count_tools,
+)
+from vibe.app_server._goal_notice_store import (
+    GOAL_NOTICES_FILENAME,
+    GoalNoticeStore,
+    goal_notice_entry,
+    read_stored_goal_notices,
+    with_goal_notices,
+)
+from vibe.app_server._goal_notices import GoalNotice
+from vibe.app_server._goal_state import GoalError
+from vibe.app_server._goal_store import read_stored_goal
 from vibe.app_server._host import config_schema_response
 from vibe.app_server._host_hooks import (
+    HOOK_FAILED_CODE,
     HOOK_MESSAGE_CODE,
     HostHook,
     HostHooks,
@@ -225,6 +251,7 @@ from vibe.app_server._identity import (
     IdentityGateway,
     PlatformCredentialProviderFactory,
 )
+from vibe.app_server._keep_awake import KeepAwake
 from vibe.app_server._launch_context import client_launch_context
 from vibe.app_server._legacy_import import LegacySessionStore
 from vibe.app_server._local_projects import (
@@ -259,11 +286,25 @@ from vibe.app_server._plugins import (
     plugin_hook_signature,
     plugin_reload_notices,
 )
+from vibe.app_server._project_moves import (
+    PROJECT_TOOL_NAMES,
+    ListProjectsResult,
+    MoveToProjectArgs,
+    MoveToProjectResult,
+    ProjectMoveError,
+    cancelled,
+    current_project_id,
+    find_project,
+    list_projects,
+    planned_move,
+    read_projects,
+)
 from vibe.app_server._projection import (
     project_agent_summary,
     project_config_view,
     project_debug_logs,
     project_installed_skill_summaries,
+    project_policy_summary,
     writable_disabled_skills,
 )
 from vibe.app_server._projector import EventProjector, ProjectedUpdate
@@ -277,7 +318,7 @@ from vibe.app_server._provided_tools import (
 )
 from vibe.app_server._provider_auth import read_provider_auth
 from vibe.app_server._pull_request_cache import Read, ReadFailure, pull_request_cache
-from vibe.app_server._registry_skill_sync import RegistrySkillSync
+from vibe.app_server._registry_skill_sync import PickRestore, RegistrySkillSync
 from vibe.app_server._remote_follower import FollowedValue, RemoteFollower
 from vibe.app_server._review import ReviewRequestHandler
 from vibe.app_server._root_session import rebind_history_with_checkpoint
@@ -317,6 +358,7 @@ from vibe.app_server._session_backend_port import (
     SessionRewindForkResult,
 )
 from vibe.app_server._session_backend_services import (
+    SessionBackendClientOwner,
     SessionBackendPlatformCredentials,
     SessionBackendServices,
 )
@@ -339,6 +381,7 @@ from vibe.app_server._session_model import (
     active_model_is_pinned,
     active_model_override_write_requested,
     clear_session_active_model_override,
+    model_default_thinking,
     model_thinking_is_session_writable,
     set_session_active_model_override,
     set_session_reasoning_effort_override,
@@ -346,6 +389,20 @@ from vibe.app_server._session_model import (
 )
 from vibe.app_server._session_peers import SessionPeerError, SessionPeers, TurnStarts
 from vibe.app_server._session_project_match import ProjectFolders
+from vibe.app_server._session_reply import (
+    ReplyRoute,
+    final_message,
+    owed_reply,
+    read_reply_text,
+    replies_to,
+    retrying,
+    send_reply,
+    settled,
+)
+from vibe.app_server._session_runtime_owner import (
+    refuse_target_start,
+    refuse_unless_local,
+)
 from vibe.app_server._session_seen_state import (
     SessionSeenState,
     should_mark_session_unseen,
@@ -401,6 +458,17 @@ from vibe.app_server._subagent_runs import (
 from vibe.app_server._turn_input import (
     session_content_blocks_from_vibe,
     vibe_content_blocks,
+)
+from vibe.app_server._unified_goal import (
+    CLIENT_INTERRUPT,
+    GOAL_TOOL_ROUTES,
+    USER_INTERRUPT_REASONS,
+    GoalTurnClock,
+    UnifiedSessionGoal,
+    billable_tokens,
+    goal_path,
+    goal_turn_outcome,
+    turn_tool_effects,
 )
 from vibe.app_server._unified_harness_snapshots import (
     RewindFileSnapshots,
@@ -458,6 +526,7 @@ from vibe.app_server.connector_catalog import (
     FollowedCatalog,
 )
 from vibe.app_server.events import (
+    SESSION_WHOLE_KEYS,
     AppServerEvent,
     CallbackRequested,
     ChildSessionUpdated,
@@ -483,6 +552,7 @@ from vibe.app_server.models import (
     ApprovalCallbackDetail,
     ApprovalCallbackOutput,
     ApprovalDecisionType,
+    ApprovalPolicySummary,
     ArchivedSessionStatus as VibeArchivedSessionStatus,
     BlockedSessionStatus as VibeBlockedSessionStatus,
     BudgetStopReason,
@@ -494,6 +564,8 @@ from vibe.app_server.models import (
     FailedEffectState,
     FailedSessionStatus as VibeFailedSessionStatus,
     GenericEffectDetail,
+    GoalNoticeDetail,
+    GoalStatus,
     IdleSessionStatus as VibeIdleSessionStatus,
     ImageContentBlock,
     JsonPatchOperation,
@@ -507,12 +579,15 @@ from vibe.app_server.models import (
     PublicBackgroundProcess,
     PublicCallbackEntry,
     PublicCheckpointEntry,
+    PublicChildModel,
     PublicChildSession,
     PublicEffectEntry,
     PublicEntryGenerationStatus,
     PublicError,
+    PublicGoal,
     PublicHistoryEntry,
     PublicMessageEntry,
+    PublicNoticeEntry,
     PublicRetryCategory,
     PublicRetryState,
     PublicSession,
@@ -541,11 +616,15 @@ from vibe.app_server.protocol import (
     PEER_REFUSAL_ARCHIVED,
     PEER_REFUSAL_BUSY,
     PEER_REFUSAL_PAUSED,
+    SESSION_LIMIT_DEPTH,
+    SESSION_LIMIT_HOPS,
+    SESSION_LIMIT_STARTED_SESSIONS,
     AccountReadParams,
     AccountReadResponse,
     AgentInstallParams,
     AgentsListResponse,
     AgentSwitchParams,
+    ApprovalPolicySwitchParams,
     ArtifactCreatedParams,
     ArtifactsListParams,
     ArtifactsListResponse,
@@ -686,6 +765,7 @@ from vibe.app_server.protocol import (
     SessionUpdatedParams,
     ShellRunParams,
     ShellRunResponse,
+    SkillsInstalledResponse,
     StartedSessionsArchived,
     StartedSessionSkipped,
     StartedSessionSkipReason,
@@ -736,7 +816,17 @@ from vibe.core.agents.install import (
     verify_installed_agents_change,
     with_agent_installed,
 )
-from vibe.core.agents.manager import FALLBACK_AGENTS, AgentManager, AgentSelectionError
+from vibe.core.agents.manager import (
+    FALLBACK_POLICIES,
+    POLICY_ORDER,
+    AgentManager,
+    AgentSelectionError,
+)
+from vibe.core.agents.models import (
+    REMOVED_BUILTIN_AGENTS,
+    ApprovalPolicyName,
+    BuiltinAgentName,
+)
 from vibe.core.config import MCPServer, MissingAPIKeyError, VibeConfigSchema
 from vibe.core.config._setting_keys import UnusedConfigKeysError
 from vibe.core.config.admin_config import AdminConfigApplyResult, AdminConfigOutcome
@@ -750,7 +840,7 @@ from vibe.core.config.layers.model_catalog import (
     set_catalog_and_reload,
 )
 from vibe.core.config.layers.overrides import OverridesLayer
-from vibe.core.config.models import ModelConfig
+from vibe.core.config.models import ModelConfig, standard_thinking_level
 from vibe.core.config.orchestrator import ConfigOrchestrator, ConfigPatchValidationError
 from vibe.core.config.vibe_schema import outside_workdir_denied
 from vibe.core.experiments.active import ExperimentName, ExperimentSurface
@@ -759,20 +849,23 @@ from vibe.core.experiments.session import resolve_plan_attributes
 from vibe.core.experiments.wait import (
     ExperimentsWait,
     experiments_eval_runs,
-    experiments_wait_needed,
+    experiments_pending,
 )
 from vibe.core.git.errors import GitError
 from vibe.core.git.worktree import ManagedWorktree, PreparedWorktree, WorktreeRepository
 from vibe.core.hooks.config import load_hooks_from_fs
 from vibe.core.hooks.models import HookType
 from vibe.core.identity_cache import IdentityCache
+from vibe.core.llm.utility_credentials import UtilityCredentialsFactory
 from vibe.core.log_reader import LogReader
 from vibe.core.loop import LoopError
 from vibe.core.model_catalog import (
     ModelCatalogResponse,
     ModelCatalogWait,
+    model_catalog_pending,
     model_catalog_wait_needed,
 )
+from vibe.core.paths import WORKTREES_DIR
 from vibe.core.proxy_setup import (
     SUPPORTED_PROXY_VARS,
     ProxySetupError,
@@ -791,8 +884,10 @@ from vibe.core.session.saved_sessions import (
     update_saved_session_pin,
 )
 from vibe.core.session.session_loader import METADATA_FILENAME, SessionLoader
-from vibe.core.skills.registry import refresh_registry_skills
+from vibe.core.skills.models import ManifestEntry, SkillInfo
+from vibe.core.skills.registry import refresh_registry_skills, restore_session_skills
 from vibe.core.telemetry.send import (
+    AgentModeTrigger,
     SubagentOperation,
     SubagentOutcome,
     SubagentProfileSource,
@@ -803,11 +898,13 @@ from vibe.core.telemetry.types import AttachmentKind, LaunchContext
 from vibe.core.tools.builtins.skill import already_loaded_message, skill_content_marker
 from vibe.core.trusted_folders import TrustedFoldersManager, has_agents_md_file
 from vibe.core.types import (
+    OwedReply,
     ScheduledLoop as CoreScheduledLoop,
     SessionMetadata,
     SessionProject,
 )
 from vibe.core.utils.concurrency import cancel_pending
+from vibe.core.utils.fetch_wait import FetchFailures, FetchWait
 from vibe.observability.logging import logger
 from vibe.observability.sentry import capture_cli_exception
 from vibe.setup.auth.whoami import WhoAmICache, WhoAmIResult, resolve_user_plan
@@ -815,6 +912,7 @@ from vibe.user_content import UserDisplayContent
 from vibe.utils import AgentEntrypoint
 from vibe.utils.io import FileSignature, file_signature, read_safe
 from vibe.utils.mcp import format_tool_display_description
+from vibe.utils.platform import PRIVATE_DIRECTORY_MODE
 
 if TYPE_CHECKING:
     from vibe.app_server._sandbox_skills import SandboxSessionSkills
@@ -828,6 +926,11 @@ if TYPE_CHECKING:
 def _report(exc: BaseException, boundary: str) -> None:
     """Reports a swallowed failure that leaves session state inconsistent."""
     capture_cli_exception(exc, tags={"vibe_boundary": f"session.{boundary}"})
+
+
+def _resolve(future: asyncio.Future[None]) -> None:
+    if not future.done():
+        future.set_result(None)
 
 
 @dataclass(frozen=True, slots=True)
@@ -844,6 +947,8 @@ class UnifiedSessionSettings:
     # the session is open, so a switch turned off then (a rollback, say)
     # reaches only sessions opened later.
     session_api: bool | None = None
+    # Registry skills ``skills/import`` pinned for this session only.
+    skill_pins: tuple[ManifestEntry, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -863,6 +968,8 @@ class UnifiedRuntimeDerivation:
     profile_warnings: tuple[CompletionWarning, ...] = ()
     # The catalogue's answer for the active model, which the session saves.
     completion_catalogue: CatalogueSnapshot | None = None
+    # The model each subagent type selects, by type; absent ones run on the session's.
+    child_models: Mapping[str, PublicChildModel] = field(default_factory=dict)
 
     # The Vibe attribution the runtime reads. Scoped to the derivation, not the
     # context, so a forked session cannot rebind the source session's. The
@@ -1165,6 +1272,10 @@ class UnifiedSessionContext:
     org_config_service: OrgConfigService
     experiments_service: ExperimentsService
     model_catalog_service: ModelCatalogService
+    keep_awake: KeepAwake
+    config_changes: ConfigChanges
+    """Tells the process's subscribed clients that a session loaded a new
+    model catalog."""
     skill_store: SkillStoreCleanup | None = None
     """None in a process without a background worker."""
     mcp_authentication: MCPAuthenticationService = field(
@@ -1209,6 +1320,9 @@ class UnifiedSessionContext:
     # resolve it: what side calls (narration, image description) send. None
     # outside a process: they read the API key.
     provider_credentials: Callable[[str], ProviderCredentialProvider] | None = None
+    # The connection's credentials for utility calls made with a config of
+    # their own (worktree naming). None outside a process: they read the key.
+    utility_credentials: UtilityCredentialsFactory | None = None
     # The pair ``AgentLoop`` owns on the legacy path, so the account and
     # identity hosts can name a cache without naming a backend. A session that
     # sends no eval resolves its telemetry attributes through them.
@@ -1356,6 +1470,8 @@ class _MergedListingKey:
     parent_session_id: str | None
     pinned: bool | None
     include_archived: bool
+    owes_reply: bool
+    interrupted: bool
 
 
 @dataclass(frozen=True, slots=True)
@@ -1373,6 +1489,7 @@ class _ListedRow:
     item: HarnessSessionListItem
     metadata_signature: FileSignature
     loops_signature: FileSignature
+    goal_signature: FileSignature
     public: PublicSession
 
 
@@ -1417,21 +1534,38 @@ _UNCHANGED: Final = _Unchanged()
 # How old cached MCP tools may get before an open refreshes them in the
 # background. Under the cache TTL, so tools stay offered while refreshing.
 _MCP_DESCRIPTOR_REFRESH_AFTER_S: Final = 6 * 60 * 60
+# How long a turn on a locked model waits for the model catalog's refresh
+# before it is refused on the catalog held: a plan upgraded since the last
+# fetch unlocks it, but a hung endpoint must not hold the turn, or the loops
+# behind it.
+_LOCKED_MODEL_REFETCH_WAIT_S: Final = 2.0
 # The sweep needs every match before it can merge, sort and filter pins, so it
 # asks for them in one call.
 _SESSION_LISTING_PAGE = sys.maxsize
 # The lease the Harness's maintenance holds; a session open waits on it.
 _MAINTENANCE_LEASE: Final = "process-output-cleanup"
 _MOVE_HELD_ELSEWHERE: Final = "Another connection or process holds the session."
-# A started session reports back from inside its turn, so its starter's archive
-# right after the report finds it finishing that turn.
-_PEER_ARCHIVE_SETTLE_SECONDS = 10.0
-_PEER_ARCHIVE_POLL_SECONDS = 0.05
+_REPLY_OBSERVER_ID: Final = "vibe-session-reply"
+# How often keep-awake reads whether the session runs a turn, as Vibe Desktop
+# does: fast while it holds the machine awake, slow otherwise, so a turn starting
+# is noticed up to that late (the input that started it reset the idle timer).
+KEEP_AWAKE_POLL_S: Final = 0.25
+KEEP_AWAKE_IDLE_POLL_S: Final = 5.0
+_PROJECT_MOVE_OBSERVER_ID: Final = "vibe-session-project-move"
+# Keys the open's own delivery among the replies in flight, which turn ids key.
+_OPEN_REPLIES: Final = "vibe-session-reply-open"
+_HARNESS_TURN: Final = TypeAdapter(harness_session_protocol.PublicTurn)
 _HISTORY_PAGE_WINDOW = 500
 # A turn can end, or a queued one start, between joining and starting one.
 _SESSION_MESSAGE_DELIVERY_ATTEMPTS: Final = 20
 _SESSION_MESSAGE_RETRY_SECONDS: Final = 0.25
+# How long an operation that needs the session idle waits for the reaping, queue
+# drain and title that follow a turn's end. A title is one short model call.
+_TURN_SETTLE_SECONDS: Final = 10.0
+_TURN_SETTLE_POLL_SECONDS: Final = 0.05
 _HISTORY_WINDOW_SESSIONS = 64
+# Interrupt reasons kept for root turns whose end is not settled yet.
+_MAX_INTERRUPT_REASONS = 64
 _RELOCATION_HISTORY_LIMIT = 200
 # Settings only delivery surfaces read, so writing them cannot change a running
 # turn; ``config/write`` accepts them mid-turn (ADR 0012).
@@ -1440,6 +1574,7 @@ _TURN_INDEPENDENT_CONFIG_PATHS: Final = frozenset({
     "/voice_mode_enabled",
     "/narrator_enabled",
     "/log_level",
+    "/keep_awake",
 })
 
 
@@ -1524,6 +1659,23 @@ def _log_completion_warning(warning: CompletionWarning) -> None:
     logger.warning("Completion settings: %s (%s)", warning.message, warning.code)
 
 
+def _is_user_notice(code: WarningCode) -> bool:
+    """Whether a completion warning is shown to the user, not only logged."""
+    match code:
+        case WarningCode.CATALOGUE_UNAVAILABLE:
+            # The session already falls back to the known-model table, and the
+            # user has nothing to fix.
+            return False
+        case (
+            WarningCode.WINDOW_GUESSED
+            | WarningCode.IMAGES_REPLACED
+            | WarningCode.REASONING_BUDGET_UNAVAILABLE
+        ):
+            return True
+        case _:
+            assert_never(code)
+
+
 @dataclass(eq=False)
 class _ArtifactSubscription:
     """A client's subscription to the PR reads of the stored sessions it
@@ -1570,6 +1722,28 @@ def _read_session_project(storage_root: str, session_id: str) -> SessionProject 
         _unified_session_dir(storage_root, session_id)
     )
     return metadata.project if metadata is not None else None
+
+
+_SKILL_RESTORE_WAIT_CAP_SECONDS = 5.0
+_SKILL_RESTORE_RETRY_DELAYS_SECONDS = (30.0, 120.0, 600.0)
+
+
+async def _with_stored_skill_pins(
+    settings: UnifiedSessionSettings | None, storage_root: str, session_id: str
+) -> UnifiedSessionSettings | None:
+    """Settings carrying the skills picked in a saved session, for its reopen.
+
+    A live source's settings already hold them; only a cold open reads the disk.
+    """
+    if settings is not None and settings.skill_pins:
+        return settings
+    metadata = await asyncio.to_thread(
+        _read_unified_session_metadata, _unified_session_dir(storage_root, session_id)
+    )
+    pins = () if metadata is None else tuple(metadata.skill_pins)
+    if not pins:
+        return settings
+    return replace(settings or UnifiedSessionSettings(), skill_pins=pins)
 
 
 def _metadata_username() -> str:
@@ -1684,8 +1858,11 @@ def _build_unified_session_metadata(
         config=previous.config if previous is not None else None,
         # Only the live adapter knows the path; the host paths carry it over.
         runtime_path=previous.runtime_path if previous is not None else None,
+        # Sessions saved before owners were recorded are local.
+        runtime=(previous.runtime if previous is not None else None) or "local",
         import_provenance=previous.import_provenance if previous is not None else None,
         created_worktree=previous.created_worktree if previous is not None else None,
+        skill_pins=previous.skill_pins if previous is not None else [],
         # Only an unstamped session takes a stamp: a session never changes project here.
         project=(
             previous.project
@@ -1697,6 +1874,7 @@ def _build_unified_session_metadata(
         # keeps the next full persist from wiping the recorded artifacts.
         artifacts=previous.artifacts if previous is not None else [],
         worktrees=previous.worktrees if previous is not None else [],
+        owed_replies=previous.owed_replies if previous is not None else [],
     )
 
 
@@ -1726,7 +1904,9 @@ async def _persist_unified_session_metadata(
 async def _write_unified_session_metadata(
     session_dir: Path, metadata: SessionMetadata
 ) -> SessionMetadata:
-    await asyncio.to_thread(session_dir.mkdir, mode=0o700, parents=True, exist_ok=True)
+    await asyncio.to_thread(
+        session_dir.mkdir, mode=PRIVATE_DIRECTORY_MODE, parents=True, exist_ok=True
+    )
     await persist_metadata(metadata.model_dump(mode="json"), session_dir)
     return metadata
 
@@ -1851,6 +2031,12 @@ class _UnifiedIdentityHost:
         return self.context.identity_cache
 
 
+def _skill_file(skill: SkillInfo | None) -> str | None:
+    if skill is None or skill.skill_path is None:
+        return None
+    return str(skill.skill_path)
+
+
 class _UnifiedSkillsHost:
     """Presents the Unified backend as a ``SkillsHost``.
 
@@ -1864,15 +2050,21 @@ class _UnifiedSkillsHost:
         context: UnifiedSessionContext,
         *,
         runtime: Callable[[], RuntimeSnapshot],
-        require_idle: Callable[[], None],
+        require_no_session_rewrite: Callable[[], None],
         require_session: Callable[[str], None],
-        refresh: Callable[[], Awaitable[RuntimeSnapshot]],
+        refresh: Callable[[], Awaitable[RuntimeMutationResponse]],
+        session_pins: Callable[[], tuple[ManifestEntry, ...]],
+        save_session_pins: Callable[[tuple[ManifestEntry, ...]], Awaitable[None]],
+        plugin_skills: Callable[[], Mapping[str, SkillInfo]],
     ) -> None:
         self._context = context
+        self._plugin_skills = plugin_skills
         self._runtime = runtime
-        self._require_idle = require_idle
+        self._require_no_session_rewrite = require_no_session_rewrite
         self._require_session = require_session
         self._refresh = refresh
+        self._session_pins = session_pins
+        self._save_session_pins = save_session_pins
 
     @property
     def config(self) -> VibeConfigSchema:
@@ -1890,8 +2082,22 @@ class _UnifiedSkillsHost:
     def skill_roots(self) -> list[Path]:
         return self._context.harness_files.project_roots
 
-    def require_idle(self) -> None:
-        self._require_idle()
+    @property
+    def local_skill_dirs(self) -> list[Path]:
+        harness_files = self._context.harness_files
+        configured = self._context.config_orchestrator.config.skill_paths
+        return [
+            *configured,
+            *harness_files.project_skills_dirs,
+            *harness_files.user_skills_dirs,
+        ]
+
+    @property
+    def sandboxed(self) -> bool:
+        return self._context.sandbox_skills is not None
+
+    def require_no_session_rewrite(self) -> None:
+        self._require_no_session_rewrite()
 
     def require_session(self, session_id: str) -> None:
         self._require_session(session_id)
@@ -1899,15 +2105,16 @@ class _UnifiedSkillsHost:
     def list_skills(self) -> list[SkillSummary]:
         return list(self._runtime().skills)
 
-    def installed_skills(self) -> list[SkillSummary]:
+    def installed_skills(self) -> SkillsInstalledResponse:
         """Every skill file and registry pin, one per name, scope and source, then
         the plugin skills; each marked active when its name resolves to it, and
         an active one shown in the version the session runs.
         """
-        skills = installed_session_skills(
+        skills, issues = installed_session_skills(
             lambda: self._context.config_orchestrator.config,
             harness_files=self._context.harness_files,
             sandbox=self._context.sandbox_skills,
+            session_pins=self._session_pins(),
         )
         orchestrator = self._context.config_orchestrator
         installed = project_installed_skill_summaries(
@@ -1917,14 +2124,31 @@ class _UnifiedSkillsHost:
         # ``project_core_skills``); merge in any that are not already present
         # so the browser shows them alongside registry pins and local skills.
         existing = {s.name for s in installed}
+        plugin_skills = self._plugin_skills()
         installed.extend(
-            s.model_copy(update={"enabled": True, "locked": True})
+            s.model_copy(
+                update={
+                    "enabled": True,
+                    "locked": True,
+                    "path": _skill_file(plugin_skills.get(s.name)),
+                }
+            )
             for s in self._runtime().skills
             if s.source == "plugin" and s.name not in existing
         )
-        return installed
+        if self.sandboxed:
+            # The files live in the sandbox, so the host can neither open nor delete them.
+            installed = [s.model_copy(update={"path": None}) for s in installed]
+        return SkillsInstalledResponse(skills=installed, issues=issues)
 
-    async def refresh(self) -> RuntimeSnapshot:
+    @property
+    def session_skill_pins(self) -> tuple[ManifestEntry, ...]:
+        return self._session_pins()
+
+    async def save_session_skill_pins(self, pins: tuple[ManifestEntry, ...]) -> None:
+        await self._save_session_pins(pins)
+
+    async def refresh(self) -> RuntimeMutationResponse:
         return await self._refresh()
 
 
@@ -1990,6 +2214,38 @@ def _require_session_logging(context: UnifiedSessionContext) -> None:
     )
 
 
+SPAWN_REFUSAL_STARTER_UNKNOWN = "starter_unknown"
+SPAWN_REFUSAL_POLICY_MISMATCH = "policy_must_match_starter"
+SPAWN_REFUSAL_AUTO_APPROVE = "auto_approve_on_spawned_start"
+_POLICY_NAMES = frozenset(name.value for name in ApprovalPolicyName)
+_VIBE_BOT_STARTER_PREFIX = "vibebot:"
+_POLICY_RANKS = {name.value: rank for rank, name in enumerate(POLICY_ORDER)}
+
+
+def _policy_rank(policy: str) -> int:
+    # A custom or unknown policy counts as one the bot may not exceed: `ask`.
+    return _POLICY_RANKS.get(policy, -1)
+
+
+def _spawn_refused(reason: str, message: str) -> SessionBackendError:
+    return SessionBackendError(
+        ProtocolErrorCode.INVALID_PARAMS, message, {"reason": reason}, expected=True
+    )
+
+
+def _selection_refused(exc: ValueError) -> SessionBackendError:
+    """A refused agent or policy switch, with a reason a client can word."""
+    reason = exc.reason if isinstance(exc, AgentSelectionError) else None
+    if isinstance(exc, InvalidConfigError):
+        return SessionBackendError.configuration(exc)
+    return SessionBackendError(
+        ProtocolErrorCode.INVALID_PARAMS,
+        str(exc),
+        None if reason is None else {"reason": reason.value},
+        expected=True,
+    )
+
+
 def _raise_session_config_error(
     exc: ConfigStorageError
     | LayerImplementationError
@@ -2014,6 +2270,7 @@ def adapt_harness_host(  # noqa: PLR0913 - one collaborator per concern, all key
     owns_host: bool = True,
     pin_session_options: Callable[[SessionOptions], SessionOptions] | None = None,
     worktree_housekeeping: WorktreeHousekeeping | None = None,
+    worktree_naming_credentials: UtilityCredentialsFactory | None = None,
     host_hooks: HostHooks | None = None,
     open_sessions: OpenSessions | None = None,
 ) -> UnifiedHarnessBackendHostAdapter:
@@ -2027,6 +2284,7 @@ def adapt_harness_host(  # noqa: PLR0913 - one collaborator per concern, all key
         owns_host=owns_host,
         pin_session_options=pin_session_options,
         worktree_housekeeping=worktree_housekeeping,
+        worktree_naming_credentials=worktree_naming_credentials,
         host_hooks=host_hooks,
         open_sessions=open_sessions,
     )
@@ -2125,6 +2383,7 @@ class UnifiedHarnessBackendHostAdapter:  # noqa: PLR0904 - implements app-server
         owns_host: bool = True,
         pin_session_options: Callable[[SessionOptions], SessionOptions] | None = None,
         worktree_housekeeping: WorktreeHousekeeping | None = None,
+        worktree_naming_credentials: UtilityCredentialsFactory | None = None,
         host_hooks: HostHooks | None = None,
         open_sessions: OpenSessions | None = None,
     ) -> None:
@@ -2163,6 +2422,7 @@ class UnifiedHarnessBackendHostAdapter:  # noqa: PLR0904 - implements app-server
         self._worktrees = SessionWorktrees(
             launch_context_getter=self._launch_context_getter,
             housekeeping=worktree_housekeeping,
+            naming_credentials=worktree_naming_credentials,
         )
         self._merged_listing: _MergedListing | None = None
         # Serialize this process's read-then-write of one closed session's metadata.
@@ -2183,7 +2443,118 @@ class UnifiedHarnessBackendHostAdapter:  # noqa: PLR0904 - implements app-server
         )
 
     async def start(self, params: SessionStartParams) -> SessionLifecycleResult:
-        params = self._pinned(params)
+        params = await self._spawned_start(self._pinned(params))
+        return await self._start(params)
+
+    async def _spawned_start(self, params: SessionStartParams) -> SessionStartParams:
+        """A start another session asked for runs that session's policy as it
+        is now: the client names which session to start, never what it may do.
+        Without an agent named, it also runs the starter's agent: clients name
+        none for a starter on `default`, which `default_agent` may not be.
+
+        Desktop starts it on whichever app server process has room, so the
+        starter's choices are read live when this process holds it open, and
+        otherwise from its saved pins, which it writes on every change.
+        """
+        starter = params.spawned_by_session_id or params.started_by_session_id
+        if starter is None:
+            return params
+        if starter.startswith(_VIBE_BOT_STARTER_PREFIX):
+            return await self._vibe_bot_start(params)
+        selection = self._open_sessions.selection(
+            starter
+        ) or await self._saved_selection(starter)
+        if selection is None:
+            if params.spawned_by_session_id is None:
+                # A client from before `spawnedBySessionId` naming a session
+                # this app server cannot read.
+                return params
+            raise _spawn_refused(
+                SPAWN_REFUSAL_STARTER_UNKNOWN,
+                "The session that asked for this start is not one this app "
+                "server can read.",
+            )
+        starter_agent, policy = selection
+        options = params.agent_config
+        if options.auto_approve:
+            raise _spawn_refused(
+                SPAWN_REFUSAL_AUTO_APPROVE,
+                "A session another session starts cannot ask for auto-approve: "
+                "it runs its starter's approval policy.",
+            )
+        requested = options.approval_policy or (
+            options.agent if options.agent in _POLICY_NAMES else None
+        )
+        if requested is not None and requested != policy:
+            raise _spawn_refused(
+                SPAWN_REFUSAL_POLICY_MISMATCH,
+                f"A session another session starts runs its starter's approval "
+                f"policy, '{policy}', not '{requested}'.",
+            )
+        return params.model_copy(
+            update={
+                "agent_config": options.model_copy(
+                    update={
+                        "approval_policy": policy,
+                        "agent": starter_agent
+                        if options.agent is None or options.agent in _POLICY_NAMES
+                        else options.agent,
+                    }
+                )
+            }
+        )
+
+    async def _vibe_bot_start(self, params: SessionStartParams) -> SessionStartParams:
+        """A start a Vibebot thread asked for, from the cloud, runs the strictest
+        of this machine's Vibebot ceiling, the user's default policy, and the
+        policy the bot requested: the bot can only lower trust.
+        """
+        config = (await self._read_context(SessionOptions())).config_orchestrator.config
+        options = params.agent_config
+        candidates = [
+            config.vibe_bot_max_approval_policy,
+            config.default_approval_policy,
+        ]
+        if options.approval_policy is not None:
+            candidates.append(options.approval_policy)
+        policy = min(candidates, key=_policy_rank)
+        if _policy_rank(policy) < 0:
+            policy = ApprovalPolicyName.ASK.value
+        return params.model_copy(
+            update={
+                "agent_config": options.model_copy(
+                    update={"approval_policy": policy, "auto_approve": False}
+                )
+            }
+        )
+
+    async def _saved_selection(self, session_id: str) -> tuple[str, str] | None:
+        """The agent and policy a session not open here last ran, from its
+        saved pins, read as a resume reads them (``decoded_selection``).
+        """
+        try:
+            context = await self._read_context(SessionOptions())
+            pins = await _harness_call(self._host.session_pins(session_id))
+        except SessionBackendError:
+            return None
+        agent_name = pins[SessionPin.AGENT_NAME] or None
+        approval_policy = pins[SessionPin.APPROVAL_POLICY] or None
+        if agent_name is None and approval_policy is None:
+            return None
+        agents = await asyncio.to_thread(context.build_agents)
+        agent, policy = decoded_selection(agents, agent_name, approval_policy)
+        if agent is None or policy is None:
+            return None
+        return agent, policy
+
+    def open_selection(self, session_id: str) -> tuple[str, str] | None:
+        adapter = self._adapters.get(session_id)
+        if adapter is None or adapter._closed:
+            return None
+        agents = adapter._context.agents
+        return agents.active_agent.name, agents.active_policy.name
+
+    async def _start(self, params: SessionStartParams) -> SessionLifecycleResult:
         if params.agent_config.worktree is None:
             result, _ = await self._start_resolved(params, params.agent_config)
             return result
@@ -2194,7 +2565,11 @@ class UnifiedHarnessBackendHostAdapter:  # noqa: PLR0904 - implements app-server
         worktree = params.agent_config.worktree
         # The move rebuilds from these, so it keeps the agent the start resolved.
         requested = params.agent_config.model_copy(
-            update={"agent": started.agent, "auto_approve": started.auto_approve}
+            update={
+                "agent": started.agent,
+                "approval_policy": started.approval_policy,
+                "auto_approve": started.auto_approve,
+            }
         )
         progress = (
             WorktreeProgress(
@@ -2342,6 +2717,12 @@ class UnifiedHarnessBackendHostAdapter:  # noqa: PLR0904 - implements app-server
         resolution = await self._worktrees.resolve_for_start(options)
         try:
             context, derivation, started = await self._start_context(resolution.options)
+            if params.first_turn is not None:
+                # It would run before the client could see the refusal.
+                refuse_target_start(context.config_orchestrator.config)
+            if context.config_orchestrator.config.experimental_target_runtime:
+                # Opens like a warm-up: refused at first use.
+                params = params.model_copy(update={"kind": SessionKind.EPHEMERAL})
             context = (
                 await self._plant_connector_catalog(context, cached_only=True)
                 or context
@@ -2368,15 +2749,20 @@ class UnifiedHarnessBackendHostAdapter:  # noqa: PLR0904 - implements app-server
                 ),
             )
             await self._prepare_opened_backend(
-                backend,
-                backend.restore_scheduled_loops(),
-                worktree_resolution=resolution,
+                backend, backend.restore_session_state(), worktree_resolution=resolution
             )
-            if started.agent is not None:
+            if started.agent is not None or started.approval_policy is not None:
                 await backend.pin_started_agent()
-            if (
-                params.started_by_session_id is not None
-                and params.first_turn is not None
+            starter = params.spawned_by_session_id or params.started_by_session_id
+            if starter is not None and not starter.startswith(_VIBE_BOT_STARTER_PREFIX):
+                backend.record_spawned_by(
+                    starter, attached=params.started_by_session_id is not None
+                )
+            # A detached session has no starter to report back to, but its
+            # task still carries the chain's hops, so detached starts cannot
+            # chain past `MAX_SESSION_HOPS`.
+            if params.first_turn is not None and (
+                params.started_by_session_id is not None or params.hops > 0
             ):
                 backend.expect_handed_task(max(params.hops, 1))
             if params.started_by_session_id is None:
@@ -2432,7 +2818,7 @@ class UnifiedHarnessBackendHostAdapter:  # noqa: PLR0904 - implements app-server
         )
         _require_session_logging(context)
         seat = _terminal_seat(params.agent_config, context)
-        context, derivation, resolution = await self._pin_for_resume(
+        context, derivation, resolution, settings = await self._pin_for_resume(
             params.agent_config,
             params.session_id,
             context,
@@ -2441,19 +2827,26 @@ class UnifiedHarnessBackendHostAdapter:  # noqa: PLR0904 - implements app-server
         )
         try:
             session, context = await _harness_call(
-                self._resume_harness(params.session_id, params.history_limit, context)
+                self._resume_harness(
+                    params.session_id,
+                    params.history_limit,
+                    context,
+                    interrupt_left_turn=params.interrupt_left_turn,
+                )
             )
             backend = self._adapter(
                 session,
                 context,
                 derivation,
                 scheduled_loops_enabled=not params.agent_config.headless,
+                settings=settings,
             )
             backend._unlanded_worktree_candidate = True
             await self._prepare_opened_backend(
                 backend,
-                backend.restore_scheduled_loops(),
+                backend.restore_session_state(),
                 worktree_resolution=resolution,
+                stamp_owner=False,
             )
         except BaseException:
             await self._worktrees.cleanup(resolution)
@@ -2505,7 +2898,7 @@ class UnifiedHarnessBackendHostAdapter:  # noqa: PLR0904 - implements app-server
                 "No session to continue",
                 {"harnessCode": NOTHING_TO_CONTINUE},
             )
-        context, derivation, resolution = await self._pin_for_resume(
+        context, derivation, resolution, settings = await self._pin_for_resume(
             params.agent_config, target_id, context, derivation, require_api_key=True
         )
         try:
@@ -2517,12 +2910,14 @@ class UnifiedHarnessBackendHostAdapter:  # noqa: PLR0904 - implements app-server
                 context,
                 derivation,
                 scheduled_loops_enabled=not params.agent_config.headless,
+                settings=settings,
             )
             backend._unlanded_worktree_candidate = True
             await self._prepare_opened_backend(
                 backend,
-                backend.restore_scheduled_loops(),
+                backend.restore_session_state(),
                 worktree_resolution=resolution,
+                stamp_owner=False,
             )
         except BaseException:
             await self._worktrees.cleanup(resolution)
@@ -2538,7 +2933,12 @@ class UnifiedHarnessBackendHostAdapter:  # noqa: PLR0904 - implements app-server
         )
 
     async def _resume_harness(
-        self, session_id: str, history_limit: int, context: UnifiedSessionContext
+        self,
+        session_id: str,
+        history_limit: int,
+        context: UnifiedSessionContext,
+        *,
+        interrupt_left_turn: bool = False,
     ) -> tuple[UnifiedHarnessSessionBackend, UnifiedSessionContext]:
         """Configure connector routes before recovery and retry old stores if needed.
 
@@ -2556,6 +2956,8 @@ class UnifiedHarnessBackendHostAdapter:  # noqa: PLR0904 - implements app-server
                 history_limit=history_limit,
                 hook_bindings=context.hooks.bindings,
                 hook_handlers=context.hooks.handlers,
+                owner=self._client_owner(),
+                interrupt_left_turn=interrupt_left_turn,
             )
 
         resolved = await self._plant_connector_catalog(context, cached_only=True)
@@ -2609,7 +3011,10 @@ class UnifiedHarnessBackendHostAdapter:  # noqa: PLR0904 - implements app-server
         return resolved
 
     async def fork(self, params: SessionForkParams) -> SessionForkResult:
-        options = params.agent_config or SessionOptions()
+        # A fork runs its source's approval policy: a client cannot name one.
+        options = (params.agent_config or SessionOptions()).model_copy(
+            update={"approval_policy": None, "auto_approve": False}
+        )
         self._worktrees.reject_input(options)
         source = self._adapters.get(params.source_session_id)
         if source is not None and source._closed:
@@ -2619,6 +3024,7 @@ class UnifiedHarnessBackendHostAdapter:  # noqa: PLR0904 - implements app-server
             UnifiedSessionContext,
             UnifiedRuntimeDerivation,
             WorktreeResolution,
+            UnifiedSessionSettings | None,
             HarnessSessionForkResult,
         ]:
             # A fork continues the source session's work, so it keeps the org
@@ -2628,7 +3034,7 @@ class UnifiedHarnessBackendHostAdapter:  # noqa: PLR0904 - implements app-server
             context, derivation = await self._lifecycle_context(
                 options, require_api_key=True
             )
-            context, derivation, resolution = await self._pin_for_fork(
+            context, derivation, resolution, settings = await self._pin_for_fork(
                 options,
                 params.source_session_id,
                 context,
@@ -2638,6 +3044,13 @@ class UnifiedHarnessBackendHostAdapter:  # noqa: PLR0904 - implements app-server
                 trust_store=None if source is None else source._worktree_trust_store,
             )
             try:
+                if source is not None:
+                    derivation = await self._run_sources_policy(
+                        context,
+                        derivation,
+                        source._context.agents.active_policy.name,
+                        source._settings,
+                    )
                 result = await _harness_call(
                     self._host.fork(
                         params.source_session_id,
@@ -2651,7 +3064,7 @@ class UnifiedHarnessBackendHostAdapter:  # noqa: PLR0904 - implements app-server
             except BaseException:
                 await self._worktrees.cleanup(resolution)
                 raise
-            return context, derivation, resolution, result
+            return context, derivation, resolution, settings, result
 
         if source is not None:
             await source._await_deferred_setup()
@@ -2660,10 +3073,17 @@ class UnifiedHarnessBackendHostAdapter:  # noqa: PLR0904 - implements app-server
                     context,
                     derivation,
                     resolution,
+                    settings,
                     result,
                 ) = await fork_at_source_boundary()
         else:
-            context, derivation, resolution, result = await fork_at_source_boundary()
+            (
+                context,
+                derivation,
+                resolution,
+                settings,
+                result,
+            ) = await fork_at_source_boundary()
         try:
             fork_local = result.session.adapter_config
             if fork_local is not None:
@@ -2682,7 +3102,7 @@ class UnifiedHarnessBackendHostAdapter:  # noqa: PLR0904 - implements app-server
                 context,
                 derivation,
                 scheduled_loops_enabled=not options.headless,
-                settings=None if source is None else source._settings,
+                settings=settings,
                 project=(
                     source._project
                     if source is not None
@@ -2758,6 +3178,8 @@ class UnifiedHarnessBackendHostAdapter:  # noqa: PLR0904 - implements app-server
             parent_session_id=params.parent_session_id,
             pinned=params.pinned,
             include_archived=params.include_archived,
+            owes_reply=params.owes_reply,
+            interrupted=params.interrupted,
         )
         listing = self._merged_listing
         # A cursor continues a walk whose first page already swept both stores,
@@ -2766,9 +3188,9 @@ class UnifiedHarnessBackendHostAdapter:  # noqa: PLR0904 - implements app-server
         # advances moves ahead of the cursor into the region already passed,
         # and the walk never returns it. Hold the first page's merge instead
         # and let the walk read a stable snapshot of it.
-        if params.session_ids is not None:
-            # Asked by id: answered on its own, so a walk the cache holds for
-            # another caller goes on undisturbed.
+        if params.session_ids is not None or params.interrupted:
+            # Asked by id, or for the interrupted ones: answered on its own, so
+            # a walk the cache holds for another caller goes on undisturbed.
             listing = await self._build_merged_listing(params, key)
         elif params.cursor is None or listing is None or listing.key != key:
             listing = await self._build_merged_listing(params, key)
@@ -2890,7 +3312,13 @@ class UnifiedHarnessBackendHostAdapter:  # noqa: PLR0904 - implements app-server
         context = await self._read_context(options)
         legacy = LegacySessionStore(context.config)
 
-        if params.session_ids is None:
+        if params.interrupted:
+            # Legacy sessions never resume mid-turn.
+            unified_items, _latest_id = await self._sweep_unified_sessions(
+                params, options, context.storage_root, cwd_matches
+            )
+            legacy_items: list[PublicSession] = []
+        elif params.session_ids is None:
             # One store is a host round trip and the other a worker-thread
             # filesystem scan, so reading them in sequence would add the smaller
             # to the larger for nothing.
@@ -2916,8 +3344,7 @@ class UnifiedHarnessBackendHostAdapter:  # noqa: PLR0904 - implements app-server
         merged = await asyncio.to_thread(
             _merge_listed_sessions, params, unified_items, legacy_items
         )
-        if context.config.experimental_enable_local_projects:
-            merged = await self._with_folder_projects(merged, context)
+        merged = await self._with_folder_projects(merged, context)
 
         return _MergedListing(
             key=key, sessions=merged, legacy=legacy, storage_root=context.storage_root
@@ -3081,6 +3508,10 @@ class UnifiedHarnessBackendHostAdapter:  # noqa: PLR0904 - implements app-server
                     root_session_id=params.root_session_id,
                     parent_session_id=params.parent_session_id,
                     session_ids=params.session_ids,
+                    interrupted=params.interrupted,
+                    owner=self._client_owner()
+                    if params.interrupted or params.owes_reply
+                    else None,
                 )
             )
             items.extend(
@@ -3094,7 +3525,8 @@ class UnifiedHarnessBackendHostAdapter:  # noqa: PLR0904 - implements app-server
                     and harness_cwd is None
                     and params.root_session_id is None
                     and params.parent_session_id is None
-                    and params.session_ids is None,
+                    and params.session_ids is None
+                    and not params.interrupted,
                 )
             )
             if latest_id is None:
@@ -3235,10 +3667,15 @@ class UnifiedHarnessBackendHostAdapter:  # noqa: PLR0904 - implements app-server
             pins = await _stored_session_pins(
                 self._host, snapshot.state.session.id, context.build_agents
             )
+            session_dir = _unified_session_dir(
+                context.storage_root, snapshot.state.session.id
+            )
             scheduled_loops = await asyncio.to_thread(
-                read_stored_loops,
-                _unified_session_dir(context.storage_root, snapshot.state.session.id)
-                / "scheduled-loops.json",
+                read_stored_loops, session_dir / "scheduled-loops.json"
+            )
+            goal = await asyncio.to_thread(read_stored_goal, goal_path(session_dir))
+            goal_notices = await asyncio.to_thread(
+                read_stored_goal_notices, session_dir
             )
             return _read_response(
                 snapshot,
@@ -3246,6 +3683,8 @@ class UnifiedHarnessBackendHostAdapter:  # noqa: PLR0904 - implements app-server
                 metadata=metadata,
                 pins=pins,
                 scheduled_loops=scheduled_loops,
+                goal=goal,
+                goal_notices=goal_notices,
                 mcp_apps=None,
                 started_by_session_id=result.started_by_session_id,
             )
@@ -3278,6 +3717,19 @@ class UnifiedHarnessBackendHostAdapter:  # noqa: PLR0904 - implements app-server
             if adapter is not None and not adapter._closed
             else ()
         )
+        goal = (
+            adapter._goal.live_goal
+            if adapter is not None and not adapter._closed
+            else None
+        )
+        if adapter is not None and not adapter._closed:
+            goal_notices = adapter._goal_notices.notices
+        else:
+            storage_root = (await self._read_context(SessionOptions())).storage_root
+            goal_notices = await asyncio.to_thread(
+                read_stored_goal_notices,
+                _unified_session_dir(storage_root, params.session_id),
+            )
         mcp_apps = (
             adapter._mcp_apps if adapter is not None and not adapter._closed else None
         )
@@ -3295,6 +3747,8 @@ class UnifiedHarnessBackendHostAdapter:  # noqa: PLR0904 - implements app-server
                 result.cwd,
                 workspace_roots=workspace_roots,
                 scheduled_loops=scheduled_loops,
+                goal=goal,
+                goal_notices=goal_notices,
                 mcp_apps=mcp_apps,
                 started_by_session_id=result.started_by_session_id,
             ).state
@@ -3538,11 +3992,6 @@ class UnifiedHarnessBackendHostAdapter:  # noqa: PLR0904 - implements app-server
     ) -> SessionMoveResponse:
         """Restamp one root Session and move it to its new project's primary folder."""
         context = await self._read_context(SessionOptions())
-        if not context.config.experimental_enable_local_projects:
-            raise SessionBackendError(
-                ProtocolErrorCode.INVALID_PARAMS,
-                "Moving a session needs local projects",
-            )
         stamp, folder = await asyncio.to_thread(_move_target, params.project)
         backend = self._relocation_backend(params.session_id, attached)
         # The legacy store is read-only: opening a legacy session imports it.
@@ -3607,8 +4056,21 @@ class UnifiedHarnessBackendHostAdapter:  # noqa: PLR0904 - implements app-server
                 destination = _RelocationDestination(
                     target=target, checkout=target, changes_worktree=changes_worktree
                 )
+                # An open session keeps a folder no project claims, such as a
+                # scratch one, unless it holds the target: that would widen the
+                # workspace past the project.
+                keep_previous = (
+                    backend is not None
+                    and not target.is_relative_to(previous_cwd)
+                    and await asyncio.to_thread(_in_no_project, previous_cwd)
+                )
                 prepared = await self._prepare_relocation(
-                    session_id, backend, previous_cwd, destination, trust_store
+                    session_id,
+                    backend,
+                    previous_cwd,
+                    destination,
+                    trust_store,
+                    keep_previous=keep_previous,
                 )
                 try:
                     relocated = await self._commit_relocation(session_id, prepared)
@@ -3719,6 +4181,8 @@ class UnifiedHarnessBackendHostAdapter:  # noqa: PLR0904 - implements app-server
         previous_cwd: Path,
         destination: _RelocationDestination,
         trust_store: TrustedFoldersManager,
+        *,
+        keep_previous: bool = False,
     ) -> _PreparedRelocation:
         if destination.changes_worktree:
             await asyncio.to_thread(
@@ -3731,7 +4195,7 @@ class UnifiedHarnessBackendHostAdapter:  # noqa: PLR0904 - implements app-server
         try:
             trust_store.trust_for_session(destination.checkout)
             options = self._relocation_options(
-                backend, previous_cwd, destination.target
+                backend, previous_cwd, destination.target, keep_previous=keep_previous
             )
             context, _ = await self._lifecycle_context(options, require_api_key=True)
             await self._restore_session_pins(session_id, context)
@@ -3865,11 +4329,15 @@ class UnifiedHarnessBackendHostAdapter:  # noqa: PLR0904 - implements app-server
                         count=self.count_turn_started_session,
                     ),
                     enter_worktree=self.enter_worktree,
+                    list_projects=self.list_projects,
+                    move_to_project=self.move_to_project,
                     max_todos=lambda: resolved_max_todos(
                         context.config_orchestrator.config.tools.get(TODO_TOOL_NAME)
                     ),
+                    goals=self.goal_controller,
                 ),
                 mode=VIBE_PROVIDED_TOOL_MODES,
+                root_only=(*GOAL_TOOL_NAMES, *PROJECT_TOOL_NAMES),
             )
             self._publish_mcp_catalog(context, context.mcp_catalog)
             self._configure_connectors(
@@ -3894,6 +4362,16 @@ class UnifiedHarnessBackendHostAdapter:  # noqa: PLR0904 - implements app-server
                 relocated.snapshot,
                 relocated.cwd,
                 scheduled_loops=(),
+                goal=await asyncio.to_thread(
+                    read_stored_goal,
+                    goal_path(
+                        _unified_session_dir(prepared.context.storage_root, session_id)
+                    ),
+                ),
+                goal_notices=await asyncio.to_thread(
+                    read_stored_goal_notices,
+                    _unified_session_dir(prepared.context.storage_root, session_id),
+                ),
                 started_by_session_id=relocated.started_by_session_id,
                 mcp_apps=None,
             )
@@ -4049,7 +4527,11 @@ class UnifiedHarnessBackendHostAdapter:  # noqa: PLR0904 - implements app-server
 
     @staticmethod
     def _relocation_options(
-        backend: UnifiedHarnessBackendAdapter | None, previous_cwd: Path, target: Path
+        backend: UnifiedHarnessBackendAdapter | None,
+        previous_cwd: Path,
+        target: Path,
+        *,
+        keep_previous: bool = False,
     ) -> SessionOptions:
         if backend is None:
             return SessionOptions(cwd=str(target))
@@ -4058,6 +4540,8 @@ class UnifiedHarnessBackendHostAdapter:  # noqa: PLR0904 - implements app-server
             for root in backend._adapter_config.workspace.roots
             if root not in {previous_cwd, target}
         ]
+        if keep_previous:
+            extra_roots.append(str(previous_cwd))
         return SessionOptions(
             cwd=str(target),
             workspace_roots=extra_roots,
@@ -4191,6 +4675,8 @@ class UnifiedHarnessBackendHostAdapter:  # noqa: PLR0904 - implements app-server
                 parent_session_id=None,
                 pinned=None,
                 include_archived=True,
+                owes_reply=False,
+                interrupted=False,
             ),
         )
         by_id = {session.id: session for session in listing.sessions}
@@ -4260,6 +4746,22 @@ class UnifiedHarnessBackendHostAdapter:  # noqa: PLR0904 - implements app-server
             return "failed"
         return None
 
+    async def reload_config_files(self) -> None:
+        """Every session this Host holds re-reads the config files."""
+        for adapter in tuple(self._adapters.values()):
+            if adapter._closed:
+                continue
+            try:
+                await adapter.reload_config_files()
+            except Exception:
+                # The setting is written; the session takes it at its next
+                # reload, and its own config error is reported there.
+                logger.warning(
+                    "Could not reload the config files of session_id=%s",
+                    adapter.session_id,
+                    exc_info=True,
+                )
+
     async def archive_open(
         self, params: SessionArchiveParams
     ) -> SessionArchiveResponse | None:
@@ -4267,7 +4769,9 @@ class UnifiedHarnessBackendHostAdapter:  # noqa: PLR0904 - implements app-server
         archived_at = datetime.now(UTC) if params.archived else None
         adapter = self._adapters.get(params.session_id)
         if adapter is not None and not adapter._closed:
-            async with await adapter._archive_gate_once_settled(params):
+            if params.require_idle:
+                await adapter._await_turn_settled()
+            async with adapter._archive_gate:
                 if params.require_idle and adapter._session.has_active_work:
                     raise _peer_refusal(PEER_REFUSAL_BUSY, "The session is working.")
                 metadata = await adapter._persist_session_metadata(
@@ -4528,6 +5032,11 @@ class UnifiedHarnessBackendHostAdapter:  # noqa: PLR0904 - implements app-server
         await self._prepare_opened_backend(
             backend, backend.replace_scheduled_loops(await source.scheduled_loops())
         )
+        # The rewound conversation carries on the goal; the source gives it up so
+        # two sessions never run it. Its notices stay with the source: the
+        # fork's copied entries have no turn ids and all share the fork's time,
+        # so nothing in the fork could place them.
+        await backend._goal.adopt(*await source._goal.release())
         await backend.seat_terminal(source.terminal_seat, record_now=False)
         # The fork runs on the source's context: an eval of its own would land
         # in the manager the source runs on too.
@@ -4731,10 +5240,11 @@ class UnifiedHarnessBackendHostAdapter:  # noqa: PLR0904 - implements app-server
         # The requester sends its reap again once the close is acknowledged,
         # and the worktree prune completes any reap still left.
         self._release_worktrees()
-        # The user quits: every main session ends with ``exit``, and their
-        # session_end hooks start together, before the slower teardown below.
+        # Every main session ends with ``exit`` (the user quits) unless its
+        # ``session/stop`` said otherwise, and their session_end hooks start
+        # together, before the slower teardown below.
         for adapter in tuple(self._adapters.values()):
-            adapter.end_session_hooks(SessionEndReason.EXIT)
+            adapter.end_session_hooks(adapter._stop_reason or SessionEndReason.EXIT)
         # The Host's hooks still running (session_end, notification,
         # session_start), deleted sessions' included, get one shared grace, then
         # are stopped. It runs alongside the adapter shutdowns, which stop the
@@ -4783,6 +5293,8 @@ class UnifiedHarnessBackendHostAdapter:  # noqa: PLR0904 - implements app-server
             # After the Harness close, so nothing still holds the store open.
             if self._release_storage is not None:
                 await asyncio.to_thread(self._release_storage)
+        # A cancelled shutdown still drains every adapter, then ends cancelled.
+        raise_if_cancelled(errors)
         if errors:
             raise BaseExceptionGroup("Failed to shut down session adapters", errors)
 
@@ -4793,6 +5305,7 @@ class UnifiedHarnessBackendHostAdapter:  # noqa: PLR0904 - implements app-server
                 await self._host.close_session(adapter._session)
             except BaseException as exc:
                 errors.append(exc)
+        raise_if_cancelled(errors)
         if len(errors) == 1:
             raise errors[0]
         if errors:
@@ -4889,6 +5402,14 @@ class UnifiedHarnessBackendHostAdapter:  # noqa: PLR0904 - implements app-server
             return adapter.cron_scheduler()
         return await adapter.child_cron_scheduler(session_id)
 
+    def goal_controller(self, session_id: str) -> GoalController:
+        # Only the root's own id: subagents never see the goal tools, and a call
+        # that still names one must not reach the root's goal.
+        adapter = self._adapters.get(session_id)
+        if adapter is None or adapter._closed:
+            raise GoalError("invalid", "Goals are not available in this session.")
+        return adapter._goal.controller
+
     def spawn_origin(self, session_id: str) -> SessionSpawnOrigin:
         """The checkout is read from the live directory: a resumed session no
         longer reports the worktree it was set up in, but still runs there.
@@ -4923,6 +5444,77 @@ class UnifiedHarnessBackendHostAdapter:  # noqa: PLR0904 - implements app-server
                 "Only a top-level session can move into a worktree"
             )
         return await adapter.enter_worktree(args, announce_cwd=self._announce_cwd)
+
+    async def list_projects(self, session_id: str) -> ListProjectsResult:
+        adapter = self._project_mover(session_id)
+        projects = await asyncio.to_thread(read_projects)
+        current = current_project_id(projects, adapter.project)
+        return await asyncio.to_thread(list_projects, projects, current=current)
+
+    async def move_to_project(
+        self, session_id: str, args: MoveToProjectArgs
+    ) -> MoveToProjectResult:
+        adapter = self._project_mover(session_id)
+        if args.project_id is None:
+            if adapter.cancel_project_move():
+                return cancelled()
+            raise ProjectMoveError("No move is planned")
+        projects = await asyncio.to_thread(read_projects)
+        project = find_project(projects, args.project_id)
+        if current_project_id(projects, adapter.project) == project.id:
+            if adapter.cancel_project_move():
+                return cancelled()
+            raise ProjectMoveError(f"This session is already in {project.name}")
+        adapter.park_project_move(
+            lambda: self._move_parked(adapter, project.id, project.name)
+        )
+        return planned_move(project)
+
+    def _project_mover(self, session_id: str) -> UnifiedHarnessBackendAdapter:
+        adapter = self._adapter_of(session_id)
+        if adapter is None or adapter.session_id != session_id:
+            raise ProjectMoveError("Only a top-level session can move to a project")
+        return adapter
+
+    async def _move_parked(
+        self, adapter: UnifiedHarnessBackendAdapter, project_id: str, name: str
+    ) -> None:
+        """Land a move the agent asked for, as ``session/move`` would, once its turn ended."""
+        try:
+            stamp, folder = await asyncio.to_thread(
+                _move_target, SessionMoveToLocalProject(id=project_id)
+            )
+            async with adapter.relocation_reservation():
+                await self._move_reserved(
+                    adapter.session_id,
+                    adapter,
+                    stamp,
+                    folder,
+                    adapter._context.storage_root,
+                )
+            self._merged_listing = None
+        except Exception as exc:
+            busy = (
+                isinstance(exc, SessionBackendError)
+                and exc.code is ProtocolErrorCode.CONFLICT
+                and not adapter._closed
+            )
+            if busy and adapter._session.has_turn_work:
+                # A queued turn started first: try again when it ends.
+                adapter.park_project_move(
+                    lambda: self._move_parked(adapter, project_id, name)
+                )
+                return
+            if busy and adapter._session.has_active_work:
+                adapter._publish_notice(
+                    f"This session stays in its folder: it cannot move to {name} "
+                    "while a background process runs."
+                )
+                return
+            logger.warning(
+                "Could not move a session to the project its agent chose", exc_info=True
+            )
+            adapter._publish_notice(f"This session could not move to {name}: {exc}")
 
     def message_hops(self, session_id: str) -> int:
         adapter = self._adapter_of(session_id)
@@ -5077,7 +5669,7 @@ class UnifiedHarnessBackendHostAdapter:  # noqa: PLR0904 - implements app-server
         orchestrator = backend._context.config_orchestrator
         credentials = backend._context.platform_credentials
         failures = backend._context.experiments_service.failures
-        needed = experiments_wait_needed(orchestrator, failures, credentials)
+        needed = experiments_pending(orchestrator, failures, credentials)
         # Armed for every eval, so one still running at the cap stops later
         # sessions from waiting even when this one holds nothing on it.
         wait = (
@@ -5128,7 +5720,12 @@ class UnifiedHarnessBackendHostAdapter:  # noqa: PLR0904 - implements app-server
         prepare: Awaitable[None],
         *,
         worktree_resolution: WorktreeResolution | None = None,
+        stamp_owner: bool = True,
     ) -> None:
+        """``stamp_owner``: the connection owns the session it opened, as for a
+        new one. Opening an existing session does not take it over: who owns
+        it is who last started a turn in it.
+        """
         try:
             await prepare
             await backend.initialize_integrations()
@@ -5153,6 +5750,9 @@ class UnifiedHarnessBackendHostAdapter:  # noqa: PLR0904 - implements app-server
         self._occupy_worktree(backend, worktree_resolution)
         await self._occupy_entered_worktrees(backend)
         await backend._persist_session_metadata_best_effort()
+        if stamp_owner:
+            await backend.stamp_owner()
+        backend.deliver_replies_owed_on_open()
 
     # Where start, resume and continue all end up, which is why the marking
     # happens here rather than three times over. Only after the open succeeded:
@@ -5212,7 +5812,12 @@ class UnifiedHarnessBackendHostAdapter:  # noqa: PLR0904 - implements app-server
         derivation: UnifiedRuntimeDerivation,
         *,
         require_api_key: bool,
-    ) -> tuple[UnifiedSessionContext, UnifiedRuntimeDerivation, WorktreeResolution]:
+    ) -> tuple[
+        UnifiedSessionContext,
+        UnifiedRuntimeDerivation,
+        WorktreeResolution,
+        UnifiedSessionSettings | None,
+    ]:
         async def resolve_worktree(pinned: SessionOptions) -> WorktreeResolution:
             entered = await asyncio.to_thread(
                 _entered_worktrees, context.storage_root, session_id
@@ -5232,6 +5837,38 @@ class UnifiedHarnessBackendHostAdapter:  # noqa: PLR0904 - implements app-server
             settings=None,
         )
 
+    async def _run_sources_policy(
+        self,
+        context: UnifiedSessionContext,
+        derivation: UnifiedRuntimeDerivation,
+        policy: str,
+        settings: UnifiedSessionSettings,
+    ) -> UnifiedRuntimeDerivation:
+        """Put a fork on the policy its live source runs now, which its pins
+        may not have caught up with.
+        """
+        agents = context.agents
+        if agents.active_policy.name == policy:
+            return derivation
+        try:
+            await agents.aswitch_policy(policy)
+        except ValueError:
+            # Refused here, say by a rollout gate turned off since: the default
+            # may approve more than the source did, so the fork takes `ask`.
+            with contextlib.suppress(ValueError):
+                await agents.aswitch_policy(ApprovalPolicyName.ASK)
+            warning = (
+                f"The forked session ran the '{policy}' approval policy, which is "
+                f"not available here, so this one runs '{agents.active_policy.name}'."
+            )
+            if warning not in agents.restore_warnings:
+                agents.restore_warnings.append(warning)
+        derivation = await asyncio.to_thread(context.derive, settings)
+        self._host.configure_runtime(
+            derivation.core_config, adapter_config=derivation.adapter_config
+        )
+        return derivation
+
     async def _pin_for_fork(
         self,
         options: SessionOptions,
@@ -5242,7 +5879,12 @@ class UnifiedHarnessBackendHostAdapter:  # noqa: PLR0904 - implements app-server
         require_api_key: bool,
         settings: UnifiedSessionSettings | None,
         trust_store: TrustedFoldersManager | None = None,
-    ) -> tuple[UnifiedSessionContext, UnifiedRuntimeDerivation, WorktreeResolution]:
+    ) -> tuple[
+        UnifiedSessionContext,
+        UnifiedRuntimeDerivation,
+        WorktreeResolution,
+        UnifiedSessionSettings | None,
+    ]:
         return await self._pin_session_context(
             options,
             session_id,
@@ -5269,7 +5911,12 @@ class UnifiedHarnessBackendHostAdapter:  # noqa: PLR0904 - implements app-server
         require_api_key: bool,
         resolve_worktree: _WorktreeResolver,
         settings: UnifiedSessionSettings | None,
-    ) -> tuple[UnifiedSessionContext, UnifiedRuntimeDerivation, WorktreeResolution]:
+    ) -> tuple[
+        UnifiedSessionContext,
+        UnifiedRuntimeDerivation,
+        WorktreeResolution,
+        UnifiedSessionSettings | None,
+    ]:
         """Rebuild the context against an existing session's stored cwd, if it differs.
 
         The caller must have already built ``context`` once (which configures the Host's
@@ -5277,7 +5924,12 @@ class UnifiedHarnessBackendHostAdapter:  # noqa: PLR0904 - implements app-server
         in a different cwd than the caller's, rebuild so hooks are discovered and compiled
         against the session's own cwd; binding ids embed it, so a resume/fork otherwise
         skips every persisted hook or binds the wrong project's hooks.
+
+        Also refuses a session the local runtime does not own.
         """
+        await refuse_unless_local(
+            _unified_session_dir(context.storage_root, session_id)
+        )
         stored_cwd = await _harness_call(self._host.session_cwd(session_id))
         restored = False
         if stored_cwd is not None:
@@ -5305,6 +5957,7 @@ class UnifiedHarnessBackendHostAdapter:  # noqa: PLR0904 - implements app-server
                 )
                 context.org_config_report.inherit(first_report)
             rederive = await self._restore_session_pins(session_id, context)
+            settings = await self._with_stored_skill_pins(settings, context, session_id)
             if rederive or settings is not None:
                 derivation = await asyncio.to_thread(
                     context.derive, settings or UnifiedSessionSettings()
@@ -5312,10 +5965,21 @@ class UnifiedHarnessBackendHostAdapter:  # noqa: PLR0904 - implements app-server
                 self._host.configure_runtime(
                     derivation.core_config, adapter_config=derivation.adapter_config
                 )
-            return context, derivation, resolution
+            return context, derivation, resolution, settings
         except BaseException:
             await self._worktrees.cleanup(resolution)
             raise
+
+    async def _with_stored_skill_pins(
+        self,
+        settings: UnifiedSessionSettings | None,
+        context: UnifiedSessionContext,
+        session_id: str,
+    ) -> UnifiedSessionSettings | None:
+        """A pick a cleanup took is fetched again after the open, by the session's
+        registry sync, so reading the picks never waits on the registry.
+        """
+        return await _with_stored_skill_pins(settings, context.storage_root, session_id)
 
     async def _restore_session_pins(self, session_id: str, context: _PinTarget) -> bool:
         """Put a context on the choices a session was left with.
@@ -5335,6 +5999,12 @@ class UnifiedHarnessBackendHostAdapter:  # noqa: PLR0904 - implements app-server
         """
         restored = False
         stored_pins = await _harness_call(self._host.session_pins(session_id))
+        agent_name = stored_pins[SessionPin.AGENT_NAME]
+        if agent_name and agent_name in _NamedPolicies(context.agents):
+            # An `agent_name` naming a policy is the default agent's, and the
+            # policy a build from before the split last picked: it only
+            # rewrites that pin, so a newer `approval_policy` beside it is stale.
+            stored_pins = {**stored_pins, SessionPin.APPROVAL_POLICY: None}
         for pin in SessionPin:
             value = stored_pins[pin]
             try:
@@ -5360,7 +6030,62 @@ class UnifiedHarnessBackendHostAdapter:  # noqa: PLR0904 - implements app-server
             restored = restored or applied
         return restored
 
-    async def _apply_restored_pin(  # noqa: PLR0911 - one return per pin's case
+    async def _restore_selection_pin(
+        self, pin: SessionPin, agents: AgentManager, value: str
+    ) -> bool:
+        """Restore a saved agent or policy pin; see ``decoded_selection``."""
+        agent, policy = decoded_selection(
+            agents,
+            value if pin is SessionPin.AGENT_NAME else None,
+            value if pin is SessionPin.APPROVAL_POLICY else None,
+        )
+        moved_agent = False
+        if pin is SessionPin.AGENT_NAME and agent == BuiltinAgentName.DEFAULT:
+            # A pin naming a policy saved the `default` agent: put it back, as a
+            # host whose `default_agent` is another one starts on that one.
+            if agents.active_agent.name != BuiltinAgentName.DEFAULT:
+                with contextlib.suppress(ValueError):
+                    await agents.aswitch_agent(BuiltinAgentName.DEFAULT)
+                    moved_agent = True
+            # The policy pin, when there is one, comes after and wins.
+            name, switch = policy, agents.aswitch_policy
+            running = agents.active_policy.name
+        elif pin is SessionPin.AGENT_NAME:
+            name, switch = agent, agents.aswitch_agent
+            running = agents.active_agent.name
+        else:
+            name, switch = policy, agents.aswitch_policy
+            running = agents.active_policy.name
+        if name is None or name == running:
+            return moved_agent
+        try:
+            await switch(name)
+        except InvalidConfigError as exc:
+            # It is there, but its settings clash with the config, say
+            # lean's shell timeouts with config.toml's: refused as a
+            # session start on it is, never dropped for the default.
+            raise SessionBackendError.configuration(exc) from exc
+        except ValueError:
+            if switch != agents.aswitch_policy:
+                logger.debug(
+                    "Stored session %s %r is unavailable; keeping the default",
+                    pin.value,
+                    value,
+                )
+                return False
+            # The default may approve more than the session ever did. An org
+            # list that leaves `ask` out chose the policies itself.
+            with contextlib.suppress(ValueError):
+                await agents.aswitch_policy(ApprovalPolicyName.ASK)
+            warning = (
+                f"This session ran the '{name}' approval policy, which is no "
+                f"longer available, so it continues in '{agents.active_policy.name}'."
+            )
+            if warning not in agents.restore_warnings:
+                agents.restore_warnings.append(warning)
+        return True
+
+    async def _apply_restored_pin(
         self, pin: SessionPin, context: _PinTarget, value: str
     ) -> bool:
         """Apply one restored pin to a resumed, continued, or forked context.
@@ -5382,23 +6107,8 @@ class UnifiedHarnessBackendHostAdapter:  # noqa: PLR0904 - implements app-server
                         f"Failed to restore session active model: {failures[0]}",
                     )
                 return True
-            case SessionPin.AGENT_NAME:
-                if value == context.agents.active_profile.name:
-                    return False
-                try:
-                    await context.agents.aswitch_profile(value)
-                except InvalidConfigError as exc:
-                    # The mode is there, but its settings clash with the config,
-                    # say lean's shell timeouts with config.toml's: refused as a
-                    # session start in it is, never dropped for the default.
-                    raise SessionBackendError.configuration(exc) from exc
-                except ValueError:
-                    logger.debug(
-                        "Stored session running mode %r is unavailable; keeping the default",
-                        value,
-                    )
-                    return False
-                return True
+            case SessionPin.AGENT_NAME | SessionPin.APPROVAL_POLICY:
+                return await self._restore_selection_pin(pin, context.agents, value)
             case SessionPin.REASONING_EFFORT:
                 if not value:
                     return False
@@ -5430,6 +6140,12 @@ class UnifiedHarnessBackendHostAdapter:  # noqa: PLR0904 - implements app-server
         if self._services is None:
             return "cli"
         return self._services.client_info().entrypoint
+
+    def _client_owner(self) -> JsonValue:
+        services = self._services
+        if not isinstance(services, SessionBackendClientOwner):
+            return None
+        return services.client_owner()
 
     async def _lifecycle_context(
         self,
@@ -5522,13 +6238,18 @@ class UnifiedHarnessBackendHostAdapter:  # noqa: PLR0904 - implements app-server
                     of=self.turn_started_sessions, count=self.count_turn_started_session
                 ),
                 enter_worktree=self.enter_worktree,
+                list_projects=self.list_projects,
+                move_to_project=self.move_to_project,
                 # Read per call, not captured: `/config` can raise or lower the cap
                 # inside a session's life.
                 max_todos=lambda: resolved_max_todos(
                     context.config_orchestrator.config.tools.get(TODO_TOOL_NAME)
                 ),
+                goals=self.goal_controller,
             ),
             mode=VIBE_PROVIDED_TOOL_MODES,
+            # A subagent must not end or replace its root's goal, nor move its session.
+            root_only=(*GOAL_TOOL_NAMES, *PROJECT_TOOL_NAMES),
         )
         # The client runs these itself, on its own authority, so they are not
         # gated again here.
@@ -6075,7 +6796,12 @@ class _UnifiedSessionPersistence:
     _archive_gate: asyncio.Lock
 
     def _publish_notice(
-        self, message: str, *, level: str = "warning", code: str | None = None
+        self,
+        message: str,
+        *,
+        level: str = "warning",
+        code: str | None = None,
+        details: Mapping[str, str] | None = None,
     ) -> None: ...
 
     def _persists_to_disk(self) -> bool:
@@ -6098,6 +6824,7 @@ class _UnifiedSessionMetadataAdapter(_UnifiedSessionPersistence):
     _artifact_service: SessionArtifactService
     _api_path: SessionApiPath | None
     _project: SessionProject | None
+    _settings: UnifiedSessionSettings
 
     @property
     def session_id(self) -> str:
@@ -6150,6 +6877,21 @@ class _UnifiedSessionMetadataAdapter(_UnifiedSessionPersistence):
         """A move replaces any stamp; a listing stamp replaces only the one it listed."""
         async with self._metadata_lock:
             await self._restamp_locked(project)
+        # Clients regroup the session under its new project.
+        self._publish_session_metadata(
+            _SessionMetadataProjection(
+                session_id=self.session_id,
+                patch=(
+                    JsonPatchOperation(
+                        op="replace",
+                        path="/project",
+                        value=_public_session_project(project).model_dump(
+                            mode="json", by_alias=True
+                        ),
+                    ),
+                ),
+            )
+        )
 
     async def _restamp_locked(self, project: SessionProject) -> None:
         self._project = project
@@ -6236,7 +6978,8 @@ class _UnifiedSessionMetadataAdapter(_UnifiedSessionPersistence):
         metadata = self._with_model_config(metadata)
         metadata = metadata.model_copy(
             update={
-                "runtime_path": "direct" if self._api_path is None else "session_api"
+                "runtime_path": "direct" if self._api_path is None else "session_api",
+                "skill_pins": list(self._settings.skill_pins),
             }
         )
         # The artifact service is authoritative between sidecars: a PR may have
@@ -6366,22 +7109,47 @@ class _UnifiedScheduledLoopsAdapter(_UnifiedSessionPersistence):
     _storage_root: str
     _host: UnifiedHarnessSessionBackendHost | None
     _scheduled_loops: UnifiedScheduledLoops
+    _goal: UnifiedSessionGoal
+    _goal_clock: GoalTurnClock
+    _events_subscribed: bool
+    _commands: SessionCommands
+    # Turns this adapter started itself, by origin, so the goal can tell them
+    # from the user's.
+    _host_turn_origins: dict[str, TurnOrigin]
+    _open_callbacks: dict[tuple[str, str], PublicCallbackEntry]
     # Each subagent's own schedules, keyed by its session id. A subagent only
     # ever reaches its own pool, and its loops fire as messages to it.
     _child_scheduled_loops: dict[str, UnifiedScheduledLoops]
     _child_scheduled_loops_lock: asyncio.Lock
     _scheduled_loops_enabled: bool
     _scheduled_loops_task: asyncio.Task[None] | None
-    _pending_startup_notices: list[str]
+    _pending_startup_notices: list[tuple[str, str]]
     _defer_event_flush: bool
     _relocation_active: bool
     _scheduled_turn_opening: bool
+    _goal_upsell_notice: tuple[str, str] | None
+    _runtime_unannounced: bool
+    # An update is being translated: it carries the loops as they end up.
+    _translating_update: bool
+    # Set for the session's life when it started with a worktree: its first
+    # turn saves it and records the worktree.
+    _turns_deferred: asyncio.Event | None
 
     async def _publish_integrations(self) -> None: ...
 
     async def _wait_for_cold_integrations(self) -> None: ...
 
     async def _wait_for_first_turn_fetches(self) -> None: ...
+
+    def _require_runnable_active_model(self) -> None: ...
+
+    async def _unlock_active_model(self) -> None: ...
+
+    async def _pin_session_model_choice(self) -> bool: ...
+
+    def _announce_first_use(self) -> None: ...
+
+    async def _after_server_activity(self, *, was_ephemeral: bool) -> None: ...
 
     @property
     def session_id(self) -> str:
@@ -6462,10 +7230,11 @@ class _UnifiedScheduledLoopsAdapter(_UnifiedSessionPersistence):
                     ProtocolErrorCode.INTERNAL_ERROR, f"{exc}. {recovery_exc}"
                 ) from recovery_exc
             logger.warning("Quarantined corrupt scheduled loops", exc_info=exc)
-            self._pending_startup_notices.append(
+            self._pending_startup_notices.append((
                 "Saved scheduled loops could not be restored. "
-                f"They were disabled and preserved at {quarantine_path}."
-            )
+                f"They were disabled and preserved at {quarantine_path}.",
+                "warning",
+            ))
 
     async def copy_scheduled_loops(self, source_session_id: str) -> None:
         source = UnifiedScheduledLoops(
@@ -6487,10 +7256,11 @@ class _UnifiedScheduledLoopsAdapter(_UnifiedSessionPersistence):
             logger.warning(
                 "Quarantined corrupt scheduled loops while forking", exc_info=exc
             )
-            self._pending_startup_notices.append(
+            self._pending_startup_notices.append((
                 "Saved scheduled loops from the source session could not be copied. "
-                f"They were disabled and preserved at {quarantine_path}."
-            )
+                f"They were disabled and preserved at {quarantine_path}.",
+                "warning",
+            ))
         try:
             await self._scheduled_loops.replace(await source.list())
         except ScheduledLoopStoreError as exc:
@@ -6557,8 +7327,22 @@ class _UnifiedScheduledLoopsAdapter(_UnifiedSessionPersistence):
                     await self._fire_due_child_loops()
                 if self._session.active_turn_id is not None or self._defer_event_flush:
                     continue
+                # Notes about the user's goal actions go in while idle, ahead
+                # of the next turn that reads them.
+                await self._goal.flush_notes()
                 scheduled = await self._scheduled_loops.due()
                 if scheduled is None:
+                    # Due loops first: a goal that is always ready to continue
+                    # would otherwise starve them.
+                    try:
+                        await self._continue_goal_if_idle()
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception as exc:
+                        logger.exception("Goal continuation failed", exc_info=exc)
+                        self._session.publish_notice(
+                            f"The goal could not continue: {exc}", level="error"
+                        )
                     continue
             except asyncio.CancelledError:
                 raise
@@ -6597,6 +7381,9 @@ class _UnifiedScheduledLoopsAdapter(_UnifiedSessionPersistence):
             # Advance it in memory only: sleeping here would stall the shared runner
             # and every other schedule, and leaving it due would re-fire it at once.
             await loops.defer(scheduled.id)
+        if loops is self._scheduled_loops:
+            # A loop that started no turn would otherwise keep its past run time.
+            self._publish_scheduled_loops()
 
     async def _fire_due_child_loops(self) -> None:
         # Each pool on its own: one subagent's failure skips no other loop.
@@ -6679,6 +7466,11 @@ class _UnifiedScheduledLoopsAdapter(_UnifiedSessionPersistence):
         )
         if record is None or _child_is_gone(record):
             self._child_scheduled_loops.pop(child_session_id, None)
+            name = child_session_id if record is None else record.agent_name
+            self._publish_notice(
+                f"Scheduled loops of subagent {name} stopped: "
+                "it can no longer take messages."
+            )
             return None
         if (
             record.state.type not in _MESSAGEABLE_CHILD_STATES
@@ -6695,6 +7487,8 @@ class _UnifiedScheduledLoopsAdapter(_UnifiedSessionPersistence):
         # The loop's turn pins what it runs on (see `_settle_configuration`),
         # so it waits, as `start_turn` does, for what decides the default.
         await self._wait_for_first_turn_fetches()
+        await self._unlock_active_model()
+        self._require_runnable_active_model()
         params = await self._prepared_turn_params(
             TurnStartParams(
                 session_id=self.session_id,
@@ -6718,8 +7512,123 @@ class _UnifiedScheduledLoopsAdapter(_UnifiedSessionPersistence):
                 )
             finally:
                 self._scheduled_turn_opening = False
+        response = getattr(result, "response", None)
+        if response is not None:
+            self._host_turn_origins[response.turn.id] = TurnOrigin.LOOP
         if result.after_response is not None:
             result.after_response()
+
+    async def _continue_goal_if_idle(self) -> None:
+        """Start the goal's next continuation when nothing else should run.
+
+        Any turn the user queued, a paused queue, or an open question or approval
+        keeps the goal waiting: accepted user work always goes first.
+        """
+        goal = self._goal.goal
+        if goal is None or goal.status is not GoalStatus.ACTIVE:
+            return
+        if self._user_work_waiting():
+            return
+        if _metadata_archived_at_ms(self._metadata):
+            return
+        # Goal accounting follows the event stream: with no client attached,
+        # nothing would charge the turn or stop the goal at its budget.
+        if not self._events_subscribed:
+            return
+        # A turn the event stream has not seen end yet may still stop the goal
+        # (a failed turn blocks it): its end decides whether to go on.
+        if self._goal_clock.turns:
+            return
+        # The goal waits for a model the plan can run, said once per goal and
+        # model: refusing here would repeat the failure on every idle tick.
+        await self._unlock_active_model()
+        model = self._context.config_orchestrator.config.get_active_model()
+        if model.requires is not None:
+            if self._goal_upsell_notice != (goal.goal_id, model.alias):
+                self._goal_upsell_notice = (goal.goal_id, model.alias)
+                self._publish_notice(
+                    f"The goal is waiting: {model.display_name or model.alias} "
+                    "requires a plan upgrade. Pick another model to continue."
+                )
+            return
+        try:
+            await self._start_goal_continuation(goal)
+        except SessionBackendError as exc:
+            # Lost a race with a user turn: the next idle moment retries.
+            if exc.code is not ProtocolErrorCode.CONFLICT:
+                raise
+
+    def _user_work_waiting(self) -> bool:
+        queue = self._session.turn_queue
+        return bool(queue.items or queue.paused or self._open_callbacks)
+
+    async def _start_goal_continuation(self, goal: PublicGoal) -> None:
+        self._require_no_session_rewrite()
+        # A continuation runs on what the session runs on, so it waits, as a
+        # user turn and a loop do, for what decides the default, and pins it.
+        await self._wait_for_first_turn_fetches()
+        await self._unlock_active_model()
+        self._require_runnable_active_model()
+        await self._wait_for_cold_integrations()
+        async with self._archive_gate:
+            if self._continuation_target(goal) is None:
+                return
+            # Pinned only once the continuation is due: a session that follows
+            # the default must not stick to a model no turn ran on.
+            if await self._pin_session_model_choice():
+                self._runtime_unannounced = True
+            # The pin yields too: a pause, clear or prompt made meanwhile wins.
+            current = self._continuation_target(goal)
+            if current is None:
+                return
+            params = TurnStartParams(
+                session_id=self.session_id,
+                message=[TextContentBlock(text=continuation_message(current))],
+                # Model-visible, never a user bubble.
+                injected=True,
+            )
+            self._announce_first_use()
+            was_ephemeral = bool(getattr(self._session, "ephemeral", True))
+            result = await _harness_call(self._commands.start_turn(params))
+        turn_id = result.response.id
+        self._host_turn_origins[turn_id] = TurnOrigin.CONTINUATION
+        await self._after_server_activity(was_ephemeral=was_ephemeral)
+        if result.after_response is not None:
+            result.after_response()
+        await self._goal.continuation_started(turn_id)
+        if not self._goal.bound(turn_id):
+            # The goal stopped while the turn was starting: it works for nothing.
+            await self._interrupt_unwanted_continuation(turn_id)
+
+    async def _interrupt_unwanted_continuation(self, turn_id: str) -> None:
+        try:
+            await _harness_call(
+                self._commands.interrupt_turn(
+                    TurnInterruptParams(
+                        session_id=self.session_id, expected_turn_id=turn_id
+                    )
+                )
+            )
+        except Exception as exc:
+            logger.warning("Failed to interrupt a goal continuation", exc_info=exc)
+
+    def _continuation_target(self, goal: PublicGoal) -> PublicGoal | None:
+        """The goal a continuation would work on now, or ``None`` to stand down.
+
+        Read again after every wait: the session may have been archived, the
+        user may have queued a prompt, which goes first, or edited, paused or
+        replaced the goal, and an edit must reach the model.
+        """
+        if _metadata_archived_at_ms(self._metadata) or self._user_work_waiting():
+            return None
+        current = self._goal.goal
+        if (
+            current is None
+            or current.goal_id != goal.goal_id
+            or current.status is not GoalStatus.ACTIVE
+        ):
+            return None
+        return current
 
     async def _dispatch_scheduled_loops(
         self, method: str, raw_params: dict[str, Any]
@@ -6738,19 +7647,28 @@ class _UnifiedScheduledLoopsAdapter(_UnifiedSessionPersistence):
                 case "loops/create":
                     params = validate_wire(LoopsCreateParams, raw_params)
                     self._require_session(params.session_id)
-                    loop = await self._scheduled_loops.create(
-                        params.interval, params.prompt
+                    loop = await (
+                        self._scheduled_loops.create_cron(params.cron, params.prompt)
+                        if params.cron is not None
+                        else self._scheduled_loops.create(
+                            params.interval or "", params.prompt
+                        )
                     )
+                    self._publish_scheduled_loops()
+                    await self._save_session_for_loop(loop.id)
                     return LoopsCreateResponse(loop=_project_scheduled_loop(loop))
                 case "loops/delete":
                     params = validate_wire(LoopsDeleteParams, raw_params)
                     self._require_session(params.session_id)
                     loop = await self._scheduled_loops.delete(params.loop_id)
+                    self._publish_scheduled_loops()
                     return LoopsDeleteResponse(loop=_project_scheduled_loop(loop))
                 case "loops/clear":
                     params = validate_wire(LoopsClearParams, raw_params)
                     self._require_session(params.session_id)
-                    return LoopsClearResponse(count=await self._scheduled_loops.clear())
+                    count = await self._scheduled_loops.clear()
+                    self._publish_scheduled_loops()
+                    return LoopsClearResponse(count=count)
                 case _:
                     raise method_not_found(method)
         except LoopError as exc:
@@ -6761,6 +7679,63 @@ class _UnifiedScheduledLoopsAdapter(_UnifiedSessionPersistence):
             raise SessionBackendError(
                 ProtocolErrorCode.INTERNAL_ERROR, str(exc)
             ) from exc
+
+    async def _save_session_for_loop(self, loop_id: str) -> None:
+        """Save a session that has sent nothing yet, so its new loop outlives it.
+
+        An unsaved session is discarded when it closes, and its loops with it.
+        A loop is a reason to keep the session, as a first message is: the
+        session opens for the user and is saved with the loop. A session
+        started in a worktree is still saved by its first turn: only that turn
+        records the worktree it runs in.
+        """
+        if (
+            not self._context.session_logging_enabled
+            or not self._session.ephemeral
+            or self._turns_deferred is not None
+        ):
+            return
+        self._announce_first_use()
+        try:
+            # A direct runtime call: the Session API cannot save a session yet.
+            promoted = await _harness_call(self._session.promote())
+        except BaseException:
+            # The client is told creation failed: the loop must not run.
+            with contextlib.suppress(LoopError):
+                await self._scheduled_loops.delete(loop_id)
+            self._publish_scheduled_loops()
+            raise
+        # The session and its loop are saved: what follows is best effort.
+        try:
+            await self._after_server_activity(was_ephemeral=promoted)
+        except Exception as exc:
+            logger.warning(
+                "Failed to finish saving a session for its scheduled loop", exc_info=exc
+            )
+
+    def _publish_scheduled_loops(self) -> None:
+        """Announce the session's loops on its own event stream.
+
+        A loop mutation changes no Harness state, so a subscribed client would
+        hold the old list until it next re-read the session. An update being
+        translated carries the loops as they end up (see `_with_live_extras`).
+        """
+        if self._translating_update:
+            return
+        loops: list[JsonValue] = [
+            _project_scheduled_loop(loop).model_dump(mode="json", by_alias=True)
+            for loop in self._scheduled_loops.snapshot()
+        ]
+        self._publish_session_metadata(
+            _SessionMetadataProjection(
+                session_id=self.session_id,
+                patch=(JsonPatchOperation(op="replace", path="/loops", value=loops),),
+            )
+        )
+
+    def _publish_session_metadata(
+        self, metadata: _SessionMetadataProjection
+    ) -> None: ...
 
     def _require_session(self, session_id: str) -> None: ...
 
@@ -6820,6 +7795,9 @@ class _ChildIdentity:
     name: str
     agent_type: str
     spawned_at: int
+    # The name the spawn gave the child, which its agent path ends with; None
+    # until the spawn's arguments have streamed.
+    agent_name: str | None
 
 
 def _check_saved_models(before: VibeConfigSchema, after: VibeConfigSchema) -> None:
@@ -6841,20 +7819,36 @@ def _check_saved_models(before: VibeConfigSchema, after: VibeConfigSchema) -> No
 async def _leave_excluded_mode(
     agents: AgentManager, orchestrator: ConfigOrchestrator[VibeConfigSchema]
 ) -> str | None:
-    """Move ``agents`` off a mode the org config disables, to its default.
-
-    Returns the mode left, if any.
+    """Move ``agents`` off an agent or policy the org config disables, to the
+    first one it allows. Returns the one left, if any.
     """
-    active = agents.active_profile.name
-    if not agents.org_excludes(active):
-        return None
-    for candidate in (orchestrator.config.default_agent, *FALLBACK_AGENTS):
+    left = None
+    agent = agents.active_agent.name
+    if agents.org_excludes(agent):
+        for fallback in agents.primary_agents():
+            try:
+                await agents.aswitch_agent(fallback.name)
+            except ValueError:
+                continue
+            left = agent
+            break
+    policy = agents.active_policy.name
+    if not agents.org_excludes(policy):
+        return left
+    candidates = dict.fromkeys((
+        orchestrator.config.default_approval_policy,
+        *FALLBACK_POLICIES,
+        *agents.get_policy_order(),
+    ))
+    for candidate in candidates:
+        if candidate == policy:
+            continue
         try:
-            await agents.aswitch_profile(candidate)
+            await agents.aswitch_policy(candidate)
         except ValueError:
             continue
-        return active
-    return None
+        return policy
+    return left
 
 
 def _carry_experiments(
@@ -6942,6 +7936,7 @@ class UnifiedHarnessBackendAdapter(  # noqa: PLR0904 - implements app-server ses
         self._start_connector_resolve()
         self._start_mcp_discovery()
         self._follow_org_config()
+        self._follow_keep_awake()
 
     def _start_mcp_discovery(self) -> None:
         """Discover the MCP servers the session opened without, and refresh old ones.
@@ -7195,8 +8190,8 @@ class UnifiedHarnessBackendAdapter(  # noqa: PLR0904 - implements app-server ses
             self._pending_startup_notices,
             [],
         )
-        for message in pending_notices:
-            self._publish_notice(message)
+        for message, level in pending_notices:
+            self._publish_notice(message, level=level)
         self._flush_integration_warnings()
 
     def _flush_integration_warnings(self) -> None:
@@ -7364,7 +8359,10 @@ class UnifiedHarnessBackendAdapter(  # noqa: PLR0904 - implements app-server ses
         self._commands: SessionCommands = (
             api if api is not None else DirectCommands(session, host)
         )
-        self._worktrees = SessionWorktrees(housekeeping=worktree_housekeeping)
+        self._worktrees = SessionWorktrees(
+            housekeeping=worktree_housekeeping,
+            naming_credentials=context.utility_credentials,
+        )
         self._deferred_turns = deferred_turns
         session.configure_turn_settlement(self._settle_configuration)
         session.configure_waiting_turn_steer(self._user_joined_the_waiting_turn)
@@ -7424,9 +8422,10 @@ class UnifiedHarnessBackendAdapter(  # noqa: PLR0904 - implements app-server ses
         self._image_input = _image_input(derivation)
         self._history_image_warning: asyncio.Task[None] | None = None
         self._bind_completion_sources(derivation)
-        # One sink per session: each distinct profile warning is logged and
-        # shown once, however many derivations raise it again. A catalogue
-        # warning is shown once per process: see ``_emit_profile_warnings``.
+        # One sink per session: each distinct profile warning is logged once,
+        # and shown once when ``_is_user_notice`` allows, however many
+        # derivations raise it again. A catalogue warning is logged once per
+        # process: see ``_emit_profile_warnings``.
         self._completion_warnings = RuntimeWarningSink(_log_completion_warning)
         self._completion_warnings.subscribe(self._show_completion_warning)
         self._unshown_completion_warnings: list[str] = []
@@ -7449,8 +8448,14 @@ class UnifiedHarnessBackendAdapter(  # noqa: PLR0904 - implements app-server ses
         # A switch rebuilds the config before it records the agent: a context
         # adopted meanwhile would carry the agent the switch is leaving.
         self._agent_switching = asyncio.Lock()
+        # The agent Core's system prompt was built for.
+        self._prompt_agent = (
+            context.agents.active_agent.name if context.agents is not None else ""
+        )
         self._session_opened_turn_pinning = asyncio.Lock()
         self._scheduled_turn_opening = False
+        self._goal_upsell_notice: tuple[str, str] | None = None
+        self._queued_turn_upsell_notice: tuple[str, str] | None = None
         self._plugins = context.plugins
         self._plugin_provider = context.plugin_provider
         self._rewrite_plugins = rewrite_plugins
@@ -7471,6 +8476,9 @@ class UnifiedHarnessBackendAdapter(  # noqa: PLR0904 - implements app-server ses
         self._mcp_apps = SessionMcpApps()
         self._event_id = 0
         self._open_callbacks: dict[tuple[str, str], PublicCallbackEntry] = {}
+        # Approval answers already reported: the Runtime accepts a repeated
+        # answer until the callback closes.
+        self._reported_approval_answers: set[tuple[str, str]] = set()
         self._events_condition = asyncio.Condition()
         self._events_subscribed = False
         # From ``subscribe`` until its stream ends: a notice raised before the
@@ -7501,6 +8509,14 @@ class UnifiedHarnessBackendAdapter(  # noqa: PLR0904 - implements app-server ses
         self._parent_session_id: str | None = None
         # Set when another session started this one to hand it a task.
         self._handed_task_pending = False
+        self._spawned_by: tuple[str, Literal["attached", "detached"]] | None = None
+        self._replies_in_flight: dict[str, asyncio.Task[None]] = {}
+        self._observing_turn_ends = False
+        self._keep_awake_task: asyncio.Task[None] | None = None
+        # The move `move_to_project` parked, landed when the turn ends.
+        self._parked_project_move: Callable[[], Coroutine[Any, Any, None]] | None = None
+        self._project_move_task: asyncio.Task[None] | None = None
+        self._observing_project_moves = False
         # Session messages and starts that led to the running turn since a
         # user wrote; the peer tools refuse past `MAX_SESSION_HOPS`.
         self._message_hops = 0
@@ -7539,9 +8555,17 @@ class UnifiedHarnessBackendAdapter(  # noqa: PLR0904 - implements app-server ses
         # Its notices, shown once the client holds the session.
         self._session_start_notices: asyncio.Task[None] | None = None
         self._end_reason = SessionEndReason.OTHER
+        # The reason a ``session/stop`` gave, for the close that follows it.
+        self._stop_reason: SessionEndReason | None = None
         # The session's own turns, so the model calls its subagents report
         # into the same telemetry sink are not counted as its own.
         self._root_turn_ids: set[str] = set()
+        self._host_turn_origins: dict[str, TurnOrigin] = {}
+        self._goal_clock = GoalTurnClock()
+        # Why each recent root turn was interrupted, by turn id. Kept per turn:
+        # a turn can end in the same update a queued one starts, and is settled
+        # after the newer turn is already the latest.
+        self._interrupt_reasons: dict[str, str] = {}
         self._model_calls = 0
         # Per-turn file snapshots answering rewind restores: the harness
         # runtime writes files itself, so the adapter records disk states at
@@ -7581,8 +8605,12 @@ class UnifiedHarnessBackendAdapter(  # noqa: PLR0904 - implements app-server ses
         # request cache, which it owns as an attached session
         # (``_watch_pull_requests``).
         self._watching_pull_requests = False
-        # The artifacts/updated announcements of new reads, in flight.
+        # The artifacts/updated announcements of new reads, and other work the
+        # session runs off a request or the event stream, in flight.
         self._background_announcements: set[asyncio.Task[None]] = set()
+        # The convergence the last ``turn_terminated`` started, which the next
+        # turn a client starts waits for.
+        self._turn_end_convergence: asyncio.Task[None] | None = None
         # Any shell command can create a PR (wrapped, scripted, a PR link the
         # agent opens), so a turn that ran one reruns discovery when it ends,
         # at most once per interval.
@@ -7652,9 +8680,14 @@ class UnifiedHarnessBackendAdapter(  # noqa: PLR0904 - implements app-server ses
             _UnifiedSkillsHost(
                 context,
                 runtime=lambda: self._runtime,
-                require_idle=self._require_idle,
+                require_no_session_rewrite=self._require_no_session_rewrite,
                 require_session=self._require_session,
                 refresh=self._refresh_after_skill_change,
+                session_pins=lambda: self._settings.skill_pins,
+                save_session_pins=self._save_skill_pins,
+                plugin_skills=lambda: (
+                    self.session_plugins.materialized.resolution.skills
+                ),
             )
         )
         self._feedback_controller = FeedbackController(
@@ -7673,6 +8706,7 @@ class UnifiedHarnessBackendAdapter(  # noqa: PLR0904 - implements app-server ses
         self._experiments_wait: ExperimentsWait | None = None
         self._model_catalog_task: asyncio.Task[None] | None = None
         self._model_catalog_wait: ModelCatalogWait | None = None
+        self._skill_restore_wait: FetchWait | None = None
         self._registry_sync = RegistrySkillSync(
             config=lambda: self._context.config_orchestrator.config,
             credentials=lambda: self._context.platform_credentials,
@@ -7686,6 +8720,12 @@ class UnifiedHarnessBackendAdapter(  # noqa: PLR0904 - implements app-server ses
                 "Failed to apply the synced registry skills",
                 "apply_registry_skills",
             ),
+            restore=PickRestore(
+                fetch=self._restore_picked_skills,
+                missing=self._report_unrestored_skills,
+                restored=self._report_restored_skills,
+                retry_delays=_SKILL_RESTORE_RETRY_DELAYS_SECONDS,
+            ),
         )
         self._model_catalog: RemoteFollower[ModelCatalogResponse] | None = None
         self._model_catalog_key: ModelCatalogKey | None = None
@@ -7694,6 +8734,9 @@ class UnifiedHarnessBackendAdapter(  # noqa: PLR0904 - implements app-server ses
         self._model_catalog_running = _catalog_of(context.config_orchestrator)
         # The pin a catalog was refused for: another pick lets it load.
         self._model_catalog_refused_for: str | None = None
+        # What a model pick waits for: the catalog reaching the config, not
+        # the fetch task, which a session/start answer must precede.
+        self._model_catalog_pick_wait: ModelCatalogWait | None = None
         self._connector_resolve_task: asyncio.Task[None] | None = None
         self._connector_follower: RemoteFollower[ResolvedConnectorCatalog] | None = None
         self._connector_follow: FollowedCatalog | None = None
@@ -7733,6 +8776,7 @@ class UnifiedHarnessBackendAdapter(  # noqa: PLR0904 - implements app-server ses
             derive=self.derive_configuration,
             push=self._push_configuration,
             adopt=self._adopt_derivation,
+            # The local Session's turn; the target runtime has none (HAR-1183).
             turn_running=lambda: self._session.active_turn_id is not None,
         )
         # Set once the client holds the response that announced this session.
@@ -7753,15 +8797,115 @@ class UnifiedHarnessBackendAdapter(  # noqa: PLR0904 - implements app-server ses
         self._child_scheduled_loops_lock = asyncio.Lock()
         self._scheduled_loops_enabled = scheduled_loops_enabled
         self._scheduled_loops_task: asyncio.Task[None] | None = None
+        # Goals share the loops' gate: both start work without the user.
+        self._goal = UnifiedSessionGoal(
+            self._session_dir(),
+            hooks=self,
+            require_session=self._require_session,
+            available=lambda: self._scheduled_loops_enabled and not self._closed,
+            max_token_budget=lambda: (
+                self._context.config_orchestrator.config.max_goal_token_budget
+            ),
+            persistent=self._persists_to_disk,
+        )
+        self._goal_notices = GoalNoticeStore(
+            self._session_dir() / GOAL_NOTICES_FILENAME,
+            persistent=self._persists_to_disk,
+        )
+        # True while a runtime update is being translated into client events.
+        self._translating_update = False
         self._skill_watch_task: asyncio.Task[None] | None = None
         self._skill_watch_roots: SkillWatchRoots | None = None
         self._skill_watch_started = False
-        self._pending_startup_notices: list[str] = []
+        self._pending_startup_notices: list[tuple[str, str]] = []
         self._resolved_cwd: tuple[str | None, Path] | None = None
         self._host_shell = _HostShell(ShellController(self._cwd_path()))
 
     def runtime_updated_params(self) -> RuntimeUpdatedParams:
         return RuntimeUpdatedParams(session_id=self.session_id, runtime=self._runtime)
+
+    def publish_goal_patch(self, patch: tuple[JsonPatchOperation, ...]) -> None:
+        if self._translating_update:
+            # The update being translated carries the goal as it ends up.
+            return
+        self._publish_session_metadata(
+            _SessionMetadataProjection(session_id=self.session_id, patch=patch)
+        )
+
+    def publish_notice(self, message: str) -> None:
+        if self._translated_state is None:
+            self._pending_startup_notices.append((message, "warning"))
+            return
+        self._session.publish_notice(message)
+
+    async def tell_model(self, note: str) -> None:
+        """A hidden note the model reads at its next turn; only sent while idle."""
+        self._announce_first_use()
+        was_ephemeral = bool(getattr(self._session, "ephemeral", True))
+        await _harness_call(
+            self._session.inject_context(
+                ContextInjectParams(
+                    session_id=self.session_id, input=[TextContentBlock(text=note)]
+                )
+            )
+        )
+        await self._after_server_activity(was_ephemeral=was_ephemeral)
+
+    def goal_notice_recorded(self, goal_id: str, event: str) -> bool:
+        return any(
+            isinstance(entry.detail, GoalNoticeDetail)
+            and entry.detail.goal_id == goal_id
+            and entry.detail.event == event
+            for entry in self._goal_notices.notices
+        )
+
+    async def record_goal_notice(self, notice: GoalNotice, turn_id: str | None) -> None:
+        """Keep one goal notice beside the session and show it live."""
+        entry = goal_notice_entry(
+            notice_id=f"goal-notice-{uuid4()}",
+            session_id=self.session_id,
+            turn_id=turn_id,
+            created_at=now_ms(),
+            level=cast(Literal["info", "warning", "error"], notice.level),
+            message=notice.message,
+            detail=notice.detail,
+        )
+        await self._goal_notices.append(entry)
+        # The update being translated carries this notice (see
+        # `_translating_goal_update`).
+        if self._translating_update:
+            return
+        state = self._translated_state
+        # An update translated while the notice was being saved already
+        # carried it to the client; sending it again would duplicate it.
+        if state is None or any(e.id == entry.id for e in state.history or []):
+            return
+        history = with_goal_notices(
+            list(state.history or []),
+            [entry],
+            complete=state.history_before_cursor is None,
+        )
+        if all(existing.id != entry.id for existing in history):
+            return
+        self._publish_local_event(HistoryEntryAdded(entry))
+        self._translated_state = state.model_copy(
+            update={"event_id": self._event_id, "history": history}
+        )
+
+    def record_goal_event(self, name: str, properties: dict[str, Any]) -> None:
+        try:
+            self._telemetry.send_telemetry_event(name, properties)
+        except Exception:
+            logger.warning("Failed to send goal telemetry", exc_info=True)
+
+    async def restore_session_state(self) -> None:
+        """Restore the Vibe-owned sidecars: scheduled loops and the goal."""
+        await self.restore_scheduled_loops()
+        # Notices first: restoring the goal can record one (a completion its
+        # turn never reported), which must join the saved ones.
+        await self._goal_notices.restore()
+        # A turn a crash cut is already running again here: its end charges it.
+        await self._goal.restore(running_turn_id=self._session.active_turn_id)
 
     def mark_announced(self) -> None:
         self._announced.set()
@@ -7777,7 +8921,7 @@ class UnifiedHarnessBackendAdapter(  # noqa: PLR0904 - implements app-server ses
     def _emit_profile_warnings(self, derivation: UnifiedRuntimeDerivation) -> None:
         # Every derivation carries the cached catalogue warnings, since the one
         # that fetched may never reach a session; the process cache lets the
-        # first session that shows them be the only one.
+        # first session that logs them be the only one.
         self._completion_warnings.emit_all(
             PROCESS_CATALOGUE_CACHE.unshown(derivation.profile_warnings)
         )
@@ -7832,7 +8976,13 @@ class UnifiedHarnessBackendAdapter(  # noqa: PLR0904 - implements app-server ses
     def _report_hook_failure(self, event: str) -> Callable[[str, str], None]:
         def report(name: str, reason: str) -> None:
             if not self._closed:
-                self._publish_notice(f"{event} hook {name!r} failed: {reason}")
+                self._publish_notice(
+                    f"{event} hook {name!r} failed: {reason}",
+                    code=HOOK_FAILED_CODE,
+                    details=_hook_notice_details(
+                        name, f"{event} hook failed: {reason}"
+                    ),
+                )
 
         return report
 
@@ -7897,11 +9047,20 @@ class UnifiedHarnessBackendAdapter(  # noqa: PLR0904 - implements app-server ses
             if self._closed:
                 return
             for name, failure in failures:
-                self._publish_notice(f"session_start hook {name!r} failed: {failure}")
+                self._publish_notice(
+                    f"session_start hook {name!r} failed: {failure}",
+                    code=HOOK_FAILED_CODE,
+                    details=_hook_notice_details(
+                        name, f"session_start hook failed: {failure}"
+                    ),
+                )
             # Not a warning: the hook's own line, as other hooks show theirs.
             for name, message in messages:
                 self._publish_notice(
-                    f"[{name}] {message}", level="info", code=HOOK_MESSAGE_CODE
+                    f"[{name}] {message}",
+                    level="info",
+                    code=HOOK_MESSAGE_CODE,
+                    details=_hook_notice_details(name, message),
                 )
 
         async def run() -> str | None:
@@ -8039,6 +9198,8 @@ class UnifiedHarnessBackendAdapter(  # noqa: PLR0904 - implements app-server ses
         )
 
     def _show_completion_warning(self, warning: CompletionWarning) -> None:
+        if not _is_user_notice(warning.code):
+            return
         # A notice before the client holds the session would reach no one.
         if self._announced.is_set():
             self._publish_notice(warning.message)
@@ -8124,7 +9285,10 @@ class UnifiedHarnessBackendAdapter(  # noqa: PLR0904 - implements app-server ses
         share it, so nothing is translated — but the Runtime holds no Vibe
         types, and this is where it stops holding one.
         """
-        info = await _harness_call(self._session.read_plugin_info())
+        if self._api_path is not None:
+            info = await _harness_call(self._api_path.read_plugin_info())
+        else:
+            info = await _harness_call(self._session.read_plugin_info())
         return validate_backend_wire(
             PluginInfo, info.model_dump(mode="json", by_alias=True)
         )
@@ -8151,7 +9315,7 @@ class UnifiedHarnessBackendAdapter(  # noqa: PLR0904 - implements app-server ses
             # A re-pin cannot swap the tools under a running turn: the turn
             # boundary runs the reload instead (``_settle_configuration``).
             self._plugin_reload_parked = True
-            return PluginReloadResponse()
+            return PluginReloadResponse(deferred=True)
         async with self._plugin_reloading:
             self._plugin_reload_parked = False
             try:
@@ -8162,6 +9326,7 @@ class UnifiedHarnessBackendAdapter(  # noqa: PLR0904 - implements app-server ses
                 if not _is_turn_conflict(exc):
                     raise
                 self._plugin_reload_parked = True
+                return PluginReloadResponse(deferred=True)
         return PluginReloadResponse()
 
     async def reload_switched_plugins(self) -> None:
@@ -8405,6 +9570,12 @@ class UnifiedHarnessBackendAdapter(  # noqa: PLR0904 - implements app-server ses
                 response = await self._dispatch_session_reads(method, raw_params)
             case _ if method.startswith("loops/"):
                 response = await self._dispatch_scheduled_loops(method, raw_params)
+            case _ if method.startswith("goal/"):
+                result = await self._goal.controller.dispatch(method, raw_params)
+                await self._goal.flush_notices()
+                # The model hears about the change before its next turn: the
+                # loop runner delivers the note once the session is idle.
+                return result
             case _ if method.startswith("skills/"):
                 return await self._skills_controller.dispatch(method, raw_params)
             case "diagnostics/logs/read":
@@ -8730,17 +9901,13 @@ class UnifiedHarnessBackendAdapter(  # noqa: PLR0904 - implements app-server ses
         )
 
     def _merge_translated_entry(self, entry: PublicHistoryEntry) -> None:
-        state = self._translated_state
-        if state is None:
+        if entry.session_id != self.session_id:
+            child = self._child_states.get(entry.session_id)
+            if child is not None:
+                self._child_states[entry.session_id] = _with_history_entry(child, entry)
             return
-        history = state.history or []
-        if any(existing.id == entry.id for existing in history):
-            history = [
-                entry if existing.id == entry.id else existing for existing in history
-            ]
-        else:
-            history = [*history, entry]
-        self._translated_state = state.model_copy(update={"history": history})
+        if self._translated_state is not None:
+            self._translated_state = _with_history_entry(self._translated_state, entry)
 
     async def _record_shell_effect_best_effort(
         self, entry: PublicEffectEntry, limit: int
@@ -8794,21 +9961,32 @@ class UnifiedHarnessBackendAdapter(  # noqa: PLR0904 - implements app-server ses
         self._host_shell.queue.put_nowait(_event_envelope(event, self._event_id))
 
     def _publish_notice(
-        self, message: str, *, level: str = "warning", code: str | None = None
+        self,
+        message: str,
+        *,
+        level: str = "warning",
+        code: str | None = None,
+        details: Mapping[str, str] | None = None,
     ) -> None:
         """Send the Client a remark of the Host's own as a ``warning``.
 
         It rides the Host's side of the event stream, not the Runtime's: the
         Session API has no procedure for it, and a remark changes nothing about
         the Session, so the Session never stores it. ``code`` names it for a
-        Client that handles it on its own. Dropped when no subscription is
-        open, as the Runtime drops an event nobody follows.
+        Client that handles it on its own, and ``details`` gives such a Client
+        its parts. Dropped when no subscription is open, as the Runtime drops an
+        event nobody follows.
         """
         if not (self._events_subscribed or self._notices_subscribed):
             return
         self._host_shell.pending += 1
         self._host_shell.queue.put_nowait(
-            self._notice_event({"message": message, "level": level, "code": code})
+            self._notice_event({
+                "message": message,
+                "level": level,
+                "code": code,
+                "details": details,
+            })
         )
 
     def _workspace_cwd(self, requested_cwd: str | None) -> str:
@@ -8968,6 +10146,12 @@ class UnifiedHarnessBackendAdapter(  # noqa: PLR0904 - implements app-server ses
             case "session/stop":
                 params = validate_wire(SessionStopParams, raw_params)
                 self._require_session(params.session_id)
+                if params.reason is not None:
+                    self._stop_reason = (
+                        SessionEndReason.OTHER
+                        if params.reason == SessionEndReason.OTHER
+                        else SessionEndReason.EXIT
+                    )
                 response = SessionStopResponse()
             case (
                 "session/subagents/wait"
@@ -8982,11 +10166,7 @@ class UnifiedHarnessBackendAdapter(  # noqa: PLR0904 - implements app-server ses
             case "session/turns/list":
                 turns_params = validate_wire(SessionTurnsListParams, raw_params)
                 self._require_readable_session(turns_params.session_id)
-                state = await self._read_page_state(turns_params.session_id)
-                response = _turns_list_response(
-                    _turns_from_history(state.history or [], state.session.id),
-                    turns_params,
-                )
+                response = await self._turns_list(turns_params)
             case "session/rewind/read":
                 params = validate_wire(SessionRewindReadParams, raw_params)
                 self._require_session(params.session_id)
@@ -9037,6 +10217,7 @@ class UnifiedHarnessBackendAdapter(  # noqa: PLR0904 - implements app-server ses
                 read_params = validate_wire(ConfigReadParams, raw_params)
                 if read_params.session_id is not None:
                     self._require_session(read_params.session_id)
+                await self._load_model_catalog_for_read()
                 return await self._config_read_response()
             case "config/effective/read":
                 effective_params = validate_wire(ConfigEffectiveReadParams, raw_params)
@@ -9069,6 +10250,10 @@ class UnifiedHarnessBackendAdapter(  # noqa: PLR0904 - implements app-server ses
     async def read(self, params: SessionReadParams) -> SessionReadResponse:
         self._require_readable_session(params.session_id)
         if params.session_id != self.session_id:
+            # A live child reads as the state its events were diffed from.
+            live = self._child_states.get(params.session_id)
+            if live is not None:
+                return SessionReadResponse(state=live, last_event_id=live.event_id)
             return await self._read_child_response(_harness_read_params(params))
         if self._api_path is not None:
             return await self._api_path.read(params)
@@ -9256,6 +10441,9 @@ class UnifiedHarnessBackendAdapter(  # noqa: PLR0904 - implements app-server ses
         # A resumed session's next compaction reports the size it replaced; keep
         # the __init__ default of 0 when the snapshot carries no measurement.
         self._track_context_tokens(snapshot.state)
+        snapshot = snapshot.model_copy(
+            update={"state": await self._settle_goal_turns_on_attach(snapshot.state)}
+        )
         self._translated_state = snapshot.state
         async with self._events_condition:
             self._observed_harness_watermark = subscription.snapshot.watermark
@@ -9290,6 +10478,17 @@ class UnifiedHarnessBackendAdapter(  # noqa: PLR0904 - implements app-server ses
             while self._events_subscribed and self._host_shell.pending > 0:
                 await self._events_condition.wait()
 
+    async def wait_for_held_events(self) -> None:
+        """Wait until the event stream handed out what was held for it.
+
+        Unlike ``flush_events``, this also waits for a stream that has not read
+        its first event yet, which is when a resumed turn's `turn/started` is
+        held. A stream that ends drops what it held and releases the wait.
+        """
+        async with self._events_condition:
+            while self._host_shell.pending > 0:
+                await self._events_condition.wait()
+
     def guard_request(self) -> None:
         self._session.guard_request()
 
@@ -9297,33 +10496,69 @@ class UnifiedHarnessBackendAdapter(  # noqa: PLR0904 - implements app-server ses
         self, params: AgentSwitchParams
     ) -> SessionBackendResult[RuntimeMutationResponse]:
         self._require_session(params.session_id)
+        agents = self._context.agents
+        if agents.is_policy_name(params.agent_name):
+            # A client from before agents and policies split.
+            return await self.switch_approval_policy(
+                ApprovalPolicySwitchParams(
+                    session_id=params.session_id, approval_policy=params.agent_name
+                )
+            )
         # Applies while a requested worktree is still being prepared: a client
-        # picks the profile before its first message, and adopt_context carries
+        # picks the agent before its first message, and adopt_context carries
         # it into the worktree's context.
-        # Entering or leaving smart-approve flips gated tools between "classify" and
-        # "ask"/"allow" in the adapter config, which _apply_derivation pushes to the
-        # live session -- no Core hook rebinding, so the switch is safe mid-session.
         async with self._agent_switching:
-            agents = self._context.agents
-            previous = agents.active_profile.name
+            previous = agents.active_agent.name
             try:
-                await agents.aswitch_profile(params.agent_name)
+                await agents.aswitch_agent(params.agent_name)
             except ValueError as exc:
-                raise SessionBackendError(
-                    ProtocolErrorCode.INVALID_PARAMS, str(exc)
-                ) from exc
+                raise _selection_refused(exc) from exc
             try:
                 await self._apply_agent_derivation()
             except Exception as exc:
-                await self._restore_profile(previous)
+                await self._restore_selection(agent=previous)
                 raise SessionBackendError(
                     ProtocolErrorCode.INTERNAL_ERROR,
                     f"Failed to apply agent '{params.agent_name}': {exc}",
                 ) from exc
-        # Pin the running mode so resume/continue/fork put the session back on it.
-        await self._persist_pin(SessionPin.AGENT_NAME, params.agent_name)
-        # A profile can repoint the model, and the level belongs to that model.
+        self._record_agent_mode_selected(previous, params.agent_name, trigger="user")
+        # Pinned so resume/continue/fork put the session back on it.
+        await self._pin_session_selection()
+        # An agent can repoint the model, and the level belongs to that model.
         await self._persist_session_reasoning_effort()
+        return SessionBackendResult(
+            response=RuntimeMutationResponse(
+                runtime=self._runtime, status=self._mutation_status()
+            )
+        )
+
+    async def switch_approval_policy(
+        self, params: ApprovalPolicySwitchParams
+    ) -> SessionBackendResult[RuntimeMutationResponse]:
+        self._require_session(params.session_id)
+        # Entering or leaving smart-approve flips gated tools between "classify" and
+        # "ask"/"allow" in the adapter config, which _apply_agent_derivation grafts
+        # onto the live session -- no Core hook rebinding, so it is safe mid-turn.
+        async with self._agent_switching:
+            agents = self._context.agents
+            previous = agents.active_policy.name
+            try:
+                await agents.aswitch_policy(params.approval_policy)
+            except ValueError as exc:
+                raise _selection_refused(exc) from exc
+            try:
+                await self._apply_agent_derivation()
+            except Exception as exc:
+                await self._restore_selection(policy=previous)
+                raise SessionBackendError(
+                    ProtocolErrorCode.INTERNAL_ERROR,
+                    f"Failed to apply approval policy '{params.approval_policy}':"
+                    f" {exc}",
+                ) from exc
+        self._record_agent_mode_selected(
+            previous, params.approval_policy, trigger="user"
+        )
+        await self._pin_session_selection()
         return SessionBackendResult(
             response=RuntimeMutationResponse(
                 runtime=self._runtime, status=self._mutation_status()
@@ -9338,15 +10573,41 @@ class UnifiedHarnessBackendAdapter(  # noqa: PLR0904 - implements app-server ses
             else RuntimeMutationStatus.APPLIED
         )
 
-    async def _restore_profile(self, name: str) -> None:
-        """Put a failed switch back on the agent the session was already running."""
+    def _record_agent_mode_selected(
+        self, from_agent: str, to_agent: str, *, trigger: AgentModeTrigger
+    ) -> None:
+        """Report a switch of the agent, or of the approval policy, by name."""
+        if from_agent == to_agent:
+            return
         try:
-            await self._context.agents.aswitch_profile(name)
+            if self._context.agents.is_policy_name(to_agent):
+                self._telemetry.send_approval_policy_selected(
+                    from_policy=from_agent, to_policy=to_agent, trigger=trigger
+                )
+            else:
+                self._telemetry.send_agent_mode_selected(
+                    from_agent=from_agent, to_agent=to_agent, trigger=trigger
+                )
+        except Exception:
+            logger.warning("Failed to send agent mode telemetry", exc_info=True)
+
+    async def _restore_selection(
+        self, *, agent: str | None = None, policy: str | None = None
+    ) -> None:
+        """Put a failed switch back on what the session was already running."""
+        agents = self._context.agents
+        try:
+            if agent is not None:
+                await agents.aswitch_agent(agent)
+            if policy is not None:
+                await agents.aswitch_policy(policy)
             await self._apply_agent_derivation()
         except Exception:
             logger.exception(
-                "Failed to restore the agent profile after a rejected switch agent=%s",
-                name,
+                "Failed to restore the session after a rejected switch"
+                " agent=%s policy=%s",
+                agent,
+                policy,
             )
 
     async def install_agent(
@@ -9377,7 +10638,7 @@ class UnifiedHarnessBackendAdapter(  # noqa: PLR0904 - implements app-server ses
             raise SessionBackendError(
                 ProtocolErrorCode.INVALID_PARAMS, str(exc)
             ) from exc
-        previous_active = agents.active_profile.name
+        previous_active = agents.active_agent.name
         was_installed: bool | None = None
 
         def toggle(names: list[str]) -> list[str]:
@@ -9391,7 +10652,7 @@ class UnifiedHarnessBackendAdapter(  # noqa: PLR0904 - implements app-server ses
         rollback_write = False
         try:
             if change.switch_to is not None:
-                await agents.aswitch_profile(change.switch_to)
+                await agents.aswitch_agent(change.switch_to)
                 await self._apply_agent_derivation()
             # write_config can raise after the patch reached the layer file, so the
             # write counts as landed from here until it comes back rejected.
@@ -9410,7 +10671,10 @@ class UnifiedHarnessBackendAdapter(  # noqa: PLR0904 - implements app-server ses
                 installed=installed,
             )
             if change.switch_to is not None:
-                await self._persist_pin(SessionPin.AGENT_NAME, change.switch_to)
+                await self._pin_session_selection()
+                self._record_agent_mode_selected(
+                    previous_active, change.switch_to, trigger="agent_uninstalled"
+                )
         except Exception as exc:
             # Undo the write first: restoring the profile needs the agent that the
             # write removed to be selectable again.
@@ -9419,7 +10683,7 @@ class UnifiedHarnessBackendAdapter(  # noqa: PLR0904 - implements app-server ses
                     params.agent_name, installed=was_installed
                 )
             if change.switch_to is not None:
-                await self._restore_profile(previous_active)
+                await self._restore_selection(agent=previous_active)
             if isinstance(exc, SessionBackendError):
                 raise
             if isinstance(exc, AgentInstallError | ValueError):
@@ -9434,7 +10698,10 @@ class UnifiedHarnessBackendAdapter(  # noqa: PLR0904 - implements app-server ses
         runtime = write.response.runtime
         return SessionBackendResult(
             response=AgentsListResponse(
-                active=runtime.active_agent, agents=runtime.agents
+                active=runtime.active_agent,
+                agents=runtime.agents,
+                active_approval_policy=runtime.active_approval_policy,
+                approval_policies=runtime.approval_policies,
             ),
             runtime_updated=True,
         )
@@ -9536,7 +10803,16 @@ class UnifiedHarnessBackendAdapter(  # noqa: PLR0904 - implements app-server ses
         a turn reads keeps ``config/write``'s idle-only contract.
         """
         self._require_session(params.session_id)
+        if params.reasoning_effort is not None:
+            # As the config saves it, so checks against the saved level match.
+            level = standard_thinking_level(params.reasoning_effort)
+            if not level:
+                raise SessionBackendError(
+                    ProtocolErrorCode.INVALID_PARAMS, "The thinking level is blank"
+                )
+            params = params.model_copy(update={"reasoning_effort": level})
         if params.model_alias:
+            await self._wait_for_model_to_arrive(params.model_alias)
             # A catalog alias picks its model, which the session then records.
             params = params.model_copy(
                 update={
@@ -9570,11 +10846,19 @@ class UnifiedHarnessBackendAdapter(  # noqa: PLR0904 - implements app-server ses
     async def _write_default_model_config(
         self, params: ModelConfigWriteParams
     ) -> SessionBackendResult[ConfigWriteResponse]:
+        orchestrator = self._context.config_orchestrator
         try:
+            written_model = model_after_write(orchestrator.config, params.model_alias)
+            default_thinking: str | None = None
+            if params.reasoning_effort is not None:
+                default_thinking = await model_default_thinking(
+                    orchestrator, written_model
+                )
             ops = model_config_write_ops(
-                self._context.config_orchestrator.config,
+                orchestrator.config,
                 model_alias=params.model_alias,
                 reasoning_effort=params.reasoning_effort,
+                default_thinking=default_thinking,
             )
         except ValueError as exc:
             raise SessionBackendError(
@@ -9582,8 +10866,6 @@ class UnifiedHarnessBackendAdapter(  # noqa: PLR0904 - implements app-server ses
             ) from exc
         # In the same batch, so one derivation serves both, and against the
         # model the write leaves active rather than the one it found.
-        orchestrator = self._context.config_orchestrator
-        written_model = model_after_write(orchestrator.config, params.model_alias)
         if params.reasoning_effort is not None and model_thinking_is_session_writable(
             orchestrator, written_model
         ):
@@ -9649,6 +10931,10 @@ class UnifiedHarnessBackendAdapter(  # noqa: PLR0904 - implements app-server ses
         # A layer above the session (an agent profile, an admin) can pin either
         # pick, and the write then lands without taking effect.
         active = orchestrator.config.get_active_model()
+        if self._agent_runs_its_own_model(active.alias):
+            # The agent brings its model, and its level with it: a pick carried
+            # from the client's composer gives way to it.
+            return accepted
         if model_alias and active.alias != model_alias:
             raise SessionBackendError(
                 ProtocolErrorCode.INVALID_PARAMS,
@@ -9666,6 +10952,13 @@ class UnifiedHarnessBackendAdapter(  # noqa: PLR0904 - implements app-server ses
                 "picked for one session",
             )
         return accepted
+
+    def _agent_runs_its_own_model(self, active_alias: str) -> bool:
+        own = self._context.agents.active_agent.overrides.get("active_model")
+        if not isinstance(own, str) or not own:
+            return False
+        config = self._context.config_orchestrator.config
+        return config.resolve_model_name(own) == active_alias
 
     async def _write_config(
         self, params: ConfigWriteParams
@@ -9749,7 +11042,12 @@ class UnifiedHarnessBackendAdapter(  # noqa: PLR0904 - implements app-server ses
         )
         return SessionBackendResult(
             response=ConfigWriteResponse(
-                runtime=self._runtime, status=self._mutation_status()
+                runtime=self._runtime,
+                status=self._mutation_status(),
+                shadowed=shadowed_writes(
+                    orchestrator,
+                    ((op.path, op.target_layer) for op in ops if op.op == "set"),
+                ),
             )
         )
 
@@ -10003,6 +11301,41 @@ class UnifiedHarnessBackendAdapter(  # noqa: PLR0904 - implements app-server ses
             follower.force()
         return follower if follower.due else None
 
+    async def _load_model_catalog_for_read(self) -> None:
+        """Load a changed catalog into an idle, announced session before a
+        client reads its models. An idle session reaches no turn boundary, and
+        a model its old catalog locked keeps its upsell and refuses the very
+        turn that would load the new one. An old catalog's refresh starts in
+        the background, and ``config/changed`` tells the client when it lands.
+        Fail-open: the read answers with what the session runs.
+        """
+        if not self._announced.is_set() or self._session.active_turn_id is not None:
+            return
+        try:
+            await self._check_model_catalog_for_picker()
+        except Exception as exc:
+            logger.exception("Failed to check the model catalog")
+            _report(exc, "check_model_catalog")
+        try:
+            changed = await self._load_model_catalog(reserved_turn=False, strict=False)
+        except Exception as exc:
+            logger.exception("Failed to apply the model catalog to config")
+            _report(exc, "apply_model_catalog")
+            return
+        if changed:
+            await self._announce_unannounced_runtime()
+
+    async def _check_model_catalog_for_picker(self) -> None:
+        """A client reading the session's models renders its picker: start a
+        refresh of the catalog by the picker's rule (sooner while it shows an
+        upsell), as the user may be back from upgrading their plan. Never
+        waits on it.
+        """
+        self._follow_model_catalog()
+        await self._context.model_catalog_service.check_for_picker(
+            self._model_catalog_key
+        )
+
     async def _load_model_catalog(self, *, reserved_turn: bool, strict: bool) -> bool:
         """Load the catalog held, if it changed, between turns only: the
         turn that ran keeps the config it started with. Answers whether the
@@ -10116,6 +11449,9 @@ class UnifiedHarnessBackendAdapter(  # noqa: PLR0904 - implements app-server ses
         self._model_catalog_refused_for = None
         if not strict:
             self._runtime_unannounced = True
+        # A client that re-read this session's models while a turn deferred
+        # the catalog cached the old ones: it reads them again.
+        context.config_changes.publish()
         return True
 
     async def _install_model_catalog(self, catalog: ModelCatalogResponse) -> bool:
@@ -10282,13 +11618,19 @@ class UnifiedHarnessBackendAdapter(  # noqa: PLR0904 - implements app-server ses
         orchestrator = self._context.config_orchestrator
         layer = admin_layer(orchestrator)
         previous = layer.snapshot() if layer is not None else None
+        live = self._context.agents
+        selection = (live.active_agent, live.active_policy)
         try:
             if layer is not None:
                 layer.restore(admin)
                 await orchestrator.reload_layer(layer.name)
             if mode_left is not None:
-                await self._context.agents.aswitch_profile(agents.active_profile.name)
+                live.active_agent = agents.active_agent
+                live.active_policy = agents.active_policy
+                await live.areapply()
         except BaseException as exc:
+            # The session layers still hold the running selection: report it.
+            live.active_agent, live.active_policy = selection
             if layer is not None and previous is not None:
                 layer.restore(previous)
             # Cancelled: the layer is back, and the caller awaits the
@@ -10304,6 +11646,16 @@ class UnifiedHarnessBackendAdapter(  # noqa: PLR0904 - implements app-server ses
                 with contextlib.suppress(Exception):
                     await orchestrator.reload_layer(layer.name)
             return False
+        if mode_left is not None:
+            self._record_agent_mode_selected(
+                mode_left,
+                (
+                    agents.active_policy.name
+                    if agents.is_policy_name(mode_left)
+                    else agents.active_agent.name
+                ),
+                trigger="org_policy",
+            )
         return True
 
     def _refuse_org_config(
@@ -10340,6 +11692,11 @@ class UnifiedHarnessBackendAdapter(  # noqa: PLR0904 - implements app-server ses
         refusing the derivation drops it, as for any parked write, and leaves
         the integrations where they are. ``strict`` raises what fails instead
         of keeping it for the next boundary.
+
+        A reserved turn settles through ``_settle_reserved_turn_configuration``
+        instead: it pushes onto the reserved turn and moves the integrations
+        even when a turn holds the pick. Only the refusal handling,
+        ``_drop_refused_configuration``, is shared.
         """
         try:
             settled = await self._deferred.settle()
@@ -10359,6 +11716,7 @@ class UnifiedHarnessBackendAdapter(  # noqa: PLR0904 - implements app-server ses
             await self._announce_unannounced_runtime()
             return
         await self._converge_integrations(strict=strict)
+        await self._tell_running_agent()
         if strict:
             # A strict caller answers with the runtime itself.
             self._runtime_unannounced = False
@@ -10536,6 +11894,7 @@ class UnifiedHarnessBackendAdapter(  # noqa: PLR0904 - implements app-server ses
             lambda: self._context.config_orchestrator.config,
             harness_files=self._context.harness_files,
             sandbox=self._context.sandbox_skills,
+            session_pins=self._settings.skill_pins,
         )
 
     async def _config_fields_response(self) -> ConfigFieldsReadResponse:
@@ -10547,7 +11906,10 @@ class UnifiedHarnessBackendAdapter(  # noqa: PLR0904 - implements app-server ses
         fields = [
             wire
             for wire in build_field_wires(
-                orchestrator.config, layer_values, popular=POPULAR_SETTINGS
+                orchestrator.config,
+                layer_values,
+                popular=POPULAR_SETTINGS,
+                locking_layers=locking_layers(orchestrator),
             )
             if wire.name not in HIDDEN_SETTINGS
         ]
@@ -10569,6 +11931,51 @@ class UnifiedHarnessBackendAdapter(  # noqa: PLR0904 - implements app-server ses
             raise SessionBackendError(
                 ProtocolErrorCode.INVALID_PARAMS, str(exc)
             ) from exc
+
+    def _require_runnable_active_model(self) -> None:
+        """Refuse a turn on a model listed only so the picker can upsell it.
+
+        Nothing downstream refuses it, so every way a turn opens checks here;
+        refusing before the turn keeps the message out of the transcript, so
+        the user can pick another model and resend.
+        """
+        model = self._context.config_orchestrator.config.get_active_model()
+        if model.requires is None:
+            return
+        raise SessionBackendError(
+            ProtocolErrorCode.FORBIDDEN,
+            f"{model.display_name or model.alias} requires a plan upgrade",
+            {"reason": "model_requires_upgrade", "model": model.alias},
+        )
+
+    async def _unlock_active_model(self) -> None:
+        """Before a turn on a locked model is refused, have the session run the
+        newest catalog: the plan may have been upgraded since it was fetched,
+        and a turn no client sends (a scheduled loop's, a goal's, a queued
+        one's) has no other way to learn it. The catalog is refreshed once it
+        is ``LOCKED_MODEL_REFRESH_AFTER_S`` old, waited for at most
+        ``_LOCKED_MODEL_REFETCH_WAIT_S``; the catalog held then is
+        loaded whatever the fetch did. Between turns only. Fail-open: the gate
+        decides on what loaded.
+        """
+        model = self._context.config_orchestrator.config.get_active_model()
+        if model.requires is None or self._session.active_turn_id is not None:
+            return
+        self._follow_model_catalog()
+        key = self._model_catalog_key
+        if key is None:
+            return
+        try:
+            await self._context.model_catalog_service.checked_for_locked_model(
+                key, timeout_s=_LOCKED_MODEL_REFETCH_WAIT_S
+            )
+            changed = await self._load_model_catalog(reserved_turn=False, strict=False)
+        except Exception as exc:
+            logger.exception("Failed to refresh the model catalog for a locked model")
+            _report(exc, "apply_model_catalog")
+            return
+        if changed and self._announced.is_set():
+            await self._announce_unannounced_runtime()
 
     def _require_no_session_rewrite(self) -> None:
         """Reject a configuration mutation aimed at a session being rewritten.
@@ -10607,6 +12014,7 @@ class UnifiedHarnessBackendAdapter(  # noqa: PLR0904 - implements app-server ses
     @contextlib.asynccontextmanager
     async def relocation_reservation(self) -> AsyncIterator[None]:
         """Reserve the idle Session and serialize configuration through a move."""
+        await self._await_turn_settled()
         async with self._agent_switching, self._deferred.exclusive():
             self._require_idle()
             self._relocation_active = True
@@ -10786,26 +12194,44 @@ class UnifiedHarnessBackendAdapter(  # noqa: PLR0904 - implements app-server ses
         context.vibe_tools.adopt(previous.vibe_tools)
         # The incoming context is built from the launch options, so a profile
         # switched while the worktree was prepared lives only on the outgoing one.
-        active = previous.agents.active_profile.name
         mode_notice = None
-        if context.agents.active_profile.name != active:
-            # The incoming context can lack the mode: a cached org config that
+        mode_trigger: AgentModeTrigger = "agent_unavailable"
+        mode_switch: tuple[str, str] | None = None
+        for active, current, switch in (
+            (
+                previous.agents.active_agent.name,
+                context.agents.active_agent.name,
+                context.agents.aswitch_agent,
+            ),
+            (
+                previous.agents.active_policy.name,
+                context.agents.active_policy.name,
+                context.agents.aswitch_policy,
+            ),
+        ):
+            if current == active:
+                continue
+            # The incoming context can lack it: a cached org config that
             # excludes it, or a custom agent this checkout does not have. The
-            # session goes on in the mode the incoming context started.
+            # session goes on with what the incoming context started.
             try:
-                await context.agents.aswitch_profile(active)
+                await switch(active)
             except InvalidConfigError as exc:
-                # The mode is there, but the incoming config clashes with it, say
+                # It is there, but the incoming config clashes with it, say
                 # with lean's shell timeouts: the user's to fix, so the move is
-                # refused as a session start in it is, not run in another mode.
+                # refused as a session start on it is.
                 raise SessionBackendError.configuration(exc) from exc
             except ValueError:
+                org_excluded = context.agents.org_excludes(active)
                 reason = (
                     "is disabled by your organization"
-                    if context.agents.org_excludes(active)
+                    if org_excluded
                     else "isn't available in this folder"
                 )
                 mode_notice = f"The '{active}' mode {reason}."
+                mode_switch = (active, current)
+                if org_excluded:
+                    mode_trigger = "org_policy"
         # Carried with no await before the swap: an eval landing earlier is
         # carried, one landing later reaches the new context.
         _carry_experiments(previous, context)
@@ -10843,6 +12269,8 @@ class UnifiedHarnessBackendAdapter(  # noqa: PLR0904 - implements app-server ses
         self._integrations_due = True
         if mode_notice is not None:
             self._publish_notice(mode_notice)
+        if mode_switch is not None:
+            self._record_agent_mode_selected(*mode_switch, trigger=mode_trigger)
         # Only the outcome: the session start already showed the --agent one.
         report = context.org_config_report.take()
         self._report_org_config_outcome(None if report is None else report.outcome)
@@ -10877,9 +12305,14 @@ class UnifiedHarnessBackendAdapter(  # noqa: PLR0904 - implements app-server ses
             _UnifiedSkillsHost(
                 context,
                 runtime=lambda: self._runtime,
-                require_idle=self._require_idle,
+                require_no_session_rewrite=self._require_no_session_rewrite,
                 require_session=self._require_session,
                 refresh=self._refresh_after_skill_change,
+                session_pins=lambda: self._settings.skill_pins,
+                save_session_pins=self._save_skill_pins,
+                plugin_skills=lambda: (
+                    self.session_plugins.materialized.resolution.skills
+                ),
             )
         )
         shell_controller = ShellController(derivation.adapter_config.workspace.cwd)
@@ -11045,11 +12478,9 @@ class UnifiedHarnessBackendAdapter(  # noqa: PLR0904 - implements app-server ses
         adapter serves the turn's completions with. They go together on the
         next turn, which ``start_turn`` flushes.
 
-        The agent's prompt is the one part that cannot always follow. Core is
-        handed its instructions when it is created and holds them for life, so a
-        switch before the first turn carries the new agent's prompt and a switch
-        after it changes everything except the prompt. ``/clear`` starts a Core
-        that takes the current one.
+        The agent's prompt follows with the rest: rebuilt here when no turn
+        runs, and by ``_converge`` at the turn's end otherwise, so whatever
+        opens the next turn finds Core on the running agent's prompt.
         """
         # Exclusive for the same reason a config write is serialised: this
         # derives and pushes for itself, so an apply that derived before the
@@ -11060,6 +12491,7 @@ class UnifiedHarnessBackendAdapter(  # noqa: PLR0904 - implements app-server ses
                 await self._commands.apply_config(derivation.session_config)
                 self._deferred.mark_applied()
                 self._adopt_derivation(derivation)
+                await self._tell_running_agent()
                 return
             approval_only = graft_live_approval_policy(
                 self._adapter_config, derivation.adapter_config
@@ -11075,10 +12507,26 @@ class UnifiedHarnessBackendAdapter(  # noqa: PLR0904 - implements app-server ses
             # Last: a failed journal write must not leave the switch half-applied.
             await self._session.record_live_agent_change(approval_only)
 
-    async def _refresh_after_skill_change(self) -> RuntimeSnapshot:
-        await self._context.config_orchestrator.reload(preflight=self._preflight_config)
-        await self._apply_derivation()
-        return self._runtime
+    async def _refresh_after_skill_change(self) -> RuntimeMutationResponse:
+        """A change made during a turn waits for it to end, as the watched skill
+        folders do: the Core binds its skills when the turn starts.
+        """
+        async with self._context.admin_config_lock:
+            await self._context.config_orchestrator.reload(
+                preflight=self._preflight_config
+            )
+            await self._apply_written_config()
+        return RuntimeMutationResponse(
+            runtime=self._runtime, status=self._mutation_status()
+        )
+
+    async def _save_skill_pins(self, pins: tuple[ManifestEntry, ...]) -> None:
+        """``meta.json`` keeps the picks for the next open; the session's store lease
+        holds their versions once the derivation loads them.
+        """
+        self._settings = replace(self._settings, skill_pins=pins)
+        async with self._metadata_lock:
+            await self._persist_session_metadata_locked(bumped_at=None)
 
     async def _preflight_config(self, candidate: VibeConfigSchema) -> None:
         """Refuse a candidate configuration before anything persists it.
@@ -11230,8 +12678,19 @@ class UnifiedHarnessBackendAdapter(  # noqa: PLR0904 - implements app-server ses
         if (task := self._model_catalog_task) is not None and not task.done():
             return
         service = context.model_catalog_service
-        task = asyncio.create_task(self._open_model_catalog())
+        landed: asyncio.Future[None] = asyncio.get_running_loop().create_future()
+        task = asyncio.create_task(self._open_model_catalog(landed))
+        task.add_done_callback(lambda _task: _resolve(landed))
         self._model_catalog_task = task
+        self._model_catalog_pick_wait = (
+            # Failures of its own: a pick's cap must not stop later sessions
+            # from waiting. The readiness wait below records those.
+            ModelCatalogWait(landed, FetchFailures())
+            if model_catalog_pending(
+                orchestrator, service.failures, context.platform_credentials
+            )
+            else None
+        )
         self._model_catalog_wait = (
             ModelCatalogWait(task, service.failures)
             if model_catalog_wait_needed(
@@ -11240,7 +12699,7 @@ class UnifiedHarnessBackendAdapter(  # noqa: PLR0904 - implements app-server ses
             else None
         )
 
-    async def _open_model_catalog(self) -> None:
+    async def _open_model_catalog(self, landed: asyncio.Future[None]) -> None:
         """Load the catalog held for this session's account, once the process
         holds one: at once from memory or disk, else after the first fetch.
         Fail-open: without one, the session runs on local config.
@@ -11258,6 +12717,10 @@ class UnifiedHarnessBackendAdapter(  # noqa: PLR0904 - implements app-server ses
             logger.exception("Failed to apply the model catalog to config")
             _report(exc, "apply_model_catalog")
             return
+        finally:
+            # Before the announce wait below: a model pick in session/start
+            # waits for this, and the session is announced only once it ends.
+            _resolve(landed)
         if not changed:
             return
         await self.wait_announced()
@@ -11270,8 +12733,30 @@ class UnifiedHarnessBackendAdapter(  # noqa: PLR0904 - implements app-server ses
         if (wait := self._model_catalog_wait) is not None:
             await wait.wait()
 
+    async def _wait_for_model_to_arrive(self, name: str) -> None:
+        """Hold a pick of a model the config does not offer yet while a fetch
+        that may bring it runs: the eval, then the catalog, which the eval can
+        turn on. Each within the cap the first turn has.
+        """
+        if self._offers_model(name):
+            return
+        if (wait := self._experiments_wait) is not None:
+            await wait.wait()
+            if self._offers_model(name):
+                return
+        if (wait := self._model_catalog_pick_wait) is not None:
+            await wait.wait()
+
+    def _offers_model(self, name: str) -> bool:
+        config = self._context.config_orchestrator.config
+        return config.resolve_model_name(name) in config.models
+
     async def _wait_for_first_turn_fetches(self) -> None:
         await self._wait_for_cold_integrations()
+        # A pick a cleanup took is being fetched again: the turn that names it
+        # waits for it, within the cap.
+        if (wait := self._skill_restore_wait) is not None:
+            await wait.wait()
         # Caps that count from session open cost the longer one. A catalog the
         # eval turns on starts its cap when the eval lands, so the two add up.
         # The eval wait is for turns only: ``session/ready/wait`` keeps waiting
@@ -11369,23 +12854,122 @@ class UnifiedHarnessBackendAdapter(  # noqa: PLR0904 - implements app-server ses
 
         A queued turn or a scheduled loop's turn is opened by the Session and
         never reaches ``start_turn``, so whenever one opens next the choices it
-        runs on are pinned here, the way ``start_turn`` pins its own.
+        runs on are pinned here, the way ``start_turn`` pins its own. A turn
+        refused there still lets the write and the tools land.
         """
         await self._load_remote_values()
-        await self._pin_for_session_opened_turn()
-        await self._converge()
-        await self._publish_integrations()
-        await self._reload_parked_plugins()
+        try:
+            await self._pin_for_session_opened_turn()
+        finally:
+            await self._converge()
+            await self._publish_integrations()
+            await self._reload_parked_plugins()
+
+    def _settle_configuration_at_turn_end(self) -> asyncio.Task[None]:
+        """Converge once a turn's ``turn_terminated`` arrives, off the event stream.
+
+        The Session API path's turn boundary: the target runtime does not call
+        ``_settle_configuration`` back, so the event is what tells the app
+        server the turn is over. A model switch lands through ``config/write``
+        (``SessionApiCommands.apply_config``). The local runtime still calls
+        back too, and whichever comes first lands the write: the other finds
+        nothing parked.
+
+        Started, not awaited, by the stream: converging waits for the
+        configuration lock, and a holder of it can be waiting on the stream --
+        a worktree move reads the session under it, and the read waits until
+        the stream publishes the read's last event. So the client can hear the
+        turn ended before the pick is announced, but a turn it starts waits for
+        the pick to land (``_start_turn``).
+
+        Whether a turn still runs is read from the local Session's
+        ``active_turn_id`` (the ``turn_running`` of ``_deferred``), which the
+        local runtime clears before this event arrives. The target runtime has
+        no local Session: there it must come from the Session API (HAR-1183).
+        """
+
+        async def converge() -> None:
+            # Nothing awaits this task: a failure is logged, and what it could
+            # not land stays parked for the next boundary.
+            try:
+                await self._converge()
+            except Exception:
+                logger.exception(
+                    "Failed to converge the configuration at the end of a turn"
+                    " for session_id=%s",
+                    self.session_id,
+                )
+
+        task = asyncio.create_task(converge(), name="vibe-turn-end-converge")
+        self._background_announcements.add(task)
+        task.add_done_callback(self._background_announcements.discard)
+        self._turn_end_convergence = task
+        return task
+
+    async def _tell_running_agent(self) -> None:
+        """Keep Core's system prompt on the agent the session runs whenever no
+        turn runs: an idle switch and every turn boundary end here, so no way
+        of opening a turn has to. The next request is uncached once. A Core
+        not started yet takes the whole new configuration, prompt included.
+        """
+        if self._closed or self._session.active_turn_id is not None:
+            return
+        agents = self._context.agents
+        if agents is None:
+            return
+        current = agents.active_agent.name
+        if self._prompt_agent == current:
+            return
+        if self._session.ephemeral:
+            self._prompt_agent = current
+            return
+        try:
+            await _harness_call(
+                self._session.reconfigure_system_instructions(
+                    self._running.core_config.system_instructions
+                )
+            )
+            self._prompt_agent = current
+        except SessionBackendError as exc:
+            if not _is_turn_conflict(exc):
+                raise
+            # A turn took the boundary first; the next one rebuilds it.
 
     async def _pin_for_session_opened_turn(self) -> None:
         # Both settles of a turn boundary can get here at once: the one the
         # turn's end fires and the one the queue promotion awaits. One pins,
         # the other finds the choices already recorded.
         async with self._session_opened_turn_pinning:
-            if (
-                self._queued_turn_opens_next() or self._scheduled_turn_opens_next()
-            ) and await self._pin_session_model_choice():
+            queued = self._queued_turn_opens_next()
+            if not (queued or self._scheduled_turn_opens_next()):
+                return
+            await self._unlock_active_model()
+            self._require_runnable_model_for_session_opened_turn(queued=queued)
+            if await self._pin_session_model_choice():
                 self._runtime_unannounced = True
+
+    def _require_runnable_model_for_session_opened_turn(self, *, queued: bool) -> None:
+        """Refuse the turn the Session opens on a locked model.
+
+        The model can be locked since the turn was queued: a pick parked during
+        the last turn lands at this boundary. Raising makes the Session pause
+        its queue rather than promote the turn; a queue pauses with no message
+        of its own, so the user is told why, once per queued turn and model.
+        A scheduled loop reports its own failure.
+        """
+        try:
+            self._require_runnable_active_model()
+        except SessionBackendError as exc:
+            if queued:
+                model = self._context.config_orchestrator.config.get_active_model()
+                notice = (str(self._session.turn_queue.items[0].id), model.alias)
+                if self._queued_turn_upsell_notice != notice:
+                    self._queued_turn_upsell_notice = notice
+                    self._publish_notice(
+                        f"The queue is paused: {exc}. Pick another model, "
+                        "then resume the queue."
+                    )
+            raise
 
     def _scheduled_turn_opens_next(self) -> bool:
         """Whether a scheduled loop's turn is opening, and the Session admits it.
@@ -11496,8 +13080,47 @@ class UnifiedHarnessBackendAdapter(  # noqa: PLR0904 - implements app-server ses
         self._skill_watch_started = True
         self._follow_skill_roots()
 
+    async def _restore_picked_skills(self) -> list[str]:
+        return await restore_session_skills(
+            self._context.config_orchestrator.config,
+            self._settings.skill_pins,
+            credentials=self._context.platform_credentials,
+        )
+
+    def _report_restored_skills(self, names: Sequence[str]) -> None:
+        self._publish_or_hold_notice(
+            "The cloud skills picked in this session are available again: "
+            f"{', '.join(names)}.",
+            level="info",
+        )
+
+    def _report_unrestored_skills(self, names: Sequence[str], final: bool) -> None:
+        listed = f": {', '.join(names)}" if names else ""
+        outcome = (
+            "Pick them again to retry."
+            if final
+            else "This session runs without them until a retry succeeds."
+        )
+        self._publish_or_hold_notice(
+            f"Could not download the cloud skills picked in this session{listed}. "
+            f"{outcome}"
+        )
+
+    def _publish_or_hold_notice(self, message: str, *, level: str = "warning") -> None:
+        if self._events_subscribed or self._notices_subscribed:
+            self._publish_notice(message, level=level)
+            return
+        self._pending_startup_notices.append((message, level))
+
     def start_registry_sync(self) -> None:
-        self._registry_sync.start()
+        restore = self._registry_sync.start(restore=bool(self._settings.skill_pins))
+        if restore is not None:
+            self._skill_restore_wait = FetchWait(
+                restore,
+                name="The session's picked cloud skills",
+                cap_seconds=_SKILL_RESTORE_WAIT_CAP_SECONDS,
+                failures=FetchFailures(),
+            )
 
     def _skill_watch_wanted(self) -> bool:
         return (
@@ -11562,6 +13185,19 @@ class UnifiedHarnessBackendAdapter(  # noqa: PLR0904 - implements app-server ses
             await asyncio.sleep(delay)
             delay = min(delay * 2, _SKILL_WATCH_RETRY_MAX_S)
 
+    async def reload_config_files(self) -> None:
+        """Take a setting another connection wrote to the config files.
+
+        Applied at once when idle, otherwise at the turn boundary, and
+        announced only once the session runs it.
+        """
+        context = self._context
+        async with context.admin_config_lock:
+            await context.config_orchestrator.reload_files()
+            changed = await self._apply_derivation_when_idle()
+        if changed:
+            await self._announce_runtime()
+
     async def _rederive_after_skill_change(self) -> None:
         logger.debug(
             "Skill directories changed; re-deriving session_id=%s", self.session_id
@@ -11587,10 +13223,397 @@ class UnifiedHarnessBackendAdapter(  # noqa: PLR0904 - implements app-server ses
             await self._apply_derivation_when_idle()
         return account
 
+    def record_spawned_by(self, starter_session_id: str, *, attached: bool) -> None:
+        """Announced with ``vibe.new_session``, which a start sends after this."""
+        self._spawned_by = (starter_session_id, "attached" if attached else "detached")
+
     def expect_handed_task(self, hops: int) -> None:
-        """The first turn carries a task another session handed over."""
+        """The first turn carries a task another session handed over, and the
+        hops that led to it; only an attached session reports back.
+        """
         self._handed_task_pending = True
         self._message_hops = hops
+
+    def _owed_replies(self) -> list[OwedReply]:
+        return list(self._metadata.owed_replies) if self._metadata is not None else []
+
+    async def _owe_reply_or_abandon(
+        self,
+        result: SessionBackendResult[TurnStartResponse],
+        sender: str,
+        turn_id: str,
+        hops: int,
+    ) -> SessionBackendResult[TurnStartResponse]:
+        """A turn whose owed reply could not be saved is let go unstarted.
+        One the Harness lets go when its response is never sent never runs,
+        so it owes nothing; a turn already running, with nothing to let go,
+        keeps its reply.
+        """
+        abandon = getattr(result, "on_response_abandoned", None)
+        try:
+            await self._owe_reply(sender, turn_id, hops)
+        except BaseException:
+            if abandon is not None:
+                abandon()
+            raise
+        try:
+            await self._reply_if_already_ended(turn_id)
+        except Exception:
+            # Owed and saved: the turn's end, or the next open, sends it.
+            logger.warning("Failed to read whether a turn ended", exc_info=True)
+
+        if abandon is None:
+            return result
+
+        def abandoned() -> None:
+            abandon()
+            task = asyncio.create_task(
+                self._settle_owed_reply(owed_reply(sender, turn_id, hops)),
+                name="vibe-session-reply-abandoned",
+            )
+            self._background_announcements.add(task)
+            task.add_done_callback(self._background_announcements.discard)
+
+        return SessionBackendResult(
+            response=result.response,
+            after_response=getattr(result, "after_response", None),
+            on_response_abandoned=abandoned,
+            runtime_updated=getattr(result, "runtime_updated", False),
+        )
+
+    async def _reply_if_already_ended(self, turn_id: str) -> None:
+        """A runtime reached through the Session API may run the turn before
+        answering, so it can end before its owed reply was saved.
+        """
+        latest = (
+            await self._session.read(
+                HarnessSessionReadParams(session_id=self.session_id, history_limit=1)
+            )
+        ).snapshot.state.latest_turn
+        if latest is not None and latest.id == turn_id:
+            self._reply_when_turn_ends(_public_turn(latest))
+
+    async def _owe_reply(self, sender: str, turn_id: str, hops: int) -> None:
+        """Saved before the turn can end, so a restart cannot lose it: the
+        Harness starts the turn only once the response is sent.
+        """
+        if not replies_to(self._context.session_peers):
+            return
+        owed = owed_reply(sender, turn_id, hops)
+        self._observe_turn_ends()
+        async with self._metadata_lock:
+            metadata = self._metadata or await self._persist_session_metadata_locked(
+                bumped_at=None
+            )
+            # A message joining a turn already owed to its sender adds no
+            # second reply; the longer chain of the two counts.
+            others = [
+                reply
+                for reply in metadata.owed_replies
+                if (reply.to_session_id, reply.turn_id) != (sender, turn_id)
+            ]
+            same = [reply for reply in metadata.owed_replies if reply not in others]
+            owed = owed_reply(
+                sender, turn_id, max([hops, *(reply.hops for reply in same)])
+            ).model_copy(update={"text": next((r.text for r in same if r.text), None)})
+            if same == [owed]:
+                return
+            await self._store_metadata_locked(
+                metadata.model_copy(update={"owed_replies": [*others, owed]})
+            )
+
+    async def _settle_owed_reply(self, owed: OwedReply) -> None:
+        async with self._metadata_lock:
+            metadata = self._metadata
+            if metadata is None:
+                return
+            kept = [
+                other
+                for other in metadata.owed_replies
+                if (other.to_session_id, other.turn_id)
+                != (owed.to_session_id, owed.turn_id)
+            ]
+            if len(kept) == len(metadata.owed_replies):
+                return
+            await self._store_metadata_locked(
+                metadata.model_copy(update={"owed_replies": kept})
+            )
+        if not kept:
+            # A client holding the session only to send its reply can let go.
+            self._publish_session_metadata(
+                _SessionMetadataProjection(
+                    session_id=self.session_id,
+                    patch=(
+                        JsonPatchOperation(op="add", path="/owesReply", value=False),
+                    ),
+                )
+            )
+
+    def _reply_when_turn_ends(self, turn: PublicTurn) -> None:
+        if turn.status is PublicTurnStatus.IN_PROGRESS:
+            return
+        self._send_replies_owed_for(turn.id, turn)
+
+    def _send_replies_owed_for(self, turn_id: str, turn: PublicTurn | None) -> None:
+        owed = [reply for reply in self._owed_replies() if reply.turn_id == turn_id]
+        if not owed or turn_id in self._replies_in_flight:
+            return
+        peers = self._context.session_peers
+        if peers is None:
+            return
+        task = asyncio.create_task(
+            self._send_owed_replies(peers, owed, turn), name="vibe-session-reply"
+        )
+        self._replies_in_flight[turn_id] = task
+        task.add_done_callback(lambda _task: self._replies_in_flight.pop(turn_id, None))
+
+    async def _send_owed_replies(
+        self, peers: SessionPeers, owed: list[OwedReply], turn: PublicTurn | None
+    ) -> None:
+        """``turn`` is None for a turn older than the latest, whose reply
+        text was saved when it ended.
+        """
+        route = ReplyRoute(
+            peers=peers,
+            session_id=self.session_id,
+            sender=self._reply_sender,
+            busy=self._finishing_turn,
+            final_message=self._final_message,
+        )
+        texts: list[tuple[OwedReply, str]] = []
+        for reply in owed:
+            text = reply.text or await read_reply_text(
+                route, turn or _ended_turn(self.session_id, reply.turn_id)
+            )
+            texts.append((reply, text))
+            if reply.text is None:
+                try:
+                    await self._save_reply_text(reply, text)
+                except Exception:
+                    # Still sent now; only a restart before then loses it.
+                    logger.warning("Failed to save a reply's text", exc_info=True)
+        await settled(route)
+        for reply, text in texts:
+            if await send_reply(route, reply, text):
+                await self._settle_owed_reply(reply)
+
+    async def _save_reply_text(self, owed: OwedReply, text: str) -> None:
+        key = (owed.to_session_id, owed.turn_id)
+        async with self._metadata_lock:
+            metadata = self._metadata
+            if metadata is None:
+                return
+            await self._store_metadata_locked(
+                metadata.model_copy(
+                    update={
+                        "owed_replies": [
+                            other.model_copy(update={"text": text})
+                            if (other.to_session_id, other.turn_id) == key
+                            else other
+                            for other in metadata.owed_replies
+                        ]
+                    }
+                )
+            )
+
+    async def _reply_sender(self) -> SessionMessageSender:
+        session = (
+            await self._session.read(
+                HarnessSessionReadParams(session_id=self.session_id, history_limit=1)
+            )
+        ).snapshot.state.session
+        preview = project_session_message_preview(
+            project_loop_preview(public_session_preview(session.preview))
+        )
+        return SessionMessageSender(
+            session_id=self.session_id, title=session.title or preview or None
+        )
+
+    async def _final_message(self, turn_id: str) -> str | None:
+        result = await self._session.read(
+            HarnessSessionReadParams(session_id=self.session_id, history_limit=50)
+        )
+        return final_message(result.snapshot.state.history.entries, turn_id)
+
+    def deliver_replies_owed_on_open(self) -> None:
+        """In the background, so a session opens even while reading what it
+        owes fails; a failed read is tried again until the session closes.
+        """
+        if not self._owed_replies():
+            return
+        task = asyncio.create_task(
+            self._deliver_replies_owed_until_read(), name="vibe-session-reply-open"
+        )
+        self._replies_in_flight[_OPEN_REPLIES] = task
+        task.add_done_callback(
+            lambda _task: self._replies_in_flight.pop(_OPEN_REPLIES, None)
+        )
+
+    async def _deliver_replies_owed_until_read(self) -> None:
+        await retrying(
+            self._deliver_replies_owed_on_open,
+            "Failed to send the replies a session owes; retrying",
+            self.session_id,
+        )
+
+    async def _deliver_replies_owed_on_open(self) -> None:
+        """A turn that ended before a restart sent nothing: send it now. One
+        still running sends when it ends.
+        """
+        owed = self._owed_replies()
+        if not owed:
+            return
+        self._observe_turn_ends()
+        result = await self._session.read(
+            HarnessSessionReadParams(session_id=self.session_id, history_limit=1)
+        )
+        latest = result.snapshot.state.latest_turn
+        active = self._session.active_turn_id
+        for turn_id in dict.fromkeys(reply.turn_id for reply in owed):
+            if turn_id == active:
+                continue
+            if latest is not None and latest.id == turn_id:
+                # A turn a restart is still recovering sends when it ends.
+                self._reply_when_turn_ends(_public_turn(latest))
+                continue
+            # A turn older than the latest saved its text when it ended,
+            # unless the app stopped within moments of that.
+            self._send_replies_owed_for(turn_id, None)
+
+    def _follow_keep_awake(self) -> None:
+        """Hold the machine awake while the root's turn runs or waits on the user.
+
+        Read from the Runtime session rather than a client's stream, so a turn
+        no client follows (a loop, a message from another session) counts too,
+        and a client leaving never leaves the request held. The setting is read
+        at each poll, so a change applies mid-turn, a moved session's included.
+        """
+        if self._closed or self._keep_awake_task is not None:
+            return
+        self._keep_awake_task = asyncio.create_task(
+            self._poll_keep_awake(), name="vibe-keep-awake"
+        )
+
+    async def _poll_keep_awake(self) -> None:
+        keep_awake = self._context.keep_awake
+        try:
+            while True:
+                try:
+                    active = self._needs_keep_awake()
+                except Exception:
+                    logger.warning(
+                        "Could not read whether session_id=%s runs a turn",
+                        self.session_id,
+                        exc_info=True,
+                    )
+                    active = False
+                keep_awake.update(self, active=active)
+                await asyncio.sleep(
+                    KEEP_AWAKE_POLL_S if active else KEEP_AWAKE_IDLE_POLL_S
+                )
+        finally:
+            keep_awake.update(self, active=False)
+
+    def _needs_keep_awake(self) -> bool:
+        """The setting first: with it off, the session's Core is never asked.
+
+        Vibe Desktop keeps the machine awake for its sessions itself, under its
+        own setting, so a session whose client is Desktop never asks.
+        """
+        return (
+            self._context.config_orchestrator.config.keep_awake
+            and not self._runs_for_desktop()
+            and self._session.active_turn_id is not None
+        )
+
+    def _runs_for_desktop(self) -> bool:
+        if self._services is None:
+            return False
+        try:
+            return self._services.client_info().entrypoint == "desktop"
+        except RuntimeError:
+            # No client attached right now: a session it left keeps running.
+            return False
+
+    def _stop_keep_awake(self) -> None:
+        task, self._keep_awake_task = self._keep_awake_task, None
+        if task is not None:
+            task.cancel()
+        self._context.keep_awake.update(self, active=False)
+
+    def _observe_turn_ends(self) -> None:
+        """Hears every turn end, whether or not a client follows the session."""
+        if not self._observing_turn_ends:
+            self._session.observe_events(_REPLY_OBSERVER_ID, self._observe_turn_end)
+            self._observing_turn_ends = True
+
+    def _observe_turn_end(self, event: Mapping[str, object]) -> None:
+        turn = _ended_root_turn(event, self.session_id)
+        if turn is not None:
+            self._reply_when_turn_ends(turn)
+
+    @property
+    def project(self) -> SessionProject | None:
+        return self._project
+
+    def park_project_move(self, move: Callable[[], Coroutine[Any, Any, None]]) -> None:
+        """Run ``move`` once the running turn completes; a later call replaces it."""
+        self._parked_project_move = move
+        if not self._observing_project_moves:
+            self._session.observe_events(
+                _PROJECT_MOVE_OBSERVER_ID, self._move_when_turn_ends
+            )
+            self._observing_project_moves = True
+
+    def cancel_project_move(self) -> bool:
+        cancelled = self._parked_project_move is not None
+        self._parked_project_move = None
+        return cancelled
+
+    def _move_when_turn_ends(self, event: Mapping[str, object]) -> None:
+        move = self._parked_project_move
+        turn = _ended_root_turn(event, self.session_id)
+        if move is None or turn is None:
+            return
+        self._parked_project_move = None
+        # Stopping the turn is the user's veto on the move it asked for.
+        if turn.status is not PublicTurnStatus.COMPLETED:
+            return
+        # Not a background announcement: a close waits for it rather than cancel it.
+        self._project_move_task = asyncio.create_task(
+            move(), name="vibe-session-project-move"
+        )
+
+    async def _await_project_move(self) -> None:
+        """A turn sent as the agent's move lands waits for it, and runs in the new folder."""
+        task = self._project_move_task
+        if task is not None and not task.done():
+            await asyncio.wait({task})
+
+    def _finishing_turn(self) -> bool:
+        """The ended turn's work still settles; a turn started since does not
+        hold its reply back.
+        """
+        return self._session.active_turn_id is None and self._has_turn_work()
+
+    async def _await_turn_settled(self) -> None:
+        """Wait out the work that trails a turn the client was told has ended.
+
+        A turn's end is published before the Harness reaps its task, drains the
+        queue and finishes the title, and those keep the session busy. A client
+        acting on that end would otherwise be refused an operation that needs
+        the session idle. Bounded: work that outlasts the wait is refused as
+        before, and a turn started meanwhile is not waited for. Neither is a
+        paused queue: its turns wait for the user, not for the ended turn.
+        """
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + _TURN_SETTLE_SECONDS
+        while (
+            self._finishing_turn()
+            and not self._session.turn_queue.paused
+            and loop.time() < deadline
+        ):
+            await asyncio.sleep(_TURN_SETTLE_POLL_SECONDS)
 
     @property
     def message_hops(self) -> int:
@@ -11635,11 +13658,29 @@ class UnifiedHarnessBackendAdapter(  # noqa: PLR0904 - implements app-server ses
             # A refused start leaves the running turn its hops.
             self._message_hops = hops_before
             raise
-        # Only once it started: a retry of a failed start is still the task.
+        # Only once it started and its reply is owed: a retry of a failed
+        # start is still the task.
         if handed_task:
+            started_by = self.started_by_session_id
+            if started_by is not None:
+                result = await self._owe_reply_or_abandon(
+                    result, started_by, result.response.turn.id, self._message_hops
+                )
             self._handed_task_pending = False
         await self._record_pending_seat()
+        await self.stamp_owner()
         return result
+
+    async def stamp_owner(self) -> None:
+        """Make this connection's client the session's owner, the one offered
+        a turn a stopped process leaves running in it. A client with no
+        account owns no turn: the session is then offered to no one.
+        """
+        services = self._services
+        host = self._host
+        if host is None or not isinstance(services, SessionBackendClientOwner):
+            return
+        await host.stamp_owner(self.session_id, services.client_owner())
 
     def _with_report_back_instructions(
         self, params: TurnStartParams
@@ -11659,8 +13700,11 @@ class UnifiedHarnessBackendAdapter(  # noqa: PLR0904 - implements app-server ses
     async def _start_turn(
         self, params: TurnStartParams, *, prepared: bool = False
     ) -> SessionBackendResult[TurnStartResponse]:
+        await self._await_project_move()
         self._require_no_session_rewrite()
         self._require_model_owned_root(params.session_id)
+        await self._unlock_active_model()
+        self._require_runnable_active_model()
         # A failed preparation publishes its own worktree entry. Taking the
         # deferred path afterwards would publish that failure a second time,
         # including when turn/start runs during the failure notify.
@@ -11678,10 +13722,20 @@ class UnifiedHarnessBackendAdapter(  # noqa: PLR0904 - implements app-server ses
                 self._deferred_turn_claimed = False
                 if not isinstance(exc, Exception) or self._session.ephemeral:
                     raise
+        convergence = self._turn_end_convergence
+        if convergence is not None and not convergence.done():
+            # A turn started the moment the last one ended runs on what was
+            # picked during it. Shielded: a start given up on leaves it running.
+            await asyncio.shield(convergence)
+            # A move waiting for the configuration takes it as the convergence
+            # lets go, so it may have begun meanwhile.
+            self._require_no_session_rewrite()
         await self._await_deferred_setup()
         # Held here too, not only in session/ready/wait: a client may start a
         # turn without waiting for readiness.
         await self._wait_for_first_turn_fetches()
+        # Again: the catalog or the eval that just landed may lock the model.
+        self._require_runnable_active_model()
         runtime_updated = await self._pin_session_model_choice()
         if not prepared:
             params = await self._prepared_turn_params(params, inject_skill=True)
@@ -11694,10 +13748,7 @@ class UnifiedHarnessBackendAdapter(  # noqa: PLR0904 - implements app-server ses
         await self._report_unlanded_worktree()
         was_ephemeral = self._session.ephemeral
         result = await _harness_call(self._commands.start_turn(params))
-        await self._persist_scheduled_loops_after_promotion(was_ephemeral=was_ephemeral)
-        await self._persist_session_metadata_after_promotion(
-            was_ephemeral=was_ephemeral
-        )
+        await self._persist_after_promotion(was_ephemeral=was_ephemeral)
         turn = result.response
         return await self._accepted_user_activity_result(
             TurnStartResponse(
@@ -11710,6 +13761,7 @@ class UnifiedHarnessBackendAdapter(  # noqa: PLR0904 - implements app-server ses
                 last_event_id=self._event_id,
             ),
             after_response=result.after_response,
+            on_response_abandoned=getattr(result, "on_response_abandoned", None),
             runtime_updated=runtime_updated,
         )
 
@@ -11764,12 +13816,7 @@ class UnifiedHarnessBackendAdapter(  # noqa: PLR0904 - implements app-server ses
             )
 
         async def after_promotion() -> None:
-            await self._persist_scheduled_loops_after_promotion(
-                was_ephemeral=was_ephemeral
-            )
-            await self._persist_session_metadata_after_promotion(
-                was_ephemeral=was_ephemeral
-            )
+            await self._persist_after_promotion(was_ephemeral=was_ephemeral)
 
         async def prepare(
             context: HarnessDeferredTurnPreparationContext,
@@ -11790,6 +13837,7 @@ class UnifiedHarnessBackendAdapter(  # noqa: PLR0904 - implements app-server ses
                 # written fails the turn without marking a ready worktree failed.
                 await self._apply_model_pick_after_setup()
                 await self._wait_for_first_turn_fetches()
+                self._require_runnable_active_model()
                 await self._settle_reserved_turn_configuration()
                 if await self._pin_session_model_choice():
                     await self._announce_runtime()
@@ -11948,11 +13996,14 @@ class UnifiedHarnessBackendAdapter(  # noqa: PLR0904 - implements app-server ses
         # Who started the running turn decides; a queued message only decides
         # for the turn it starts.
         self._announce_first_use()
+        await self._await_project_move()
         self._require_no_session_rewrite()
         await self._await_deferred_setup()
         # The Session starts a queued turn itself, never through start_turn,
         # so the held catalog fetch and eval are waited for here too.
         await self._wait_for_first_turn_fetches()
+        await self._unlock_active_model()
+        self._require_runnable_active_model()
         # The session model is deliberately left alone: a queued turn is
         # promoted by the Session, whose settle hook (`_settle_configuration`)
         # lands the parked configuration and pins what the turn runs on.
@@ -11990,6 +14041,7 @@ class UnifiedHarnessBackendAdapter(  # noqa: PLR0904 - implements app-server ses
         if queue_item_id is not None:
             self._promoted_queue_item_ids.add(queue_item_id)
         await self._record_pending_seat()
+        await self.stamp_owner()
         return SessionBackendResult(
             response=response, after_response=result.after_response
         )
@@ -12009,6 +14061,20 @@ class UnifiedHarnessBackendAdapter(  # noqa: PLR0904 - implements app-server ses
             )
         message_id = entry.entry_id or str(uuid4())
         key = params.idempotency_key
+        if (
+            key is not None
+            and key not in self._session_messages_delivered
+            and (held := await self._held_entry(message_id)) is not None
+        ):
+            # Sent again after a restart lost the record of the first: a
+            # resend that took the other path (a turn start after a steer)
+            # would fail a message that was delivered. The turn it reached
+            # settles its sender.
+            turn_id = held.get("turnId")
+            self._session_messages_delivered[key] = TurnEnqueueResponse(
+                queue_item_id=message_id,
+                turn_id=turn_id if isinstance(turn_id, str) else None,
+            )
         for attempt in range(_SESSION_MESSAGE_DELIVERY_ATTEMPTS):
             if attempt:
                 await asyncio.sleep(_SESSION_MESSAGE_RETRY_SECONDS)
@@ -12020,8 +14086,10 @@ class UnifiedHarnessBackendAdapter(  # noqa: PLR0904 - implements app-server ses
                 ):
                     return SessionBackendResult(response=response)
                 await self._refuse_a_peer_message_if_archived()
+                joined_turn_id = self._session.active_turn_id
                 delivered = await self._join_running_turn(params, entry, message_id)
                 waits = False
+                turn_id = joined_turn_id if delivered is not None else None
                 if delivered is None and params.delivery == "queue":
                     delivered = await self._leave_session_message_for_next_turn(
                         entry, message_id
@@ -12031,14 +14099,20 @@ class UnifiedHarnessBackendAdapter(  # noqa: PLR0904 - implements app-server ses
                     delivered = await self._start_session_message_turn(
                         params, entry, message_id
                     )
+                    if delivered is not None:
+                        turn_id = delivered.response.turn.id
                 if delivered is not None:
                     response = TurnEnqueueResponse(
-                        queue_item_id=message_id, waits=waits
+                        queue_item_id=message_id, waits=waits, turn_id=turn_id
                     )
                     if key is not None:
                         self._session_messages_delivered[key] = response
                     return SessionBackendResult(
-                        response=response, after_response=delivered.after_response
+                        response=response,
+                        after_response=delivered.after_response,
+                        on_response_abandoned=getattr(
+                            delivered, "on_response_abandoned", None
+                        ),
                     )
         raise _peer_refusal(PEER_REFUSAL_BUSY, "The session is busy. Try again.")
 
@@ -12089,20 +14163,12 @@ class UnifiedHarnessBackendAdapter(  # noqa: PLR0904 - implements app-server ses
                     "The session's queue is paused until the user resumes it.",
                 ) from exc
             return None
+        if params.sender is not None and not params.reply:
+            result = await self._owe_reply_or_abandon(
+                result, params.sender.session_id, result.response.turn.id, params.hops
+            )
         await self._record_pending_seat()
         return result
-
-    async def _archive_gate_once_settled(
-        self, params: SessionArchiveParams
-    ) -> asyncio.Lock:
-        """Waits for a turn's work to settle, outside the gate, so a message
-        can still land meanwhile. A background process is refused at once.
-        """
-        loop = asyncio.get_running_loop()
-        deadline = loop.time() + _PEER_ARCHIVE_SETTLE_SECONDS
-        while params.require_idle and self._has_turn_work() and loop.time() < deadline:
-            await asyncio.sleep(_PEER_ARCHIVE_POLL_SECONDS)
-        return self._archive_gate
 
     def _has_turn_work(self) -> bool:
         """An older Harness has no ``has_turn_work``; its running turn is all
@@ -12197,7 +14263,30 @@ class UnifiedHarnessBackendAdapter(  # noqa: PLR0904 - implements app-server ses
         # Only raised: a message joining the user's turn must not let two
         # sessions keep it going past the hop limit by replying into it.
         self._message_hops = max(self._message_hops, params.hops)
+        # Only a turn that session started replies to it: a question joining
+        # the user's turn, or another session's, is answered by that turn.
+        if params.sender is not None and any(
+            owed.turn_id == turn_id and owed.to_session_id == params.sender.session_id
+            for owed in self._owed_replies()
+        ):
+            await self._owe_reply(params.sender.session_id, turn_id, params.hops)
         return result
+
+    async def _held_entry(self, entry_id: str) -> Mapping[str, Any] | None:
+        """Within the latest history page, which a resend lands well inside."""
+        result = await self._session.read(
+            HarnessSessionReadParams(
+                session_id=self.session_id, history_limit=_HISTORY_PAGE_WINDOW
+            )
+        )
+        return next(
+            (
+                entry
+                for entry in result.snapshot.state.history.entries
+                if entry.get("id") == entry_id
+            ),
+            None,
+        )
 
     async def _refuse_a_peer_message_if_archived(self) -> None:
         # From disk: another process may have archived the session since this
@@ -12238,10 +14327,26 @@ class UnifiedHarnessBackendAdapter(  # noqa: PLR0904 - implements app-server ses
         )
 
     async def pin_started_agent(self) -> None:
-        """Record the agent a start chose as the session's, so a reopen restores it."""
+        """Record the agent and policy a start chose, so a reopen restores them."""
+        await self._pin_session_selection()
+
+    async def _pin_session_selection(self) -> None:
+        """Save the running agent and approval policy.
+
+        On the default agent only the agent pin is written, and it holds the
+        policy: a build from before agents and policies split reads that back
+        as its mode and rewrites only that pin, so a second pin could disagree
+        with its last pick. A custom agent, which those builds cannot run,
+        names its policy apart.
+        """
+        agents = self._context.agents
+        agent = agents.active_agent.name
+        policy = agents.active_policy.name
+        on_default = agent == BuiltinAgentName.DEFAULT
         await self._persist_pin(
-            SessionPin.AGENT_NAME, self._context.agents.active_profile.name
+            SessionPin.APPROVAL_POLICY, "" if on_default else policy
         )
+        await self._persist_pin(SessionPin.AGENT_NAME, policy if on_default else agent)
 
     async def _persist_pin(self, pin: SessionPin, value: str) -> bool:
         """Save one session pin and, on the Session API path, announce it.
@@ -12260,11 +14365,13 @@ class UnifiedHarnessBackendAdapter(  # noqa: PLR0904 - implements app-server ses
                 "model": pins.model,
                 "reasoning_effort": pins.reasoning_effort,
                 "agent": pins.agent,
+                "approval_policy": pins.approval_policy,
             }
         )
         patch = make_json_patch(
             state.session.model_dump(mode="json", by_alias=True),
             session.model_dump(mode="json", by_alias=True),
+            whole_keys=SESSION_WHOLE_KEYS,
         )
         if patch:
             self._publish_session_metadata(
@@ -12352,9 +14459,7 @@ class UnifiedHarnessBackendAdapter(  # noqa: PLR0904 - implements app-server ses
         a reader of the session's storage could tell. A pin a reopen could not
         apply, because its agent is gone, is replaced by the agent that runs.
         """
-        await self._persist_pin(
-            SessionPin.AGENT_NAME, self._context.agents.active_profile.name
-        )
+        await self._pin_session_selection()
 
     async def read_turn_queue(
         self, params: TurnQueueReadParams
@@ -12605,6 +14710,9 @@ class UnifiedHarnessBackendAdapter(  # noqa: PLR0904 - implements app-server ses
     ) -> SessionBackendResult[TurnInterruptResponse]:
         self._require_model_owned_root(params.session_id)
         result = await _harness_call(self._commands.interrupt_turn(params))
+        # The client's interrupt is the user's (Esc, the stop button): a goal
+        # turn it ends pauses the goal, even if a queued turn starts at once.
+        self._record_interrupt_reason(params.expected_turn_id, CLIENT_INTERRUPT)
         response = result.response
         harness_after_response = result.after_response
         harness_on_response_abandoned = result.on_response_abandoned
@@ -12668,10 +14776,7 @@ class UnifiedHarnessBackendAdapter(  # noqa: PLR0904 - implements app-server ses
         self._announce_first_use()
         was_ephemeral = bool(getattr(self._session, "ephemeral", True))
         result = cast(Any, await _harness_call(self._session.inject_context(params)))
-        await self._persist_scheduled_loops_after_promotion(was_ephemeral=was_ephemeral)
-        await self._persist_session_metadata_after_promotion(
-            was_ephemeral=was_ephemeral
-        )
+        await self._persist_after_promotion(was_ephemeral=was_ephemeral)
         await self._record_pending_seat()
         response = result.response
         return SessionBackendResult(
@@ -12687,7 +14792,21 @@ class UnifiedHarnessBackendAdapter(  # noqa: PLR0904 - implements app-server ses
             after_response=result.after_response,
         )
 
+    async def read_open_callbacks(self) -> list[PublicCallbackEntry]:
+        """The open callbacks to send again to a client that attaches.
+
+        On the Session API path, they come from the Session API, so they do
+        not depend on the local runtime.
+        """
+        if self._api_path is not None:
+            return await self._api_path.read_open_callbacks()
+        return self.open_callbacks()
+
     def open_callbacks(self) -> list[PublicCallbackEntry]:
+        """The open callbacks, read from the local runtime when there is one.
+
+        For a client that attaches, use ``read_open_callbacks``.
+        """
         if self._host is not None:
             return [
                 with_available_path_scopes(with_approval_display(callback))
@@ -12743,9 +14862,13 @@ class UnifiedHarnessBackendAdapter(  # noqa: PLR0904 - implements app-server ses
     async def respond_to_callback(
         self, params: CallbackResultParams
     ) -> SessionBackendResult[CallbackResultResponse]:
-        await self._record_approval_grant(params)
+        answer = self._approval_answer(params)
+        if answer is not None:
+            await self._record_approval_grant(answer[1], answer[2])
         result = await _harness_call(self._commands.respond_to_callback(params))
         response = result.response
+        if answer is not None:
+            self._record_tool_approval_resolved(*answer)
         callback_response = CallbackResultResponse(
             accepted=response.accepted, last_event_id=self._client_event_id(response)
         )
@@ -12756,36 +14879,96 @@ class UnifiedHarnessBackendAdapter(  # noqa: PLR0904 - implements app-server ses
             response=callback_response, after_response=result.after_response
         )
 
-    async def _record_approval_grant(self, params: CallbackResultParams) -> None:
-        """Remember an approval that reaches past the call, before it is acted on."""
+    def _approval_answer(
+        self, params: CallbackResultParams
+    ) -> (
+        tuple[PublicCallbackEntry, ApprovalCallbackDetail, ApprovalCallbackOutput]
+        | None
+    ):
+        """The open approval prompt this result answers, and the answer.
+
+        None for a delivery error, a question, a callback this adapter never saw
+        open, or a malformed answer: the Runtime owns rejecting those.
+        """
         result = params.result
         if result.error is not None:
-            return
+            return None
         callback = self._open_callbacks.get((params.session_id, result.callback_id))
         if callback is None or not isinstance(callback.detail, ApprovalCallbackDetail):
-            return
+            return None
         try:
             output = validate_wire(ApprovalCallbackOutput, result.output)
         except ValidationError:
-            # A malformed or non-approval answer. Leave it to the Runtime to
-            # reject; a grant recorded off it would outlive the rejection.
+            return None
+        return callback, callback.detail, output
+
+    def _record_tool_approval_resolved(
+        self,
+        callback: PublicCallbackEntry,
+        detail: ApprovalCallbackDetail,
+        output: ApprovalCallbackOutput,
+    ) -> None:
+        """Report the user's answer to an approval prompt the Runtime accepted.
+
+        The Runtime accepts the same answer again, from a retry or a second
+        attached client, until the callback closes: it is reported once.
+        """
+        # Keyed as the open callbacks are, so closing the prompt forgets it. A
+        # prompt that closed while the answer was in flight is not remembered:
+        # a retry finds no open prompt and is not reported anyway.
+        key = (callback.session_id, callback.id)
+        if key in self._reported_approval_answers:
             return
+        if key in self._open_callbacks:
+            self._reported_approval_answers.add(key)
+        is_subagent = callback.session_id != self.session_id
+        raw_tool_name = detail.effect.tool_name
+        agent_name, policy_name = (
+            (None, None) if is_subagent else self._active_selection_names()
+        )
+        try:
+            self._telemetry.send_tool_approval_resolved(
+                tool_name=_TOOL_NAME_ALIASES.get(raw_tool_name, raw_tool_name),
+                decision=output.decision.type.value,
+                path_scope=(
+                    output.decision.path_scope.value
+                    if output.decision.path_scope is not None
+                    else None
+                ),
+                # A subagent runs under its own profile, which this adapter
+                # does not track: the root's mode would misattribute it.
+                agent_profile_name=agent_name,
+                approval_policy=policy_name,
+                wait_ms=max(0, now_ms() - callback.created_at),
+                is_subagent=is_subagent,
+                has_feedback=bool(output.feedback),
+                message_id=(
+                    self._turn_client_message_ids.get(callback.turn_id)
+                    if callback.turn_id is not None
+                    else None
+                ),
+            )
+        except Exception:
+            logger.warning("Failed to send tool approval telemetry", exc_info=True)
+
+    async def _record_approval_grant(
+        self, detail: ApprovalCallbackDetail, output: ApprovalCallbackOutput
+    ) -> None:
+        """Remember an approval that reaches past the call, before it is acted on."""
         if output.decision.type not in {
             ApprovalDecisionType.APPROVE_FOR_SESSION,
             ApprovalDecisionType.APPROVE_PERMANENTLY,
         }:
             return
         try:
-            required_permissions = approval_grant_permissions(
-                callback.detail, output.decision
-            )
+            required_permissions = approval_grant_permissions(detail, output.decision)
         except ValueError:
             # The Runtime still owns callback settlement. A stale or malformed
             # client choice must not prevent it from rejecting or consuming the
             # callback, and must never create a broader persistent grant.
             return
         await self._context.permissions.grant(
-            callback.detail.effect.tool_name,
+            detail.effect.tool_name,
             required_permissions,
             permanent=output.decision.type is ApprovalDecisionType.APPROVE_PERMANENTLY,
         )
@@ -12795,8 +14978,10 @@ class UnifiedHarnessBackendAdapter(  # noqa: PLR0904 - implements app-server ses
     ) -> SessionBackendResult[SessionCompactResponse]:
         self._require_session(params.session_id)
         if self._api_path is not None:
-            return await self._api_path.compact(params)
-        return await self._compact_direct(params)
+            result = await self._api_path.compact(params)
+        else:
+            result = await self._compact_direct(params)
+        return result
 
     def _hold_events(self) -> None:
         """Hold the event flush while a compaction reply is on its way."""
@@ -12883,6 +15068,8 @@ class UnifiedHarnessBackendAdapter(  # noqa: PLR0904 - implements app-server ses
                     metadata=self._metadata,
                     workspace_roots=self._workspace_roots(),
                     scheduled_loops=self._scheduled_loops.snapshot(),
+                    goal=self._goal.live_goal,
+                    goal_notices=self._goal_notices.notices,
                     mcp_apps=self._mcp_apps,
                     started_by_session_id=self._session.started_by_session_id,
                 ).state
@@ -12932,6 +15119,10 @@ class UnifiedHarnessBackendAdapter(  # noqa: PLR0904 - implements app-server ses
         entry = await self._rewound_entry(params.entry_id)
         # Let the snapshots see every write of the settled turn before planning.
         await self.flush_events()
+        kept_turns, removed_turns = _turns_around(
+            (await self._read_state_containing(params.entry_id)).history or [],
+            params.entry_id,
+        )
         await _harness_call(self._host.rewind(params.session_id, params.entry_id))
         # An in-place rewind keeps the session, and with it the executor closure the
         # todo list lives in: left alone, `todo read` would answer with entries the
@@ -12951,6 +15142,9 @@ class UnifiedHarnessBackendAdapter(  # noqa: PLR0904 - implements app-server ses
             else ([], [])
         )
         self._rewind_snapshots.drop_from(entry.id)
+        await self._goal_notices.keep_before(
+            entry.created_at, kept_turns=kept_turns, removed_turns=removed_turns
+        )
         snapshot = await self.read(
             SessionReadParams(
                 session_id=self.session_id,
@@ -13022,6 +15216,25 @@ class UnifiedHarnessBackendAdapter(  # noqa: PLR0904 - implements app-server ses
         if seat is not None and record_now:
             await seat.record(self.session_id)
 
+    async def _persist_after_promotion(self, *, was_ephemeral: bool) -> None:
+        """Save what Vibe keeps beside a session the call just saved first."""
+        await self._persist_scheduled_loops_after_promotion(was_ephemeral=was_ephemeral)
+        await self._goal.persist_after_promotion(was_ephemeral=was_ephemeral)
+        if was_ephemeral:
+            await self._goal_notices.persist()
+        await self._persist_session_metadata_after_promotion(
+            was_ephemeral=was_ephemeral
+        )
+
+    async def _after_server_activity(self, *, was_ephemeral: bool) -> None:
+        """What a client's first message does, for work the server starts itself.
+
+        A goal note or continuation can be the first thing a session sends: it
+        then opens the session for the user and saves it, as a message would.
+        """
+        await self._persist_after_promotion(was_ephemeral=was_ephemeral)
+        await self._record_pending_seat()
+
     async def _record_pending_seat(self) -> None:
         if not self._seat_pending or self._terminal_seat is None:
             return
@@ -13031,6 +15244,7 @@ class UnifiedHarnessBackendAdapter(  # noqa: PLR0904 - implements app-server ses
     def _announce_first_use(self) -> None:
         if not self._announce_on_use:
             return
+        refuse_target_start(self._context.config_orchestrator.config)
         self._announce_on_use = False
         self._telemetry_closed = False
         # A session started ahead of need opens for the user only now.
@@ -13076,6 +15290,8 @@ class UnifiedHarnessBackendAdapter(  # noqa: PLR0904 - implements app-server ses
                 hook_type.value: self._context.hook_type_counts.get(hook_type, 0)
                 for hook_type in HookType
             },
+            started_by_session_id=self._spawned_by[0] if self._spawned_by else None,
+            start_link=self._spawned_by[1] if self._spawned_by else None,
         )
 
     def _measured_init_duration_ms(self) -> int:
@@ -13247,10 +15463,24 @@ class UnifiedHarnessBackendAdapter(  # noqa: PLR0904 - implements app-server ses
     async def shutdown(self, *, end_reason: SessionEndReason | None = None) -> None:
         if self._closed:
             return
+        # A move cut short would leave the session in the new folder without its stamp.
+        self._parked_project_move = None
+        await self._await_project_move()
+        if self._closed:
+            return
         # Before ``_closed``: a session_end hook reads nothing the close tears down,
         # and runs in the background. The app server waits for it on its way out.
         self.end_session_hooks(end_reason or self._end_reason)
         self._closed = True
+        self._stop_keep_awake()
+        if self._observing_turn_ends:
+            self._session.stop_observing_events(_REPLY_OBSERVER_ID)
+        if self._observing_project_moves:
+            self._session.stop_observing_events(_PROJECT_MOVE_OBSERVER_ID)
+        self._parked_project_move = None
+        # A reply cut short stays owed in metadata; the next open sends it.
+        for reply in tuple(self._replies_in_flight.values()):
+            reply.cancel()
         self._close_org_config()
         self._unfollow_connector_catalog()
         # Flush any completion whose snapshot never drove a final state update
@@ -13313,6 +15543,7 @@ class UnifiedHarnessBackendAdapter(  # noqa: PLR0904 - implements app-server ses
                 await self._scheduled_loops.persist()
             except ScheduledLoopStoreError as exc:
                 logger.warning("Failed to persist scheduled loops", exc_info=exc)
+            await self._goal.suspend()
             # The Session API transport's event pumps follow this session and
             # its loaded subagents, which can outlive it, so they stop here.
             await self._commands.close()
@@ -13952,8 +16183,20 @@ class UnifiedHarnessBackendAdapter(  # noqa: PLR0904 - implements app-server ses
     async def _history_list(
         self, params: SessionHistoryListParams
     ) -> SessionHistoryListResponse:
+        if self._api_path is not None and params.session_id == self.session_id:
+            return await self._history_windows.list(params, self._api_path.read_window)
         return await self._history_windows.list(
             params, partial(self._read_page_state, params.session_id)
+        )
+
+    async def _turns_list(
+        self, params: SessionTurnsListParams
+    ) -> SessionTurnsListResponse:
+        if self._api_path is not None and params.session_id == self.session_id:
+            return _turns_list_response(await self._api_path.read_turns(), params)
+        state = await self._read_page_state(params.session_id)
+        return _turns_list_response(
+            _turns_from_history(state.history or [], state.session.id), params
         )
 
     async def _context_breakdown(self, session_id: str) -> ContextBreakdown:
@@ -14006,6 +16249,8 @@ class UnifiedHarnessBackendAdapter(  # noqa: PLR0904 - implements app-server ses
             pins=self._live_session_pins(),
             workspace_roots=self._workspace_roots(),
             scheduled_loops=self._scheduled_loops.snapshot(),
+            goal=self._goal.live_goal,
+            goal_notices=self._goal_notices.notices,
             mcp_apps=self._mcp_apps,
             started_by_session_id=self._session.started_by_session_id,
         ).state
@@ -14055,6 +16300,7 @@ class UnifiedHarnessBackendAdapter(  # noqa: PLR0904 - implements app-server ses
             name=record.agent_name,
             agent_type=record.agent_type or "subagent",
             spawned_at=state.session.created_at,
+            agent_name=record.agent_name,
         )
 
     async def _read_child_response(
@@ -14078,25 +16324,33 @@ class UnifiedHarnessBackendAdapter(  # noqa: PLR0904 - implements app-server ses
             if probe_limit is None
             else _without_probe(result.snapshot, probe_limit)
         )
+        known = self._child_states.get(params.session_id)
         # Child sessions have no loop store of their own, and no starter.
         return _read_response(
             snapshot,
             result.cwd,
-            event_id=self._event_id,
+            # A child's events are numbered on its own sequence.
+            event_id=known.event_id if known is not None else 0,
             metadata=metadata,
             workspace_roots=self._workspace_roots(),
             scheduled_loops=(),
+            goal=None,
+            goal_notices=(),
             mcp_apps=None,
             started_by_session_id=None,
         )
 
     def _live_session_pins(self) -> _SessionPins:
+        agent, policy = _pinned_selection(
+            self._context.agents,
+            self._session.pin(SessionPin.AGENT_NAME),
+            self._session.pin(SessionPin.APPROVAL_POLICY),
+        )
         return _SessionPins(
             model=self._session.pin(SessionPin.ACTIVE_MODEL) or None,
             reasoning_effort=self._session.pin(SessionPin.REASONING_EFFORT) or None,
-            agent=_pinned_agent(
-                self._context.agents, self._session.pin(SessionPin.AGENT_NAME)
-            ),
+            agent=agent,
+            approval_policy=policy,
         )
 
     def _read_response(self, snapshot: HarnessSessionSnapshot) -> SessionReadResponse:
@@ -14128,6 +16382,8 @@ class UnifiedHarnessBackendAdapter(  # noqa: PLR0904 - implements app-server ses
             worktree=self._public_worktree(),
             workspace_roots=self._workspace_roots(),
             scheduled_loops=self._scheduled_loops.snapshot(),
+            goal=self._goal.live_goal,
+            goal_notices=self._goal_notices.notices,
             projected_history=projected_history,
             mcp_apps=self._mcp_apps,
             started_by_session_id=self._session.started_by_session_id,
@@ -14373,6 +16629,8 @@ class UnifiedHarnessBackendAdapter(  # noqa: PLR0904 - implements app-server ses
             previous.retrying != current.retrying
             or previous.background_processes != current.background_processes
             or previous.session.loops != current.session.loops
+            or _goal_without_live_counts(previous.session.goal)
+            != _goal_without_live_counts(current.session.goal)
         )
         current = self._state_with_child_summaries(current)
         app_events = [
@@ -14393,24 +16651,41 @@ class UnifiedHarnessBackendAdapter(  # noqa: PLR0904 - implements app-server ses
 
         self._event_id += 1
         current = current.model_copy(update={"event_id": self._event_id})
-        params = SessionSnapshotParams(
-            event_id=self._event_id,
-            session_id=current.session.id,
-            emitted_at=int(time.time() * 1000),
-            state=current,
-        )
-        translated.append(
-            SessionBackendEvent(
-                event=SessionSnapshot(current),
-                method="session/snapshot",
-                params=params,
-                session_id=current.session.id,
-                event_id=self._event_id,
-            )
-        )
+        translated.append(_snapshot_event(current))
         if current.retrying is not None:
             translated.append(_retrying_event(current.session.id, current.retrying))
         return translated, current
+
+    def _child_state_events(
+        self, previous: PublicSessionState, current: PublicSessionState
+    ) -> tuple[list[SessionBackendEvent], PublicSessionState]:
+        """A child's own events, numbered on the child's sequence.
+
+        Unlike the root's, they carry no stats or artifacts: those are the
+        root's alone.
+        """
+        event_id = previous.event_id
+        translated: list[SessionBackendEvent] = []
+        for app_event in reconcile_snapshot(previous, current):
+            if isinstance(app_event, SessionSnapshot | ChildSessionUpdated):
+                continue
+            event_id += 1
+            envelope = (
+                _turn_queue_event_envelope(
+                    app_event.queue, event_id, current.session.id
+                )
+                if isinstance(app_event, TurnQueueUpdated)
+                else _event_envelope(app_event, event_id)
+            )
+            translated.append(replace(envelope, child_session=True))
+        if (
+            previous.retrying != current.retrying
+            or previous.background_processes != current.background_processes
+        ):
+            event_id += 1
+            current = current.model_copy(update={"event_id": event_id})
+            translated.append(replace(_snapshot_event(current), child_session=True))
+        return translated, current.model_copy(update={"event_id": event_id})
 
     def _register_child_event(
         self, event: Mapping[str, object], root_state: PublicSessionState
@@ -14423,10 +16698,20 @@ class UnifiedHarnessBackendAdapter(  # noqa: PLR0904 - implements app-server ses
         if snapshot.state.session.id != child_session_id:
             _reject("a child registration with mismatched identity")
         state = self._child_read_state(child_session_id, snapshot)
+        registered: list[SessionBackendEvent] = []
+        previous = self._child_states.get(child_session_id)
+        if previous is not None:
+            # A client keeping a replica of the child replaces it.
+            state = state.model_copy(update={"event_id": previous.event_id + 1})
+            registered.append(replace(_snapshot_event(state), child_session=True))
         self._child_states[child_session_id] = state
         current = self._state_with_child_summaries(root_state)
         translated, current = self._child_summary_events(root_state, current)
-        return (translated, current, _required_event_id(event, "child registration"))
+        return (
+            [*registered, *translated],
+            current,
+            _required_event_id(event, "child registration"),
+        )
 
     async def _translate_child_event(
         self,
@@ -14457,11 +16742,7 @@ class UnifiedHarnessBackendAdapter(  # noqa: PLR0904 - implements app-server ses
         )
         if authorization is not None:
             translated = [authorization]
-        elif (
-            callback_events := self._callback_events(
-                raw_child_event, include_history=False
-            )
-        ) is not None:
+        elif (callback_events := self._callback_events(raw_child_event)) is not None:
             translated = callback_events
         else:
             previous = self._child_states.get(child_session_id)
@@ -14473,20 +16754,71 @@ class UnifiedHarnessBackendAdapter(  # noqa: PLR0904 - implements app-server ses
             current = self._updated_child_state(
                 raw_child_event, previous, history_limit, metadata=metadata
             )
+            child_events, current = self._child_state_events(previous, current)
             self._child_states[child_session_id] = current
             refreshed = self._state_with_child_summaries(root_state)
-            translated, root_state = self._child_summary_events(root_state, refreshed)
+            summary_events, root_state = self._child_summary_events(
+                root_state, refreshed
+            )
+            translated = [*child_events, *summary_events]
             if previous.retrying != current.retrying and current.retrying is not None:
                 translated.append(_retrying_event(child_session_id, current.retrying))
+            goal_events, root_state = await self._child_goal_progress(root_state)
+            translated.extend(goal_events)
+        # The root sends no update while it waits on a subagent's callback, so
+        # the goal clock learns of that wait here.
+        self._goal_clock.observe_callbacks(bool(self._open_callbacks))
         return (translated, root_state, _required_event_id(event, "child wrapper"))
+
+    async def _child_goal_progress(
+        self, root_state: PublicSessionState
+    ) -> tuple[list[SessionBackendEvent], PublicSessionState]:
+        """Charge a subagent's new usage to the root's running goal turn.
+
+        The goal clock counts the root and its subagents together, so a child
+        update moves the live counts as much as a root one; without this the
+        goal row would freeze for the whole subagent run.
+        """
+        if not self._goal_clock.turns or self._goal.goal is None:
+            return [], root_state
+        active = self._session.active_turn_id
+        if active is None or active not in self._goal_clock.turns:
+            return [], root_state
+        with self._translating_goal_update():
+            tokens = billable_tokens(root_state, self._child_states.values())
+            used, time_ms = self._goal_clock.progress(active, tokens)
+            try:
+                await self._goal.turn_progressed(active, tokens=used, time_ms=time_ms)
+            except Exception as exc:
+                # The goal and loop changes held meanwhile still go out below.
+                logger.exception("Goal bookkeeping failed", exc_info=exc)
+        session = self._with_live_extras(root_state)
+        if session == root_state.session:
+            return [], root_state
+        patch = make_json_patch(
+            root_state.session.model_dump(mode="json", by_alias=True),
+            session.model_dump(mode="json", by_alias=True),
+            whole_keys=SESSION_WHOLE_KEYS,
+        )
+        self._event_id += 1
+        event = _event_envelope(
+            SessionUpdated(previous=root_state.session, session=session, patch=patch),
+            self._event_id,
+        )
+        return [event], root_state.model_copy(
+            update={"session": session, "event_id": self._event_id}
+        )
 
     def _state_with_child_summaries(
         self, state: PublicSessionState
     ) -> PublicSessionState:
         self._observe_child_metadata(state.history or [])
+        gone = self._gone_child_ids()
         children = sorted(
             (
-                self._child_summary(child_state.session)
+                self._child_summary(
+                    child_state.session, gone=child_state.session.id in gone
+                )
                 for child_state in self._child_states.values()
             ),
             key=lambda child: (child.created_at, child.id),
@@ -14511,6 +16843,7 @@ class UnifiedHarnessBackendAdapter(  # noqa: PLR0904 - implements app-server ses
                     name=detail.display.message or "subagent",
                     agent_type=detail.input.agent,
                     spawned_at=entry.created_at,
+                    agent_name=detail.agent_name,
                 )
                 preceding_spawn_ids.add(detail.child_session_id)
                 continue
@@ -14548,7 +16881,25 @@ class UnifiedHarnessBackendAdapter(  # noqa: PLR0904 - implements app-server ses
                 self._api_path.forget_child(child_id)
             self._child_history_projections.pop(child_id, None)
 
-    def _child_summary(self, session: PublicSession) -> PublicChildSession:
+    def _gone_child_ids(self) -> frozenset[str]:
+        if self._host is None or not self._child_states:
+            return frozenset()
+        try:
+            records = self._host.child_session_records(self.session_id)
+        except Exception as exc:
+            logger.warning(
+                "Could not read the child records of %s", self.session_id, exc_info=exc
+            )
+            return frozenset()
+        return frozenset(
+            record.child_session_id
+            for record in records
+            if record.state.type in _GONE_CHILD_STATES
+        )
+
+    def _child_summary(
+        self, session: PublicSession, *, gone: bool = False
+    ) -> PublicChildSession:
         identity = self._child_identities.get(session.id)
         stopped_at = self._stopped_children.get(session.id)
         return PublicChildSession(
@@ -14559,10 +16910,21 @@ class UnifiedHarnessBackendAdapter(  # noqa: PLR0904 - implements app-server ses
                 else session.title or session.id[:8]
             ),
             agent_type=identity.agent_type if identity is not None else "subagent",
+            # The local harness only spawns direct children of the root.
+            agent_path=(
+                f"{_ROOT_AGENT_PATH}/{identity.agent_name}"
+                if identity is not None and identity.agent_name is not None
+                else None
+            ),
             status=(
                 VibeArchivedSessionStatus()
-                if stopped_at is not None
+                if stopped_at is not None or gone
                 else session.status
+            ),
+            model=(
+                self._running.child_models.get(identity.agent_type)
+                if identity is not None
+                else None
             ),
             token_usage=session.token_usage or VibeTokenUsage(),
             context_usage=session.context_usage,
@@ -14581,13 +16943,17 @@ class UnifiedHarnessBackendAdapter(  # noqa: PLR0904 - implements app-server ses
         metadata = _read_unified_session_metadata(
             _unified_session_dir(self._storage_root, child_session_id)
         )
+        known = self._child_states.get(child_session_id)
         return _read_response(
             snapshot,
             self.cwd,
-            event_id=self._event_id,
+            # A child's events are numbered on its own sequence.
+            event_id=known.event_id if known is not None else 0,
             metadata=metadata,
             workspace_roots=self._workspace_roots(),
             scheduled_loops=(),
+            goal=None,
+            goal_notices=(),
             projected_history=projected_history,
             mcp_apps=None,
             started_by_session_id=None,
@@ -14639,15 +17005,287 @@ class UnifiedHarnessBackendAdapter(  # noqa: PLR0904 - implements app-server ses
             metadata=self._metadata,
             projections=self._history_projections,
             scheduled_loops=self._scheduled_loops.snapshot(),
+            goal=self._goal.live_goal,
+            goal_notices=self._goal_notices.notices,
             started_by_session_id=self._session.started_by_session_id,
         )
-        # Process shell effects collected by the sync state update above: the
-        # detector is async (glab api), so it cannot run inside _updated_state.
-        await self._drain_pending_shell_effects()
-        self._rewind_snapshots.observe(current)
-        current = await self._record_unseen_transition(previous, current)
+        with self._translating_goal_update():
+            # Process shell effects collected by the sync state update above:
+            # the detector is async (glab api), so it cannot run inside
+            # _updated_state.
+            await self._drain_pending_shell_effects()
+            self._rewind_snapshots.observe(current)
+            current = await self._record_unseen_transition(previous, current)
+            current = await self._observe_goal_turns(previous, current)
         translated, current = self._translate_snapshot_update(previous, current)
         return translated, current, watermark
+
+    @contextlib.contextmanager
+    def _translating_goal_update(self) -> Iterator[None]:
+        """Hold live goal events while an update is being translated.
+
+        The stream numbers that update's events from the current ID and then
+        installs its state, so a goal event minted meanwhile would be
+        overwritten or sent twice. The update carries the goal and its notices
+        instead (see `_observe_goal_turns`).
+        """
+        self._translating_update = True
+        try:
+            yield
+        finally:
+            self._translating_update = False
+
+    async def _observe_goal_turns(
+        self, previous: PublicSessionState, current: PublicSessionState
+    ) -> PublicSessionState:
+        """Report this update's turn starts, usage and ends to the goal.
+
+        Runs inside `_translating_goal_update`: goal changes, notices and loop
+        changes made meanwhile join ``current`` instead of going out as events
+        of their own.
+        """
+        try:
+            current = await self._observe_goal_turn_changes(previous, current)
+        except Exception as exc:
+            # Goal bookkeeping must never take the session's event stream down.
+            logger.exception("Goal bookkeeping failed", exc_info=exc)
+        history = with_goal_notices(
+            current.history or [],
+            self._goal_notices.notices,
+            complete=current.history_before_cursor is None,
+        )
+        return current.model_copy(
+            update={"history": history, "session": self._with_live_extras(current)}
+        )
+
+    def _with_live_extras(self, state: PublicSessionState) -> PublicSession:
+        """``state``'s session with the goal and loops as they are now.
+
+        Every update translated under `_translating_goal_update` ends here: the
+        goal and loop events held meanwhile reach clients through it.
+        """
+        loops = [
+            _project_scheduled_loop(loop) for loop in self._scheduled_loops.snapshot()
+        ]
+        return state.session.model_copy(
+            update={"goal": self._goal.live_goal, "loops": loops}
+        )
+
+    async def _observe_goal_turn_changes(
+        self, previous: PublicSessionState, current: PublicSessionState
+    ) -> PublicSessionState:
+        self._goal_clock.observe_callbacks(bool(self._open_callbacks))
+        tokens = billable_tokens(current, self._child_states.values())
+        # Every turn is clocked from its start, so a goal the model creates
+        # mid-turn is charged the whole turn.
+        idle = (
+            self._goal.goal is None
+            and not self._goal.store.accounting.turns
+            # A stop waiting for its turn's end is reported there, even once
+            # the goal is cleared.
+            and not self._goal.stop_pending
+        )
+        previous_turns = {turn.id: turn for turn in previous.turns or []}
+        for turn in current.turns or []:
+            if turn.session_id != self.session_id:
+                continue
+            if previous_turns.get(turn.id) == turn:
+                continue
+            origin = self._host_turn_origins.get(turn.id, TurnOrigin.USER)
+            started = turn.id not in self._goal_clock.turns
+            if started:
+                self._start_goal_clock(turn, previous, previous_turns, tokens)
+            if idle:
+                if turn.status is not PublicTurnStatus.IN_PROGRESS:
+                    self._goal_clock.forget(turn.id)
+                continue
+            await self._goal.track_turn(turn.id, origin, started=started)
+            if turn.status is PublicTurnStatus.IN_PROGRESS:
+                continue
+            await self._end_goal_turn(turn, origin, current, tokens)
+        await self._settle_superseded_goal_turns(current, tokens)
+        if idle:
+            return current
+        active = self._session.active_turn_id
+        if active is not None and active in self._goal_clock.turns:
+            origin = self._host_turn_origins.get(active, TurnOrigin.USER)
+            await self._goal.track_turn(active, origin, started=False)
+            used, time_ms = self._goal_clock.progress(active, tokens)
+            await self._goal.turn_progressed(active, tokens=used, time_ms=time_ms)
+        await self._goal.flush_notices()
+        return current
+
+    def _start_goal_clock(
+        self,
+        turn: PublicTurn,
+        previous: PublicSessionState,
+        previous_turns: Mapping[str, PublicTurn],
+        tokens: int,
+    ) -> None:
+        """Clock a turn seen for the first time.
+
+        A turn first seen already ended ran entirely between two updates: it
+        spent what the session spent since the previous one, over its own
+        start and end times.
+        """
+        if turn.status is PublicTurnStatus.IN_PROGRESS or turn.id in previous_turns:
+            self._goal_clock.start(turn.id, tokens)
+            return
+        before = billable_tokens(previous, self._child_states.values())
+        self._goal_clock.start(
+            turn.id, min(before, tokens), elapsed_s=_turn_duration_ms(turn) / 1000
+        )
+
+    async def _settle_goal_turns_on_attach(
+        self, state: PublicSessionState
+    ) -> PublicSessionState:
+        """Settle the goal turns that ended while no client was attached.
+
+        Goal accounting follows the event stream, so a turn that ended between
+        two subscriptions is still clocked or bound: kept, it would hold every
+        continuation back. Its end is settled now, from what the state shows,
+        and charged only what it spent: the clock ran on through the gap.
+
+        A turn the state shows ended keeps its outcome and is charged its own
+        duration. A turn the state no longer shows was replaced by a later
+        one: it is charged what was counted before the gap, as interrupted. A
+        turn the state shows running is still running and stays as it is.
+        """
+        pending = {*self._goal_clock.turns, *self._goal.store.accounting.turns}
+        if not pending:
+            return state
+        pending.discard(self._session.active_turn_id or "")
+        shown = {turn.id: turn for turn in state.turns or []}
+        pending = {
+            turn_id
+            for turn_id in pending
+            if turn_id not in shown
+            or shown[turn_id].status is not PublicTurnStatus.IN_PROGRESS
+        }
+        if not pending:
+            return state
+        tokens = billable_tokens(state, self._child_states.values())
+        with self._translating_goal_update():
+            for turn_id in sorted(pending):
+                turn = shown.get(turn_id)
+                if turn is None:
+                    turn = PublicTurn(
+                        id=turn_id,
+                        session_id=self.session_id,
+                        status=PublicTurnStatus.INTERRUPTED,
+                        started_at=0,
+                    )
+                    # The counts kept from the last update before the gap stand.
+                    spent = (0, 0)
+                else:
+                    spent = self._goal_clock.ended(
+                        turn_id, tokens, duration_ms=_turn_duration_ms(turn)
+                    )
+                origin = self._host_turn_origins.get(turn_id, TurnOrigin.USER)
+                try:
+                    await self._end_goal_turn(turn, origin, state, tokens, spent=spent)
+                except Exception as exc:
+                    logger.exception("Goal bookkeeping failed", exc_info=exc)
+            await self._goal.flush_notices()
+        return state.model_copy(
+            update={
+                "history": with_goal_notices(
+                    state.history or [],
+                    self._goal_notices.notices,
+                    complete=state.history_before_cursor is None,
+                ),
+                "session": self._with_live_extras(state),
+            }
+        )
+
+    async def _settle_superseded_goal_turns(
+        self, current: PublicSessionState, tokens: int
+    ) -> None:
+        """End the clocked turns a newer turn replaced before their end was seen.
+
+        A state carries only its latest turn, so a turn that ended in the same
+        update another one started never shows as ended. It can only have
+        ended, though: it is charged and settled now, as interrupted (it moves
+        no breaker), so its binding and any stop it holds do not linger.
+        """
+        shown = {turn.id for turn in current.turns or []}
+        if not any(turn_id not in shown for turn_id in self._goal_clock.turns):
+            return
+        running = self._session.active_turn_id
+        for turn_id in list(self._goal_clock.turns):
+            if turn_id in shown or turn_id == running:
+                continue
+            origin = self._host_turn_origins.get(turn_id, TurnOrigin.USER)
+            ended = PublicTurn(
+                id=turn_id,
+                session_id=self.session_id,
+                status=PublicTurnStatus.INTERRUPTED,
+                started_at=0,
+            )
+            await self._end_goal_turn(ended, origin, current, tokens)
+
+    async def _end_goal_turn(
+        self,
+        turn: PublicTurn,
+        origin: TurnOrigin,
+        current: PublicSessionState,
+        tokens: int,
+        *,
+        spent: tuple[int, int] | None = None,
+    ) -> None:
+        """Charge ``turn`` and report its end to the goal.
+
+        ``spent`` replaces the live clock's count when the turn ended earlier
+        than now; a turn's charge never goes below what it was last reported.
+        """
+        used, time_ms = (
+            self._goal_clock.progress(turn.id, tokens) if spent is None else spent
+        )
+        # A clocked turn holds continuations back: it stays clocked until its
+        # end has settled (it may stop the goal, and both steps yield), and is
+        # forgotten even if that fails, so it never holds them back for good.
+        try:
+            await self._goal.turn_progressed(turn.id, tokens=used, time_ms=time_ms)
+            self._host_turn_origins.pop(turn.id, None)
+            calls, succeeded, failed = count_tools(
+                turn_tool_effects(current.history or [], turn.id),
+                ignored=GOAL_TOOL_ROUTES,
+            )
+            await self._goal.turn_ended(
+                TurnEnd(
+                    turn_id=turn.id,
+                    origin=origin,
+                    outcome=goal_turn_outcome(
+                        turn, self._interrupt_reasons.get(turn.id)
+                    ),
+                    error_code=turn.error.code if turn.error is not None else None,
+                    error_message=(
+                        turn.error.message if turn.error is not None else None
+                    ),
+                    error_retryable=(
+                        turn.error is None or _turn_error_retryable(turn.error)
+                    ),
+                    tool_calls=calls,
+                    succeeded_tool_calls=succeeded,
+                    failed_tool_calls=failed,
+                )
+            )
+        finally:
+            self._goal_clock.forget(turn.id)
+            self._interrupt_reasons.pop(turn.id, None)
+
+    def _record_interrupt_reason(self, turn_id: str, reason: str) -> None:
+        """Keep why ``turn_id`` was interrupted until its end is settled.
+
+        A user's interrupt is never replaced by the runtime's own reason for
+        the same turn. Bounded: turns no goal settles are dropped oldest first.
+        """
+        if self._interrupt_reasons.get(turn_id) in USER_INTERRUPT_REASONS:
+            return
+        self._interrupt_reasons.pop(turn_id, None)
+        self._interrupt_reasons[turn_id] = reason
+        while len(self._interrupt_reasons) > _MAX_INTERRUPT_REASONS:
+            del self._interrupt_reasons[next(iter(self._interrupt_reasons))]
 
     def _updated_child_state(
         self,
@@ -14680,6 +17318,8 @@ class UnifiedHarnessBackendAdapter(  # noqa: PLR0904 - implements app-server ses
         projections: _HistoryProjections,
         record_root_telemetry: bool = True,
         scheduled_loops: Sequence[ScheduledPrompt] = (),
+        goal: PublicGoal | None = None,
+        goal_notices: Sequence[PublicNoticeEntry] = (),
         started_by_session_id: str | None,
     ) -> tuple[PublicSessionState, int]:
         if event.get("type") != "session_state_updated":
@@ -14701,17 +17341,23 @@ class UnifiedHarnessBackendAdapter(  # noqa: PLR0904 - implements app-server ses
             projections=projections,
             workspace_roots=self._workspace_roots(),
             scheduled_loops=scheduled_loops,
+            goal=goal,
+            goal_notices=goal_notices,
             # A subagent names its connector routes in its own Runtime.
             mcp_apps=self._mcp_apps if record_root_telemetry else None,
             started_by_session_id=started_by_session_id,
         ).state
-        self._track_context_tokens(current)
+        if record_root_telemetry:
+            self._track_context_tokens(current)
         return current, watermark
 
     def _record_root_update(self, state: HarnessPublicSessionState) -> None:
         """Record what a root update's entries report: telemetry and shell effects."""
         if state.latest_turn is not None:
             self._root_turn_ids.add(state.latest_turn.id)
+            reason = getattr(state.latest_turn, "reason", None)
+            if isinstance(reason, str):
+                self._record_interrupt_reason(state.latest_turn.id, reason)
         self._record_tool_telemetry(state)
         self._record_compaction_telemetry(state)
         self._collect_pending_shell_effects(state)
@@ -15149,7 +17795,7 @@ class UnifiedHarnessBackendAdapter(  # noqa: PLR0904 - implements app-server ses
         scanned in page order, so an effect that cannot be resolved through its
         turn id falls back to the most recently seen user entry.
         """
-        agent_profile_name = self._active_agent_profile_name()
+        agent_profile_name, approval_policy = self._active_selection_names()
         for raw_entry in state.history.entries:
             if raw_entry.get("type") == "message":
                 client_message_id = _entry_client_message_id(raw_entry)
@@ -15183,6 +17829,7 @@ class UnifiedHarnessBackendAdapter(  # noqa: PLR0904 - implements app-server ses
                 tool_name=tool.tool_name,
                 status=tool.status,
                 agent_profile_name=agent_profile_name,
+                approval_policy=approval_policy,
                 nb_files_created=tool.nb_files_created,
                 nb_files_modified=tool.nb_files_modified,
                 file_extension=tool.file_extension,
@@ -15190,6 +17837,8 @@ class UnifiedHarnessBackendAdapter(  # noqa: PLR0904 - implements app-server ses
                 decision=tool.decision,
                 approval_type=tool.approval_type,
                 approval_source=tool.approval_source,
+                error_code=tool.error_code,
+                error_reason=tool.error_reason,
             )
 
     def _effect_message_id(self, raw_entry: object) -> str | None:
@@ -15264,10 +17913,11 @@ class UnifiedHarnessBackendAdapter(  # noqa: PLR0904 - implements app-server ses
         )
         self._turn_attachment_counts = {AttachmentKind.IMAGE: count} if count else {}
 
-    def _active_agent_profile_name(self) -> str | None:
+    def _active_selection_names(self) -> tuple[str | None, str | None]:
         agents = getattr(self._context, "agents", None)
-        profile = getattr(agents, "active_profile", None)
-        return getattr(profile, "name", None)
+        agent = getattr(agents, "active_agent", None)
+        policy = getattr(agents, "active_policy", None)
+        return getattr(agent, "name", None), getattr(policy, "name", None)
 
     def _auto_compact_threshold(self) -> int:
         # The snapshot's context window is the compiled compaction threshold.
@@ -15509,12 +18159,14 @@ class UnifiedHarnessBackendAdapter(  # noqa: PLR0904 - implements app-server ses
         A Core warning, such as ``request_too_long`` before a compaction,
         rides the same way and keeps its own code.
         """
+        details = event.get("details")
         params = ServerWarningParams(
             warning=PublicError(
                 code=_optional_event_str(event, "code")
                 or _optional_event_str(event, "level")
                 or "warning",
                 message=bounded_error_message(_required_event_str(event, "message")),
+                details=dict(details) if isinstance(details, Mapping) else None,
             )
         )
         return SessionBackendEvent(
@@ -15588,7 +18240,7 @@ class UnifiedHarnessBackendAdapter(  # noqa: PLR0904 - implements app-server ses
         )
 
     def _callback_events(
-        self, event: Mapping[str, object], *, include_history: bool = True
+        self, event: Mapping[str, object]
     ) -> list[SessionBackendEvent] | None:
         event_type = event.get("type")
         if event_type not in {"callback_requested", "callback_resolved"}:
@@ -15602,27 +18254,29 @@ class UnifiedHarnessBackendAdapter(  # noqa: PLR0904 - implements app-server ses
         if not isinstance(callback, PublicCallbackEntry):
             _reject("a Harness callback event with a non-callback entry")
         callback_key = (callback.session_id, callback.id)
+        # A child registered later has no sequence yet to number its entry on.
+        has_sequence = (
+            callback.session_id == self.session_id
+            or callback.session_id in self._child_states
+        )
         if event_type == "callback_requested":
             if callback_key not in self._open_callbacks:
                 self._notify_callback_opened(callback)
             self._open_callbacks[callback_key] = callback
-            if not include_history:
-                return [SessionBackendEvent(event=CallbackRequested(callback))]
-            self._event_id += 1
-            return [
-                _event_envelope(HistoryEntryAdded(callback), self._event_id),
-                SessionBackendEvent(event=CallbackRequested(callback)),
-            ]
+            requested = SessionBackendEvent(event=CallbackRequested(callback))
+            if not has_sequence:
+                return [requested]
+            return [self._history_event(HistoryEntryAdded(callback)), requested]
         previous_callback = self._open_callbacks.pop(callback_key, callback)
-        if not include_history:
+        self._reported_approval_answers.discard(callback_key)
+        if not has_sequence:
             return []
         # The Harness persists a settled question in history; its next state
         # update must read as already delivered, not as a new entry.
         if isinstance(callback.detail, UserInputCallbackDetail):
             self._merge_translated_entry(callback)
-        self._event_id += 1
         return [
-            _event_envelope(
+            self._history_event(
                 HistoryEntryUpdated(
                     previous=previous_callback,
                     entry=callback,
@@ -15634,10 +18288,31 @@ class UnifiedHarnessBackendAdapter(  # noqa: PLR0904 - implements app-server ses
                             op="replace", path="/state", value=raw_callback["state"]
                         ),
                     ],
-                ),
-                self._event_id,
+                )
             )
         ]
+
+    def _history_event(
+        self, event: HistoryEntryAdded | HistoryEntryUpdated
+    ) -> SessionBackendEvent:
+        """The envelope of one entry's event, on its own session's sequence."""
+        session_id = event.entry.session_id
+        child = self._child_states.get(session_id)
+        if session_id == self.session_id or child is None:
+            self._event_id += 1
+            return _event_envelope(event, self._event_id)
+        event_id = child.event_id + 1
+        # A live read serves this state with this event's id as its watermark,
+        # so it must show the callback open, or no longer open, already.
+        callbacks = [c for c in child.active_callbacks if c.id != event.entry.id]
+        if isinstance(event, HistoryEntryAdded) and isinstance(
+            event.entry, PublicCallbackEntry
+        ):
+            callbacks.append(event.entry)
+        self._child_states[session_id] = child.model_copy(
+            update={"event_id": event_id, "active_callbacks": callbacks}
+        )
+        return replace(_event_envelope(event, event_id), child_session=True)
 
 
 _SUBAGENT_OPERATIONS: dict[str, SubagentOperation] = {
@@ -15769,6 +18444,7 @@ _HARNESS_ERROR_CODES: Final[dict[str, TurnErrorCode]] = {
     "model_refused": TurnErrorCode.REFUSAL,
     "model_stream_incomplete": TurnErrorCode.INCOMPLETE_STREAM,
     "model_unauthorized": TurnErrorCode.INVALID_API_KEY,
+    "model_credential_unavailable": TurnErrorCode.CREDENTIAL_UNAVAILABLE,
     "pricing_unavailable": TurnErrorCode.PRICING_UNAVAILABLE,
 }
 
@@ -15797,12 +18473,50 @@ def _turn_error_http_status(error: PublicError) -> int | None:
     return status if isinstance(status, int) else None
 
 
+# Errors the same request meets again: resuming would only fail once more.
+_PERMANENT_TURN_ERRORS: Final = frozenset({
+    TurnErrorCode.CONTEXT_TOO_LONG,
+    TurnErrorCode.INVALID_IMAGE_ATTACHMENT,
+    TurnErrorCode.IMAGES_NOT_SUPPORTED,
+    TurnErrorCode.INVALID_MODEL,
+    TurnErrorCode.INVALID_API_KEY,
+})
+# Client errors that a later attempt can pass.
+_TRANSIENT_CLIENT_STATUSES: Final = frozenset({
+    HTTPStatus.REQUEST_TIMEOUT,
+    HTTPStatus.CONFLICT,
+    HTTPStatus.TOO_EARLY,
+    HTTPStatus.TOO_MANY_REQUESTS,
+})
+
+
+def _turn_error_retryable(error: PublicError) -> bool:
+    """Whether the request that failed a turn may pass if sent again."""
+    if error.code in _PERMANENT_TURN_ERRORS:
+        return False
+    status = _turn_error_http_status(error)
+    return not (
+        status is not None
+        and HTTPStatus.BAD_REQUEST <= status < HTTPStatus.INTERNAL_SERVER_ERROR
+        and status not in _TRANSIENT_CLIENT_STATUSES
+    )
+
+
+def _turn_duration_ms(turn: PublicTurn) -> int:
+    """How long an ended turn ran, by its own times; 0 when they are missing."""
+    if turn.completed_at is None or turn.started_at <= 0:
+        return 0
+    return max(0, turn.completed_at - turn.started_at)
+
+
 def _harness_turn_error_code(public_error: PublicError) -> TurnErrorCode | None:
     if public_error.code == "model_stream_failed":
         details = public_error.details if isinstance(public_error.details, dict) else {}
         status = details.get("httpStatus")
         if status == HTTPStatus.TOO_MANY_REQUESTS:
             return TurnErrorCode.RATE_LIMIT
+        if status == HTTPStatus.PAYMENT_REQUIRED:
+            return TurnErrorCode.USAGE_LIMIT
         if status in _REFUSED_CREDENTIAL_STATUSES:
             return TurnErrorCode.INVALID_API_KEY
     return _HARNESS_ERROR_CODES.get(str(public_error.code))
@@ -15893,6 +18607,35 @@ class _ToolCallTelemetry:
     decision: Literal["execute", "skip"] | None
     approval_type: Literal["always", "never", "ask"] | None
     approval_source: Literal["config", "smart", "user", "bypass", "never"] | None
+    error_code: str | None = None
+    error_reason: str | None = None
+
+
+# `details` is untyped, and a client or MCP failure may put any text there.
+_TELEMETRY_ERROR_REASONS: Final = frozenset({
+    SESSION_LIMIT_DEPTH,
+    SESSION_LIMIT_STARTED_SESSIONS,
+    SESSION_LIMIT_HOPS,
+})
+_TELEMETRY_ERROR_CODE: Final = re.compile(r"[a-z][a-z0-9_]{0,63}")
+
+
+def _effect_error(state: Mapping[str, object]) -> tuple[str | None, str | None]:
+    """The failure's code and refusal reason, only when they are identifiers."""
+    error = state.get("error")
+    if not isinstance(error, Mapping):
+        return None, None
+    code = error.get("code")
+    details = error.get("details")
+    reason = details.get("reason") if isinstance(details, Mapping) else None
+    return (
+        code
+        if isinstance(code, str) and _TELEMETRY_ERROR_CODE.fullmatch(code)
+        else None,
+        reason
+        if isinstance(reason, str) and reason in _TELEMETRY_ERROR_REASONS
+        else None,
+    )
 
 
 def _effect_file_extension(path: object) -> str | None:
@@ -15900,6 +18643,29 @@ def _effect_file_extension(path: object) -> str | None:
         return None
     suffix = Path(path).suffix.lower()
     return suffix or None
+
+
+def _turns_around(
+    history: Sequence[PublicHistoryEntry], entry_id: str
+) -> tuple[set[str], set[str]]:
+    """The turns before ``entry_id`` in ``history``, and those from it on.
+
+    Goal notices are left out: they are placed by turn, not a part of one.
+    """
+    entries = [
+        entry
+        for entry in history
+        if not (
+            isinstance(entry, PublicNoticeEntry)
+            and isinstance(entry.detail, GoalNoticeDetail)
+        )
+    ]
+    index = next(
+        (i for i, entry in enumerate(entries) if entry.id == entry_id), len(entries)
+    )
+    before = {e.turn_id for e in entries[:index] if e.turn_id is not None}
+    after = {e.turn_id for e in entries[index:] if e.turn_id is not None}
+    return before - after, after
 
 
 def _user_entry_ids(history: Sequence[PublicHistoryEntry]) -> list[str]:
@@ -15982,6 +18748,7 @@ def _terminal_tool_effect(  # noqa: PLR0914
     approval_source = (
         raw_approval_source if isinstance(raw_approval_source, str) else None
     )
+    error_code, error_reason = _effect_error(state)
     if detail.get("kind") == "todo":
         # Todo writes touch no files, but they are approvable like any other tool,
         # so the grant path has to survive into the event.
@@ -15998,6 +18765,8 @@ def _terminal_tool_effect(  # noqa: PLR0914
                 Literal["config", "smart", "user", "bypass", "never"] | None,
                 approval_source,
             ),
+            error_code=error_code,
+            error_reason=error_reason,
         )
     raw_name = detail.get("toolName")
     # Subagent effects have their own content-free event; skip them here.
@@ -16037,6 +18806,8 @@ def _terminal_tool_effect(  # noqa: PLR0914
             Literal["config", "smart", "user", "bypass", "never"] | None,
             approval_source,
         ),
+        error_code=error_code,
+        error_reason=error_reason,
     )
 
 
@@ -16076,6 +18847,15 @@ def _terminal_compaction_effect(entry: object) -> _CompactionTelemetry | None:
     return _CompactionTelemetry(
         checkpoint_id=checkpoint_id, trigger=trigger, succeeded=succeeded, reason=reason
     )
+
+
+def _hook_notice_details(hook_name: str, content: str) -> dict[str, str]:
+    """The parts of a Host hook's line, for a client that draws it on its own.
+
+    The content is capped as the warning's message is: a hook's output can be
+    up to its stdout cap, and the client keeps and re-sends the line.
+    """
+    return {"hookName": hook_name, "content": bounded_error_message(content)}
 
 
 def _required_event_str(event: Mapping[str, object], name: str) -> str:
@@ -16376,6 +19156,40 @@ class _SessionMessageInjectParams(ContextInjectParams):
     user_display_content: UserDisplayContent | None = None
 
 
+def _ended_root_turn(event: Mapping[str, object], session_id: str) -> PublicTurn | None:
+    """The root's turn a raw Harness state event reports ended, if any."""
+    if event.get("type") != "session_state_updated":
+        return None
+    state = event.get("state")
+    turn = state.get("latestTurn") if isinstance(state, Mapping) else None
+    if not isinstance(turn, Mapping) or turn.get("sessionId") != session_id:
+        return None
+    try:
+        latest = _HARNESS_TURN.validate_python(turn)
+    except ValidationError:
+        logger.warning(
+            "Ignored a turn end no reply can be built from",
+            extra={"session_id": session_id},
+            exc_info=True,
+        )
+        return None
+    if latest.status == "in_progress":
+        return None
+    return _public_turn(latest)
+
+
+def _ended_turn(session_id: str, turn_id: str) -> PublicTurn:
+    """A turn that ended with no saved reply text, as a build before the text
+    was saved left it: how it ended is no longer read.
+    """
+    return PublicTurn(
+        id=turn_id,
+        session_id=session_id,
+        status=PublicTurnStatus.COMPLETED,
+        started_at=0,
+    )
+
+
 def _from_its_sender(params: TurnEnqueueParams) -> TurnEnqueueParams:
     """The model reads who sent it from a block ahead of it; clients from its
     marker. Applied after prompt preparation, so the sender's name mentions
@@ -16497,11 +19311,73 @@ class _SessionPins:
     model: str | None = None
     reasoning_effort: str | None = None
     agent: AgentSummary | None = None
+    approval_policy: ApprovalPolicySummary | None = None
 
 
-def _pinned_agent(agents: AgentManager, name: str | None) -> AgentSummary | None:
-    profile = None if name is None else agents.available_agents.get(name)
-    return None if profile is None else project_agent_summary(profile)
+class _NamedPolicies:
+    """Every name that names a policy, available or not: a saved policy the
+    config now leaves out is still a policy, never an agent.
+    """
+
+    def __init__(self, agents: AgentManager) -> None:
+        self._agents = agents
+
+    def __contains__(self, name: object) -> bool:
+        return isinstance(name, str) and self._agents.is_policy_name(name)
+
+
+def saved_selection(
+    agent_name: str | None,
+    approval_policy: str | None,
+    policies: Container[str],
+    agents: Container[str] = (),
+) -> tuple[str | None, str | None]:
+    """The agent and policy a session saved, read across the split.
+
+    A session saved before agents and policies split has only ``agent_name``,
+    which names either its policy or a custom agent. One saved since names its
+    policy apart, and its agent pin holds the policy while it runs the default
+    agent. A mode removed before the split (``plan``) reads as its replacement.
+    """
+    if agent_name in REMOVED_BUILTIN_AGENTS and agent_name not in agents:
+        agent_name = REMOVED_BUILTIN_AGENTS[agent_name]
+    if agent_name and agent_name in policies:
+        # A build from before the split rewrites only this pin, so it is the
+        # latest pick even beside a newer `approval_policy`.
+        return BuiltinAgentName.DEFAULT, agent_name
+    return agent_name or None, approval_policy or None
+
+
+def decoded_selection(
+    agents: AgentManager, agent_name: str | None, approval_policy: str | None
+) -> tuple[str | None, str | None]:
+    """The agent and policy a session's pins name, read against ``agents``:
+    the one reading every path uses, so a custom agent that took a removed
+    mode's name stays that agent wherever the pins are read.
+    """
+    return saved_selection(
+        agent_name,
+        approval_policy,
+        _NamedPolicies(agents),
+        agents.available_agents.keys(),
+    )
+
+
+def _pinned_selection(
+    agents: AgentManager, agent_name: str | None, approval_policy: str | None
+) -> tuple[AgentSummary | None, ApprovalPolicySummary | None]:
+    if not agent_name and not approval_policy:
+        return None, None
+    agent, policy = decoded_selection(agents, agent_name, approval_policy)
+    agent_profile = None if agent is None else agents.available_agents.get(agent)
+    policy_profile = None if policy is None else agents.available_policies.get(policy)
+    if policy is not None and policy_profile is None:
+        # A resume falls back to `ask` for a policy no longer available.
+        policy_profile = agents.available_policies.get(ApprovalPolicyName.ASK)
+    return (
+        None if agent_profile is None else project_agent_summary(agent_profile),
+        None if policy_profile is None else project_policy_summary(policy_profile),
+    )
 
 
 async def _stored_session_pins(
@@ -16513,14 +19389,20 @@ async def _stored_session_pins(
     pins = await _harness_call(host.session_pins(session_id))
     model = pins[SessionPin.ACTIVE_MODEL]
     agent_name = pins[SessionPin.AGENT_NAME]
+    approval_policy = pins[SessionPin.APPROVAL_POLICY]
     reasoning_effort = pins[SessionPin.REASONING_EFFORT]
-    agent = (
-        _pinned_agent(await asyncio.to_thread(build_agents), agent_name)
-        if agent_name
-        else None
+    agent, policy = (
+        _pinned_selection(
+            await asyncio.to_thread(build_agents), agent_name, approval_policy
+        )
+        if agent_name or approval_policy
+        else (None, None)
     )
     return _SessionPins(
-        model=model or None, reasoning_effort=reasoning_effort or None, agent=agent
+        model=model or None,
+        reasoning_effort=reasoning_effort or None,
+        agent=agent,
+        approval_policy=policy,
     )
 
 
@@ -16580,12 +19462,22 @@ def _without_probe(
     )
 
 
-async def _read_widening_window(
-    read: Callable[[int], Awaitable[PublicSessionState]],
+class _HistoryWindow(Protocol):
+    """A latest window of public history, and where older history resumes."""
+
+    @property
+    def history(self) -> list[PublicHistoryEntry] | None: ...
+
+    @property
+    def history_before_cursor(self) -> str | None: ...
+
+
+async def _read_widening_window[WindowT: _HistoryWindow](
+    read: Callable[[int], Awaitable[WindowT]],
     *,
     start_window: int = _HISTORY_PAGE_WINDOW,
     enough: Callable[[list[PublicHistoryEntry]], bool] | None = None,
-) -> tuple[PublicSessionState, list[PublicHistoryEntry], int, bool]:
+) -> tuple[WindowT, list[PublicHistoryEntry], int, bool]:
     """Read latest windows, doubling the limit until one fits or history runs out.
 
     Reads probe one entry past the window, so a missing `history_before_cursor`
@@ -16617,7 +19509,7 @@ class _HistoryWindows:
     async def list(
         self,
         params: SessionHistoryListParams,
-        read: Callable[[int], Awaitable[PublicSessionState]],
+        read: Callable[[int], Awaitable[_HistoryWindow]],
     ) -> SessionHistoryListResponse:
         backward = params.sort_direction == "backward"
         before = params.cursor if backward else None
@@ -16654,7 +19546,7 @@ class _HistoryWindows:
     async def _read(
         self,
         session_id: str,
-        read: Callable[[int], Awaitable[PublicSessionState]],
+        read: Callable[[int], Awaitable[_HistoryWindow]],
         before: str | None,
         limit: int,
     ) -> tuple[list[PublicHistoryEntry], int, bool]:
@@ -16753,6 +19645,10 @@ def _read_response(  # noqa: PLR0913 - one read input per keyword, all keyword-o
     # Required on purpose: a caller that forgets the session's loops or starter
     # must fail loudly instead of silently publishing a state without them.
     scheduled_loops: Sequence[ScheduledPrompt],
+    # Required for the same reason: None means the session has no goal.
+    goal: PublicGoal | None,
+    # The goal's transcript notices, which the app server keeps (empty for none).
+    goal_notices: Sequence[PublicNoticeEntry],
     # Required for the same reason: None means the session runs no connector
     # routes here (a subagent, or a session that is not open).
     mcp_apps: SessionMcpApps | None,
@@ -16778,8 +19674,9 @@ def _read_response(  # noqa: PLR0913 - one read input per keyword, all keyword-o
             if projections is None
             else projections.project(window, display_roots)
         )
-    if mcp_apps is not None:
-        history = mcp_apps.apply(history)
+    history = _with_app_server_entries(
+        history, has_older=has_older, goal_notices=goal_notices, mcp_apps=mcp_apps
+    )
     last_event_id = snapshot.watermark if event_id is None else event_id
     harness_retrying = getattr(snapshot.state, "retrying", None)
     return SessionReadResponse(
@@ -16792,6 +19689,7 @@ def _read_response(  # noqa: PLR0913 - one read input per keyword, all keyword-o
                 pins=pins,
                 worktree=worktree,
                 scheduled_loops=scheduled_loops,
+                goal=goal,
                 started_by_session_id=started_by_session_id,
             ),
             history=history,
@@ -16828,6 +19726,24 @@ def _read_response(  # noqa: PLR0913 - one read input per keyword, all keyword-o
         ),
         last_event_id=last_event_id,
     )
+
+
+def _with_app_server_entries(
+    history: list[PublicHistoryEntry],
+    *,
+    has_older: bool,
+    goal_notices: Sequence[PublicNoticeEntry],
+    mcp_apps: SessionMcpApps | None,
+) -> list[PublicHistoryEntry]:
+    """A window of the Runtime's history with what the app server adds to it.
+
+    The app server keeps goal notices itself and links MCP app routes to their
+    tool effects; ``has_older`` says whether older history exists.
+    """
+    history = with_goal_notices(history, goal_notices, complete=not has_older)
+    if mcp_apps is not None:
+        history = mcp_apps.apply(history)
+    return history
 
 
 def _session_api_commands(
@@ -16946,6 +19862,7 @@ def _public_session(
     pins: _SessionPins = _NO_SESSION_PINS,
     worktree: PublicSessionWorktree | None = None,
     scheduled_loops: Sequence[ScheduledPrompt] = (),
+    goal: PublicGoal | None = None,
     started_by_session_id: str | None,
 ) -> PublicSession:
     status = cast(Any, session.status)
@@ -16988,20 +19905,38 @@ def _public_session(
         model=pins.model,
         reasoning_effort=pins.reasoning_effort,
         agent=pins.agent,
+        approval_policy=pins.approval_policy,
         token_usage=token_usage,
         context_usage=context_usage,
         harness=harness,
         loops=[_project_scheduled_loop(loop) for loop in scheduled_loops],
+        goal=goal,
         project=(
             _public_session_project(metadata.project)
             if metadata is not None and metadata.project is not None
             else None
         ),
+        owes_reply=metadata is not None and bool(metadata.owed_replies),
     )
 
 
 def _public_session_project(project: SessionProject) -> PublicSessionProject:
     return PublicSessionProject(kind=project.kind, id=project.id)
+
+
+def _in_no_project(folder: Path) -> bool:
+    resolved = folder.resolve()
+    # A managed worktree is released by the move, not kept; home holds everything.
+    if (
+        resolved.is_relative_to(WORKTREES_DIR.path.resolve())
+        or resolved == Path.home().resolve()
+    ):
+        return False
+    try:
+        projects = LocalProjectStore().list_projects()
+    except LocalProjectStoreUnreadable:
+        return False
+    return ProjectFolders(projects).match(str(folder)) is None
 
 
 def _move_target(target: SessionMoveTarget) -> tuple[SessionProject, Path | None]:
@@ -17028,12 +19963,28 @@ def _folder_stamps(
     """By session id, the stamp of each session no local project claims whose folder matches."""
     # Sessions share few folders, and each match resolves its folder's path.
     match = cache(ProjectFolders(projects).match)
+    merged_into = {
+        merged_id: project for project in projects for merged_id in project.merged_ids
+    }
     return {
         session.id: SessionProject(kind="local", id=project.id)
         for session in sessions
         if _claims_no_project(projects, project_ids, session.project)
-        and (project := match(session.cwd)) is not None
+        and (
+            project := _merged_project(merged_into, session.project)
+            or match(session.cwd)
+        )
+        is not None
     }
+
+
+def _merged_project(
+    merged_into: dict[str, LocalProject], stamp: PublicSessionProject | None
+) -> LocalProject | None:
+    # A worktree session matches no folder: its stamp is all that names its project.
+    if stamp is None or stamp.kind != "local" or stamp.id is None:
+        return None
+    return merged_into.get(stamp.id)
 
 
 def _claims_no_project(
@@ -17102,10 +20053,13 @@ def _project_listed_row(
     metadata_signature = file_signature(session_dir / METADATA_FILENAME)
     loops_path = session_dir / "scheduled-loops.json"
     loops_signature = file_signature(loops_path)
+    stored_goal_path = goal_path(session_dir)
+    goal_signature = file_signature(stored_goal_path)
     if (
         prior is not None
         and prior.metadata_signature == metadata_signature
         and prior.loops_signature == loops_signature
+        and prior.goal_signature == goal_signature
         and prior.item == item
     ):
         return prior
@@ -17115,12 +20069,14 @@ def _project_listed_row(
         harness="unified",
         metadata=_read_unified_session_metadata(session_dir),
         scheduled_loops=read_stored_loops(loops_path),
+        goal=read_stored_goal(stored_goal_path),
         started_by_session_id=item.started_by_session_id,
     )
     return _ListedRow(
         item=item,
         metadata_signature=metadata_signature,
         loops_signature=loops_signature,
+        goal_signature=goal_signature,
         public=public,
     )
 
@@ -17136,6 +20092,8 @@ def _merge_listed_sessions(
         merged = [session for session in merged if session.id in asked]
     if not params.include_archived:
         merged = [session for session in merged if session.archived_at is None]
+    if params.owes_reply:
+        merged = [session for session in merged if session.owes_reply]
     merged.sort(key=lambda session: (session.updated_at, session.id), reverse=True)
     return merged
 
@@ -17209,6 +20167,8 @@ def _public_turn(turn: object) -> PublicTurn:
         budget_stop_reason=reason if reason in _BUDGET_STOP_REASONS else None,
         queue_item_id=getattr(raw, "queue_item_id", None),
         input_entry_id=getattr(raw, "input_entry_id", None),
+        skip_reason=getattr(raw, "skip_reason", None),
+        reject_reason=getattr(raw, "reject_reason", None),
     )
 
 
@@ -17523,6 +20483,35 @@ def _event_envelope(event: object, event_id: int) -> SessionBackendEvent:
             event_id=event_id,
         )
     raise TypeError(f"Unsupported app-server event: {event!r}")
+
+
+def _with_history_entry(
+    state: PublicSessionState, entry: PublicHistoryEntry
+) -> PublicSessionState:
+    history = state.history or []
+    if any(existing.id == entry.id for existing in history):
+        history = [
+            entry if existing.id == entry.id else existing for existing in history
+        ]
+    else:
+        history = [*history, entry]
+    return state.model_copy(update={"history": history})
+
+
+def _snapshot_event(state: PublicSessionState) -> SessionBackendEvent:
+    params = SessionSnapshotParams(
+        event_id=state.event_id,
+        session_id=state.session.id,
+        emitted_at=int(time.time() * 1000),
+        state=state,
+    )
+    return SessionBackendEvent(
+        event=SessionSnapshot(state),
+        method="session/snapshot",
+        params=params,
+        session_id=state.session.id,
+        event_id=state.event_id,
+    )
 
 
 def _retrying_event(session_id: str, retrying: PublicRetryState) -> SessionBackendEvent:
@@ -17872,6 +20861,17 @@ def _session_connector_state(
     )
 
 
+def _goal_without_live_counts(goal: PublicGoal | None) -> PublicGoal | None:
+    """The goal minus what moves on every usage tick.
+
+    ``session/updated`` patches already carry the live counts; only a change to
+    the goal itself is worth a full snapshot.
+    """
+    if goal is None:
+        return None
+    return goal.model_copy(update={"tokens_used": 0, "time_used_seconds": 0})
+
+
 async def _harness_call[ResultT](operation: Awaitable[ResultT]) -> ResultT:
     try:
         return await operation
@@ -17890,6 +20890,7 @@ _DIRECT_SESSION_ERROR_CODES: dict[str, ProtocolErrorCode] = {
     "callback_not_found": ProtocolErrorCode.NOT_FOUND,
     "unknown_process": ProtocolErrorCode.NOT_FOUND,
     "callback_conflict": ProtocolErrorCode.CONFLICT,
+    "callback_rejected": ProtocolErrorCode.INVALID_PARAMS,
     "configuration_rejected": ProtocolErrorCode.INVALID_PARAMS,
     "history_entry_conflict": ProtocolErrorCode.CONFLICT,
     "turn_queue_edit_conflict": ProtocolErrorCode.CONFLICT,
