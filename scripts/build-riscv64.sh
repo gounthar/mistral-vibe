@@ -152,6 +152,16 @@ for old, new in patches:
     s = s.replace(old, new)
 p.write_text(s)
 PY
+# Dropping the target runtime is only safe while nothing imports it. If
+# upstream starts importing it, --version/--help would still pass while real
+# features break, so refuse to build instead.
+harness_imports="$(grep -rnE '^\s*(from|import)\s+mistralai\.vibe\.harness|import_module\(\s*["'"'"']mistralai\.vibe\.harness|from\s+mistralai\.vibe\s+import\s+harness' \
+  --include='*.py' vibe harness/runtimes/python/python || true)"
+if [[ -n "$harness_imports" ]]; then
+  error "Upstream now imports mistralai.vibe.harness, which has no riscv64 build:"
+  echo "$harness_imports" >&2
+  exit 1
+fi
 
 # Limit concurrent Rust builds to avoid overwhelming riscv64 boards
 export UV_CONCURRENT_BUILDS=1
