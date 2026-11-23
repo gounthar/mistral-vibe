@@ -27,7 +27,13 @@ from mistralai_vibe_local_harness.protocol import (
     RustTokenUsage,
     RustToolGroupDefinition,
 )
-from mistralai_vibe_local_harness.session_protocol import SessionStartParams
+from mistralai_vibe_local_harness.session_api.app_server.session.transport import (
+    UnsupportedSessionProcedureError,
+)
+from mistralai_vibe_local_harness.session_protocol import (
+    SessionReadParams,
+    SessionStartParams,
+)
 from mistralai_vibe_local_harness.vibe import (
     CompletionPricing,
     SharedCompletionBudget,
@@ -117,12 +123,17 @@ async def test_a_model_switch_goes_through_config_write_with_its_limits(
         SessionConfig(
             core=switched_core,
             local=replace(
-                local, active_model=small_route, compaction_model=small_route
+                local,
+                active_model=small_route,
+                # The alias the user knows the new model by moves with it.
+                active_model_alias="small",
+                compaction_model=small_route,
             ),
         )
     )
     after_write = session.adapter_config
     assert after_write is not None
+    alias_after_write = after_write.active_model_alias
     await commands.apply_config(
         SessionConfig(
             core=switched_core,
@@ -141,6 +152,7 @@ async def test_a_model_switch_goes_through_config_write_with_its_limits(
     assert written["model"] == "small-model"
     assert written["context_window"] == 65_536
     assert written["input_modalities"] == ["text"]
+    assert alias_after_write == "small"
     assert session.adapter_config is not None
     assert session.adapter_config.active_model.model == "model-c"
     assert session.adapter_config.extra_headers == {"x-team": "qa"}
@@ -612,6 +624,7 @@ async def test_a_subagent_approval_is_answered_through_the_session_api(
 _KNOWN_LOCAL_FIELDS = frozenset({
     "active_agent",
     "active_model",
+    "active_model_alias",
     "affinity_id",
     "agent_max_tokens",
     "api_style",
@@ -647,6 +660,7 @@ _KNOWN_LOCAL_FIELDS = frozenset({
     "region",
     "request_sent_sink",
     "retry_max_elapsed_time_s",
+    "credential_wait_s",
     "sandbox",
     "session_api",
     "shell",
@@ -678,10 +692,13 @@ _KNOWN_CORE_FIELDS = {
         "skills",
         "tool_groups",
     }),
-    "settings": frozenset({"context", "tools", "turn"}),
+    "settings": frozenset({"context", "prompts", "tools", "turn"}),
     "context": frozenset({
         "compaction",
         "compaction_model_input_modalities",
+        # The bound on live instructions, relative to the compaction threshold,
+        # so a model switch keeps it; any other change of it is no model switch.
+        "instructions",
         "model_facts",
         "notifications",
     }),
@@ -714,3 +731,33 @@ def test_the_model_switch_check_knows_every_runtime_config_field() -> None:
 
     # Assert
     assert (new_local, gone_local, changed_core) == ([], [], {})
+
+
+@pytest.mark.asyncio
+async def test_rename_through_the_local_transport_is_refused(tmp_path: Path) -> None:
+    """*Prepare*: A local Session with its Session API commands.
+    *Do*: Rename it through ``SessionApiCommands.rename``.
+    *Assert*: The local transport does not serve the catalog, so the rename is
+        refused and the title stays unset: a local Session is renamed through
+        its Host.
+    """
+    # Prepare
+    host = UnifiedHarnessSessionBackendHost(tmp_path)
+    host.configure_runtime(
+        _core_config("runtime-template"),
+        LocalRuntimeAdapterConfig.at(cwd=tmp_path, session_api=True),
+    )
+    session = await host.start(SessionStartParams(history_limit=50))
+    commands = SessionApiCommands(session)
+
+    # Do
+    with pytest.raises(UnsupportedSessionProcedureError):
+        await commands.rename("Billing retries")
+
+    # Assert
+    snapshot = await host.read(
+        SessionReadParams(session_id=session.session_id, history_limit=1)
+    )
+    assert snapshot.snapshot.state.session.title is None
+    await commands.close()
+    await host.shutdown()

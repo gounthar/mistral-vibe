@@ -344,54 +344,80 @@ expression: reviewable(snapshot)
         ]
       },
       "output_schema": {
-        "type": "object",
-        "properties": {
-          "path": {
-            "type": "string"
+        "description": "The text a read returned, or the media type and size of an image whose bytes go only to the model.",
+        "oneOf": [
+          {
+            "type": "object",
+            "properties": {
+              "path": {
+                "type": "string"
+              },
+              "content": {
+                "type": "string"
+              },
+              "file_size_bytes": {
+                "type": "integer",
+                "description": "Size of the file in bytes; for a directory, of its whole listing."
+              },
+              "returned_bytes": {
+                "type": "integer"
+              },
+              "offset": {
+                "type": "integer"
+              },
+              "lines_read": {
+                "type": "integer"
+              },
+              "was_truncated": {
+                "type": "boolean",
+                "description": "Whether the file has more content past what was returned."
+              },
+              "total_lines": {
+                "type": [
+                  "integer",
+                  "null"
+                ],
+                "description": "Number of lines in the file, or of entries in a directory, or null when the file is too large to count."
+              },
+              "next_offset": {
+                "type": [
+                  "integer",
+                  "null"
+                ],
+                "description": "The `offset` to read the rest of the file from, or null when the read reached the end of the file."
+              }
+            },
+            "required": [
+              "path",
+              "content",
+              "file_size_bytes",
+              "returned_bytes",
+              "offset",
+              "lines_read",
+              "was_truncated"
+            ]
           },
-          "content": {
-            "type": "string"
-          },
-          "file_size_bytes": {
-            "type": "integer",
-            "description": "Size of the file in bytes; for a directory, of its whole listing."
-          },
-          "returned_bytes": {
-            "type": "integer"
-          },
-          "offset": {
-            "type": "integer"
-          },
-          "lines_read": {
-            "type": "integer"
-          },
-          "was_truncated": {
-            "type": "boolean",
-            "description": "Whether the file has more content past what was returned."
-          },
-          "total_lines": {
-            "type": [
-              "integer",
-              "null"
-            ],
-            "description": "Number of lines in the file, or of entries in a directory, or null when the file is too large to count."
-          },
-          "next_offset": {
-            "type": [
-              "integer",
-              "null"
-            ],
-            "description": "The `offset` to read the rest of the file from, or null when the read reached the end of the file."
+          {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "path": {
+                "type": "string"
+              },
+              "mime_type": {
+                "type": "string",
+                "description": "The image's media type, such as `image/png`."
+              },
+              "file_size_bytes": {
+                "type": "integer"
+              }
+            },
+            "required": [
+              "path",
+              "mime_type",
+              "file_size_bytes"
+            ]
           }
-        },
-        "required": [
-          "path",
-          "content",
-          "file_size_bytes",
-          "returned_bytes",
-          "offset",
-          "lines_read",
-          "was_truncated"
         ]
       }
     },
@@ -1148,7 +1174,7 @@ expression: reviewable(snapshot)
         "namespace": "agents",
         "name": "spawn"
       },
-      "description": "Create an independent child with fresh conversation and send its first message. This does not block or wait for the agent to complete its instruction. name is a single path segment unique for the lifetime of this Session. A child without config_name does not get your instructions: give it instructions written for its task.",
+      "description": "Create an independent child with fresh conversation and send its first message. This does not block or wait for the agent to complete its task. name is a single path segment unique for the lifetime of this Session. A child without config_name does not get your instructions: give it instructions written for its task.",
       "input_schema": {
         "description": "A generic child, which needs `instructions`, or a child from `config_name`, which has its own.",
         "oneOf": [
@@ -1197,6 +1223,7 @@ expression: reviewable(snapshot)
               },
               "config_name": {
                 "type": "string",
+                "description": "The `name` of an agent configuration that `tools.agents.list_configs` returns. The child runs with that configuration: its tools and its instructions.",
                 "minLength": 1
               }
             },

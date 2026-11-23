@@ -50,6 +50,7 @@ pub fn apply_startup_event(
         }
         StartupEvent::Config(config) => {
             show_startup_config(app, *config);
+            show_dangerous_directory_warning(app);
             false
         }
         StartupEvent::Ready(ready) => apply_ready(app, client, config_tx, *ready),
@@ -96,15 +97,23 @@ pub fn announce_resume(app: &mut App) {
     }
 }
 
-/// The borderless warning mounted
-/// at startup when the cwd is a risky folder.
+/// The risky-folder warning row, removed once the config turns it off.
+const DANGEROUS_DIRECTORY_WARNING_ID: &str = "rs-dangerous-directory-warning";
+
+/// The borderless warning mounted at startup when the cwd is a risky folder:
+/// from a warm cache before the first frame, else once the server's config lands.
 pub fn show_dangerous_directory_warning(app: &mut App) {
+    if !app.session.startup_config.show_dangerous_directory_warning
+        || app.view.transcript.contains(DANGEROUS_DIRECTORY_WARNING_ID)
+    {
+        return;
+    }
     if let Some(reason) = crate::utils::paths::dangerous_directory_reason() {
         let warning =
             format!("⚠ WARNING: {reason}\n\nRunning in this location is not recommended.");
         local::add_warning(
             &mut app.view.transcript,
-            &submission::new_message_id(),
+            DANGEROUS_DIRECTORY_WARNING_ID,
             &warning,
         );
     }
@@ -177,7 +186,7 @@ fn apply_ready(
     } = ready;
     observability::level::set_config_log_level(config.log_level.as_deref());
     observability::sentry::init_sentry(
-        config.enable_telemetry,
+        config.crash_reports_enabled,
         false,
         [("entrypoint".to_owned(), "vibe-rs".to_owned())].into(),
     );
@@ -198,6 +207,7 @@ fn apply_ready(
     app.subagents.status_list_enabled = startup::read_show_subagent_status_list(&runtime);
     app.artifacts_modal.enabled = startup::read_pr_monitoring(&runtime);
     app.view.sticky_prompt_enabled = startup::read_enable_sticky_prompt(&runtime);
+    app.view.collapse_turn_details = startup::read_collapse_turn_details(&runtime);
     app.quit.ask_confirmation_on_exit = startup::read_ask_confirmation_on_exit(&runtime);
     // Later picker resumes resend this config, so it must keep naming the
     // settled worktree, not the checkout the run started in. Parking must land
@@ -211,6 +221,7 @@ fn apply_ready(
     }
     crate::vim::apply_runtime(app, &runtime);
     apply_final_startup_config(app, startup_cache);
+    show_dangerous_directory_warning(app);
     app.view
         .transcript
         .set_show_reasoning(startup::read_show_thinking_nodes(&runtime));
@@ -220,12 +231,15 @@ fn apply_ready(
         message_queue::reconcile_snapshot(app, client, &state);
         app.set_session_id(state.session.id.clone());
         crate::background_work::adopt_state(app, &state);
+        crate::loops::adopt_state(app, &state);
         app.subagents.seed_snapshot(state.child_sessions.clone());
         subagents::refresh(app);
         match app.resume_picker.open {
             true => resume_picker::rebase(app, &state),
             false => {
                 app.todo_tracker.seed_from_history(state.history.as_ref());
+                crate::goal::adopt(app, state.session.goal.clone(), true);
+                crate::goal::sync_running_turn(app, &state.session.id, state.turns.as_deref());
                 resume_picker::load_history(app, &state);
                 // The ready read below reads the live branch.
                 crate::worktree::track_state(app, &state);
@@ -262,6 +276,7 @@ fn apply_ready(
     mcp::show_post_init_notices(app, &runtime);
     crate::skills_browser::notify_updates(app, client, &runtime);
     notices::show_config_issues(app, &runtime);
+    crate::tmux_hint::show(app);
     startup::banners::mount(app, &runtime, client);
     // Read the what's-new gate inside mount before scheduling the update
     // check; keeping the spawn after mount preserves that ordering.
@@ -269,9 +284,10 @@ fn apply_ready(
     // builds its client.
     crate::update_notifier::gateway::configure_tls_trust(config.enable_system_trust_store);
     spawn_background_update_check(config.enable_update_checks);
-    post_ready::fetch(app, client, config.show_greeting);
+    post_ready::fetch(app, client);
     artifacts::fetch(app, client);
     resume_picker::subscribe(app, client);
+    crate::storage_panel::startup::read(app, client);
     completion_manager::refresh(app);
     // A picker resume that landed first already adopted its own turn: leave
     // the status it set rather than drop that turn to `Ready`.
@@ -315,6 +331,7 @@ fn record_startup(app: &mut App, attach: &startup::Attach, is_cold_start: bool) 
         "is_cold_start": is_cold_start,
         "mouse_capture": app.session.startup_config.enable_mouse_capture,
         "vim_keybindings": app.vim.enabled,
+        "environment": crate::telemetry::environment::properties(),
     }));
     app.session.startup_telemetry = Some(properties);
     flush_startup_telemetry(app);
@@ -354,6 +371,12 @@ pub fn apply_runtime_value(app: &mut App, runtime: &Value) {
     app.subagents.status_list_enabled = startup::read_show_subagent_status_list(runtime);
     app.artifacts_modal.enabled = startup::read_pr_monitoring(runtime);
     app.view.sticky_prompt_enabled = startup::read_enable_sticky_prompt(runtime);
+    let collapse = startup::read_collapse_turn_details(runtime);
+    // Turned on under a bulk-unfolded Ctrl+O state, the new groups open unfolded too.
+    if collapse && !app.view.collapse_turn_details && !app.view.tools_collapsed {
+        app.view.expanded.extend(app.view.transcript.details_keys());
+    }
+    app.view.collapse_turn_details = collapse;
     app.quit.ask_confirmation_on_exit = startup::read_ask_confirmation_on_exit(runtime);
     crate::vim::apply_runtime(app, runtime);
     let show_thinking = startup::read_show_thinking_nodes(runtime);
@@ -397,6 +420,10 @@ fn apply_final_startup_config(app: &mut App, config: startup_cache::StartupConfi
 
 fn show_startup_config(app: &mut App, config: startup_cache::StartupConfig) {
     app.session.startup_config = config;
+    if !app.session.startup_config.show_dangerous_directory_warning {
+        app.view.transcript.remove(DANGEROUS_DIRECTORY_WARNING_ID);
+    }
+    crate::tmux_hint::refresh(app);
     ui::theme::set_active(&app.session.startup_config.theme);
     app.session.tokens.1 = app.session.startup_config.context_window;
     app.completion
@@ -414,7 +441,7 @@ fn show_startup_config(app: &mut App, config: startup_cache::StartupConfig) {
     completion_manager::refresh(app);
 }
 
-/// A live reasoning row or loop prompt starts with the bulk fold state.
+/// A live reasoning row, loop prompt or turn's details start with the bulk fold state.
 fn expand_live_foldable(app: &mut App, entry: &EntryHead) {
     if app.view.tools_collapsed {
         return;
@@ -424,10 +451,14 @@ fn expand_live_foldable(app: &mut App, entry: &EntryHead) {
     };
     let transcript = &app.view.transcript;
     let unfolded = match transcript.is_reasoning(id) {
-        true => Some(id),
-        false => transcript.loop_prompt_of(id),
+        true => Some(id.to_owned()),
+        false => (transcript.loop_prompt_of(id).map(str::to_owned)).or_else(|| {
+            (app.view.collapse_turn_details)
+                .then(|| transcript.details_key(id))
+                .flatten()
+        }),
     };
-    if let Some(unfolded) = unfolded.map(str::to_owned) {
+    if let Some(unfolded) = unfolded {
         app.view.expanded.insert(unfolded);
         app.view.transcript_cache.invalidate_layouts();
     }
@@ -592,6 +623,10 @@ pub fn apply_notification(app: &mut App, client: &Arc<Client>, event: &Notificat
         resume_picker::on_lease_updated(app, client, &event.params);
         return true;
     }
+    if event.method == notification::STORAGE_USAGE_UPDATED {
+        crate::storage_panel::on_updated(app, &event.params);
+        return true;
+    }
     if event.method == notification::SESSION_LEASE_ENDED {
         resume_picker::on_lease_ended(app);
         return true;
@@ -617,10 +652,15 @@ pub fn apply_notification(app: &mut App, client: &Arc<Client>, event: &Notificat
         // updates are safe pre-ready.
         if let Some(patch) = event.params.get("patch") {
             crate::worktree::track_patch(app, patch);
+            // A subagent's own loops are not this session's.
+            if event.params["sessionId"].as_str() == app.session.session_id.as_deref() {
+                crate::loops::track_patch(app, patch);
+            }
         }
         if let Some(title) = crate::terminal_notifier::updated_title(&event.params) {
             app.terminal_notifier.set_default_title(title);
         }
+        crate::goal::track_patch(app, &event.params);
         return true;
     }
     // Warnings/errors are never re-sent in the snapshot: surface them pre-Ready too.
@@ -695,7 +735,11 @@ pub fn apply_notification(app: &mut App, client: &Arc<Client>, event: &Notificat
                         }
                     }
                     crate::worktree::adopt_state(app, &state);
+                    crate::goal::adopt(app, state.session.goal.clone(), !same_session);
+                    let turns = state.turns.as_deref();
+                    crate::goal::sync_running_turn(app, &state.session.id, turns);
                     crate::background_work::adopt_state(app, &state);
+                    crate::loops::adopt_state(app, &state);
                     sync_retrying_label(app, &state);
                     app.expand_rebuilt_tools();
                     app.subagents.seed_snapshot(state.child_sessions.clone());
@@ -709,8 +753,14 @@ pub fn apply_notification(app: &mut App, client: &Arc<Client>, event: &Notificat
         notification::TURN_STARTED => {
             notices::close_startup(app);
             let turn = PublicTurn::read(&event.params);
+            crate::goal::turn_started(app, turn.id.clone(), turn.queue_item_id.is_some());
             app.session.active_turn_id = turn.id;
             let interrupt = message_queue::take_interrupt_on_start(app);
+            // A take-back belongs to the turn it interrupts, never to a later one:
+            // any other start gives it up and mounts the marker it skipped.
+            if !interrupt {
+                crate::rewind::give_up_take_back(app);
+            }
             if let Some(queue_item_id) = turn.queue_item_id {
                 if message_queue::turn_started(app, client, &queue_item_id) {
                     feedback::maybe_show(app, client, app.session.session_id.clone());
@@ -740,14 +790,16 @@ pub fn apply_notification(app: &mut App, client: &Arc<Client>, event: &Notificat
             } else {
                 crate::terminal_notifier::NotificationContext::Complete
             };
-            // A failed or interrupted turn finalizes the open live group; a
+            // A failed or interrupted turn finalizes the open live group, and so
+            // does one a hook ended without an answer to close it; a
             // successful one leaves it spinning.
-            if matches!(status, Some("failed" | "interrupted")) {
+            if matches!(status, Some("failed" | "interrupted")) || turn.hook_answer().is_some() {
                 app.view.transcript.finalize_tool_group();
             }
             app.view.transcript.settle_reasoning();
             app.view.transcript.settle_compactions(None);
             app.session.active_turn_id = None;
+            crate::rewind::turn_settled(app, client, turn.id.as_deref(), status);
             if retry::auto_continue_incomplete_stream(app, client, &turn) {
                 return true;
             }
@@ -764,8 +816,11 @@ pub fn apply_notification(app: &mut App, client: &Arc<Client>, event: &Notificat
                 );
                 id
             });
-            // An interrupted turn can be retried too, as the marker Esc left says.
-            if retryable || status == Some("interrupted") {
+            // An interrupted turn can be retried too, as the marker Esc left says;
+            // one whose prompt is taken back is rewound instead.
+            if app.session.taking_back {
+                retry::cancel(app);
+            } else if retryable || status == Some("interrupted") {
                 retry::offer(app, turn.id.as_deref(), error_row.filter(|_| retryable));
             } else {
                 retry::cancel(app);
@@ -803,7 +858,7 @@ pub fn apply_notification(app: &mut App, client: &Arc<Client>, event: &Notificat
             } else if interrupted {
                 app.terminal_notifier
                     .remember_completion(crate::program_status::ProgramState::Idle);
-            } else {
+            } else if !crate::goal::quiet_turn_end(app) {
                 app.terminal_notifier.notify(context, crate::clock::now());
             }
         }
@@ -874,6 +929,7 @@ pub fn apply_notification(app: &mut App, client: &Arc<Client>, event: &Notificat
             }) {
                 app.set_session_id(state.session.id.clone());
                 crate::background_work::adopt_state(app, &state);
+                crate::loops::adopt_state(app, &state);
                 app.subagents.seed_snapshot(state.child_sessions.clone());
                 subagents::reset_views(app);
                 subagents::refresh(app);
@@ -969,6 +1025,7 @@ fn turn_error_message(app: &App, turn: &PublicTurn, retryable: bool) -> Option<(
     }
     let message = match turn.error_code() {
         Some("rate_limit") => rate_limit_message(app.whoami.account()),
+        Some("usage_limit") => USAGE_LIMIT_MESSAGE.to_owned(),
         _ => bounded_message(turn.error_message().unwrap_or("Turn failed")).into_owned(),
     };
     let hint = if retryable {
@@ -978,6 +1035,10 @@ fn turn_error_message(app: &App, turn: &PublicTurn, retryable: bool) -> Option<(
     };
     Some((message, hint))
 }
+
+/// The `usage_limit` failure: the account has no credit left.
+pub const USAGE_LIMIT_MESSAGE: &str =
+    "Your account has no credit left. Add credit, then run /goal resume or retry.";
 
 /// The friendly rate-limit text, with the
 /// upgrade line only when the account exposes a rate-limit action.

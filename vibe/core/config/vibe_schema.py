@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping, MutableMapping, Sequence
+import copy
 from enum import StrEnum
 import functools
 import json
@@ -9,9 +10,11 @@ from pathlib import Path
 import tomllib
 from types import MappingProxyType
 import typing
-from typing import Annotated, Any, ClassVar, Self
+from typing import Annotated, Any, ClassVar, Final, Self
 
 from dotenv import dotenv_values
+from jsonpatch import JsonPatchException, apply_patch as apply_json_patch
+from jsonpointer import JsonPointer, JsonPointerException
 from pydantic import (
     AfterValidator,
     BeforeValidator,
@@ -22,8 +25,13 @@ from pydantic import (
     model_validator,
 )
 
-from vibe.core.agents.models import REMOVED_BUILTIN_AGENTS, BuiltinAgentName
-from vibe.core.config._catalog_filter import with_catalog_filter
+from vibe.core.agents.models import (
+    BUILTIN_APPROVAL_POLICIES,
+    REMOVED_BUILTIN_AGENTS,
+    ApprovalPolicyName,
+    BuiltinAgentName,
+)
+from vibe.core.config._catalog_filter import with_remote_models
 from vibe.core.config._defaults import (
     DEFAULT_API_RETRY_MAX_ELAPSED_TIME,
     DEFAULT_API_STREAM_IDLE_TIMEOUT,
@@ -52,9 +60,15 @@ from vibe.core.config._model_aliases import (
     settings_keys,
     warn_ignored_alias,
 )
+from vibe.core.config._self_hosted import speech_server, transcription_server
+from vibe.core.config._telemetry_off_only import (
+    ignored_telemetry_opt_in_warning,
+    sets_telemetry_on_off_only,
+    without_telemetry_opt_ins,
+)
 from vibe.core.config.harness_files import get_harness_files_manager
 from vibe.core.config.layers.admin import AdminConfigLayer
-from vibe.core.config.layers.default import DefaultConfigLayer
+from vibe.core.config.layers.growthbook import GrowthbookLayer
 from vibe.core.config.models import (
     ACTIVE_MODEL_SELECTOR,
     THINKING_LEVELS,
@@ -73,6 +87,7 @@ from vibe.core.config.models import (
     TTSProviderConfig,
     UtilityFeature,
     UtilityModelsConfig,
+    VibeBotLocalToolsEntry,
     normalize_model_configs,
     refuse_zero_auto_compact_threshold,
     serialize_model_configs,
@@ -80,6 +95,7 @@ from vibe.core.config.models import (
 from vibe.core.config.patch import (
     PatchOp,
     RemoveOperationPatch,
+    ensure_parent_paths,
     escape_json_pointer_token,
     unescape_json_pointer_token,
 )
@@ -214,6 +230,22 @@ DEFAULT_PROVIDERS = [
 ]
 
 DEFAULT_ACTIVE_MODEL_CONFIG = ModelConfig(
+    name="mistral-large-4-0",
+    provider="mistral",
+    alias="mistral-large-4-0",
+    display_name="Mistral Large 4",
+    temperature=1.0,
+    input_price=0.7,
+    output_price=2.1,
+    cached_input_price=0.07,
+    thinking="high",
+    supports_images=True,
+    thinking_levels=["low", "medium", "high"],
+    max_context_length=1048576,
+    auto_compact_threshold=400000,
+)
+
+MEDIUM_3_5_MODEL_CONFIG = ModelConfig(
     name="mistral-vibe-cli-latest",
     provider="mistral",
     alias="mistral-medium-3.5",
@@ -228,7 +260,7 @@ DEFAULT_ACTIVE_MODEL_CONFIG = ModelConfig(
     max_context_length=262144,  # 256k window per the model card
 )
 
-DEFAULT_MODELS = [DEFAULT_ACTIVE_MODEL_CONFIG]
+DEFAULT_MODELS = [DEFAULT_ACTIVE_MODEL_CONFIG, MEDIUM_3_5_MODEL_CONFIG]
 
 # Sentinel ``active_model`` value meaning "not pinned": the config resolves it to
 # the default model (see ``get_active_model``). Kept distinct from pinning the
@@ -300,6 +332,88 @@ def _non_empty(items: list[Any]) -> list[Any]:
             "No models are configured. Define at least one model under [[models]]."
         )
     return items
+
+
+# What a settings entry holds besides settings: the names it is filed under.
+_MODEL_ENTRY_NAMES = frozenset({"alias", "name"})
+
+
+def _removed_model(op: PatchOp) -> tuple[str, bool] | None:
+    """The model a removal names, and whether it removes one of its fields
+    rather than the whole entry; None for any other op.
+    """
+    if not isinstance(op, RemoveOperationPatch):
+        return None
+    match op.path.split("/", 3):
+        case ["", "models", token]:
+            return unescape_json_pointer_token(token), False
+        case ["", "models", token, _]:
+            return unescape_json_pointer_token(token), True
+        case _:
+            return None
+
+
+def _holds_only_names(key: str, payload: Mapping[str, Any]) -> bool:
+    return not defines_model(payload) and all(
+        name in _MODEL_ENTRY_NAMES and value == key for name, value in payload.items()
+    )
+
+
+def _with_emptied_entries_removed(
+    ops: list[PatchOp], layer_data: Mapping[str, Any]
+) -> list[PatchOp]:
+    """``ops`` as they apply to ``layer_data``, then the cleanup of what they
+    leave empty.
+
+    Read from the result, not predicted from the ops, so their order does not
+    matter:
+
+    - a removal of a model field that is no longer there does nothing, rather
+      than failing the write: another session may have removed it already;
+    - an entry a removal touched that is left with only its names goes: it
+      adjusts nothing, and would warn as ignored settings once its model leaves
+      the catalog. A whole model keeps its entry;
+    - a ``models`` table those removals leave empty, a whole entry's removal
+      included, goes, rather than stay in the file as an empty ``[models]``.
+
+    A write this cannot follow is returned as it is, for the layer to report.
+    """
+    sentinel = object()
+    document = ensure_parent_paths(dict(layer_data), ops)
+    kept: list[PatchOp] = []
+    touched: list[str] = []
+    try:
+        for op in ops:
+            if (removed := _removed_model(op)) is not None:
+                key, of_a_field = removed
+                missing = JsonPointer(op.path).resolve(document, sentinel) is sentinel
+                if of_a_field and missing:
+                    continue
+                touched.append(key)
+            # A copy: applying the op's own value would let a later op of the
+            # batch change the caller's op, which is expanded more than once.
+            patch = copy.deepcopy(op.to_json_patch())
+            document = apply_json_patch(document, [patch], in_place=True)
+            kept.append(op)
+    except (JsonPatchException, JsonPointerException):
+        return ops
+    models = document.get("models")
+    if not touched or not isinstance(models, MutableMapping):
+        return kept
+    target = kept[0].target_layer_name
+    for key in dict.fromkeys(touched):
+        payload = models.get(key)
+        if isinstance(payload, Mapping) and _holds_only_names(key, payload):
+            del models[key]
+            kept.append(
+                RemoveOperationPatch(
+                    path=f"/models/{escape_json_pointer_token(key)}",
+                    target_layer_name=target,
+                )
+            )
+    if not models:
+        kept.append(RemoveOperationPatch(path="/models", target_layer_name=target))
+    return kept
 
 
 def _without_orphan_model_overrides(
@@ -464,6 +578,111 @@ def _mistral_thinking_levels() -> list[str]:
     return [*standard, *sorted(efforts - set(standard))]
 
 
+# The layers that may lock a model (``ModelConfig.requires``): the lock follows
+# the user's plan, which a user or project file must neither set nor lift.
+_REQUIREMENT_LAYERS: frozenset[str] = frozenset({CATALOG_LAYER, GrowthbookLayer.NAME})
+
+
+VIBE_BOT_CEILING_KEY: Final = "vibe_bot_max_approval_policy"
+VIBE_BOT_LOCAL_TOOLS_KEY: Final = "vibe_bot_local_tools"
+VIBE_BOT_LOCAL_TOOL_MAX_BYTES_KEY: Final = "vibe_bot_local_tool_max_bytes"
+# Vibebot is behind its flag: these settings stay out of the settings screens,
+# the published schema and exported configs.
+VIBE_BOT_KEYS: frozenset[str] = frozenset({
+    VIBE_BOT_CEILING_KEY,
+    VIBE_BOT_LOCAL_TOOLS_KEY,
+    VIBE_BOT_LOCAL_TOOL_MAX_BYTES_KEY,
+})
+# What the bot may call on this machine: only the user's own files set it,
+# never a repository, a session's overrides, a remote layer or an admin.
+_VIBE_BOT_LOCAL_TOOL_KEYS: frozenset[str] = frozenset({
+    VIBE_BOT_LOCAL_TOOLS_KEY,
+    VIBE_BOT_LOCAL_TOOL_MAX_BYTES_KEY,
+})
+_VIBE_BOT_LOCAL_TOOL_LAYERS: frozenset[str] = frozenset({
+    "default",
+    "user-toml",
+    "user-supplied",
+})
+# Only the user's own config sets how much a Vibebot-started session may do on
+# this machine: never a repository, a session's overrides, or a remote layer.
+_VIBE_BOT_CEILING_LAYERS: frozenset[str] = frozenset({
+    "default",
+    "user-toml",
+    "user-supplied",
+    "admin",
+})
+
+
+_POLICY_STRICTNESS: Mapping[str, int] = {
+    ApprovalPolicyName.ASK: 0,
+    ApprovalPolicyName.ACCEPT_EDITS: 1,
+    ApprovalPolicyName.SMART_APPROVE: 2,
+    ApprovalPolicyName.AUTO_APPROVE: 3,
+}
+
+
+def _without_vibe_bot_ceiling(
+    layers: list[tuple[str, dict[str, Any]]],
+) -> list[tuple[str, dict[str, Any]]]:
+    """Only the user's own config sets the ceiling; an admin's applies only
+    where it is stricter than what the layers below it set.
+    """
+    prepared: list[tuple[str, dict[str, Any]]] = []
+    below = ApprovalPolicyName.ASK.value
+    for name, data in layers:
+        value = data.get(VIBE_BOT_CEILING_KEY)
+        if value is None:
+            prepared.append((name, data))
+            continue
+        allowed = name in _VIBE_BOT_CEILING_LAYERS and (
+            name != "admin"
+            or _POLICY_STRICTNESS.get(str(value), -1) < _POLICY_STRICTNESS.get(below, 0)
+        )
+        if allowed:
+            below = str(value)
+            prepared.append((name, data))
+        else:
+            prepared.append((
+                name,
+                {k: v for k, v in data.items() if k != VIBE_BOT_CEILING_KEY},
+            ))
+    return prepared
+
+
+def _without_vibe_bot_local_tools(
+    layers: list[tuple[str, dict[str, Any]]],
+) -> list[tuple[str, dict[str, Any]]]:
+    return [
+        (
+            name,
+            data
+            if name in _VIBE_BOT_LOCAL_TOOL_LAYERS
+            or _VIBE_BOT_LOCAL_TOOL_KEYS.isdisjoint(data)
+            else {k: v for k, v in data.items() if k not in _VIBE_BOT_LOCAL_TOOL_KEYS},
+        )
+        for name, data in layers
+    ]
+
+
+def _without_requirements(data: dict[str, Any]) -> dict[str, Any]:
+    models = normalize_model_configs(data.get("models"))
+    if not isinstance(models, Mapping) or not any(
+        isinstance(payload, Mapping) and "requires" in payload
+        for payload in models.values()
+    ):
+        return data
+    return {
+        **data,
+        "models": {
+            alias: {key: value for key, value in payload.items() if key != "requires"}
+            if isinstance(payload, Mapping)
+            else payload
+            for alias, payload in models.items()
+        },
+    }
+
+
 class VibeConfigSchema(ConfigSchema):  # noqa: PLR0904 - the effective config read by every caller
     # Fields a runtime layer populates (model catalog, GrowthBook, managed
     # shell), never the user's files. The settings UI hides them; declare a new
@@ -477,9 +696,14 @@ class VibeConfigSchema(ConfigSchema):  # noqa: PLR0904 - the effective config re
         "routed_model_config",
         "routed_extra_models",
         "smart_approve_available",
+        "system_prompt_behavior",
     })
 
     _validation_warnings: list[str] = PrivateAttr(default_factory=list)
+    # Missing-model notices, logged by whoever reads them rather than at
+    # validation: startup validates the config before the cached experiment
+    # and catalog models apply, when a model they provide is still missing.
+    _missing_model_warnings: list[str] = PrivateAttr(default_factory=list)
     # The pin the fallback replaced, so validate_merged can skip the orphan
     # notice for the same alias.
     _missing_pin: str = PrivateAttr(default="")
@@ -489,6 +713,11 @@ class VibeConfigSchema(ConfigSchema):  # noqa: PLR0904 - the effective config re
     def validation_warnings(self) -> tuple[str, ...]:
         return tuple(self._validation_warnings)
 
+    @property
+    def missing_model_warnings(self) -> tuple[str, ...]:
+        """The notices for a pinned or configured model no layer provides."""
+        return tuple(self._missing_model_warnings)
+
     @classmethod
     def defines_entry(cls, key: str, payload: Any) -> bool:
         return key != "models" or defines_model(payload)
@@ -497,24 +726,16 @@ class VibeConfigSchema(ConfigSchema):  # noqa: PLR0904 - the effective config re
     def prepare_layers(
         cls, layers: list[tuple[str, dict[str, Any]]]
     ) -> list[tuple[str, dict[str, Any]]]:
-        layers = with_catalog_filter(layers)
-        # While the catalog lists models, the built-ins below it are unavailable;
-        # an empty catalog keeps them, and layers above still win their names.
-        catalog_lists_models = False
-        for name, data in layers:
-            if name == CATALOG_LAYER:
-                models = normalize_model_configs(data.get("models"))
-                catalog_lists_models = isinstance(models, Mapping) and bool(models)
-        if catalog_lists_models:
-            layers = [
-                (
-                    name,
-                    {key: value for key, value in data.items() if key != "models"}
-                    if name == DefaultConfigLayer.NAME
-                    else data,
-                )
-                for name, data in layers
-            ]
+        layers = [(name, _with_policy_default(data)) for name, data in layers]
+        layers = _without_vibe_bot_local_tools(
+            _without_vibe_bot_ceiling(
+                with_remote_models(without_telemetry_opt_ins(layers))
+            )
+        )
+        layers = [
+            (name, data if name in _REQUIREMENT_LAYERS else _without_requirements(data))
+            for name, data in layers
+        ]
         targets = catalog_alias_index(layers).targets
         if not targets:
             return layers
@@ -554,6 +775,14 @@ class VibeConfigSchema(ConfigSchema):  # noqa: PLR0904 - the effective config re
                         seen.add(path)
                         ops.append(op.model_copy(update={"path": path}))
         return ops
+
+    def expand_layer_writes(
+        self, operations: Sequence[PatchOp], layer_data: Mapping[str, Any]
+    ) -> list[PatchOp]:
+        ops = super().expand_layer_writes(operations, layer_data)
+        if not any(_removed_model(op) is not None for op in ops):
+            return ops
+        return _with_emptied_entries_removed(ops, layer_data)
 
     def layer_write_op(self, op: PatchOp, layer_data: Mapping[str, Any]) -> PatchOp:
         update: dict[str, Any] = {}
@@ -633,23 +862,34 @@ class VibeConfigSchema(ConfigSchema):  # noqa: PLR0904 - the effective config re
 
     def check_layer_keys(self, layers: Sequence[tuple[str, Mapping[str, Any]]]) -> None:
         from vibe.core.config._setting_keys import (
+            KeyIssueKind,
             UnusedConfigKeysError,
             check_strict_config_env,
             find_unused_keys,
             notice,
         )
 
+        for name, data in layers:
+            if sets_telemetry_on_off_only(name, data):
+                warning = ignored_telemetry_opt_in_warning(name)
+                logger.warning(warning)
+                self._validation_warnings.append(warning)
         check_strict_config_env()
         issues = find_unused_keys(type(self), layers)
         if not issues:
             return
-        if self.strict_config:
-            raise UnusedConfigKeysError(issues)
+        # A plugin's MCP tool, unseen here, may be what a tool filter names.
+        refused = [issue for issue in issues if issue.kind is not KeyIssueKind.NO_TOOL]
+        if self.strict_config and refused:
+            raise UnusedConfigKeysError(refused)
         for issue in issues:
             logger.warning(
                 "Config setting ignored: %s (%s)", issue.describe(), issue.layer
             )
         self._validation_warnings.extend(notice(issues))
+
+    def report_load_warnings(self, warnings: Sequence[str]) -> None:
+        self._validation_warnings.extend(warnings)
 
     @classmethod
     def validate_merged(
@@ -677,8 +917,8 @@ class VibeConfigSchema(ConfigSchema):  # noqa: PLR0904 - the effective config re
             message = (
                 f"Settings for model '{alias}' are ignored: no such model is available."
             )
-            logger.warning("%s", message)
             config._validation_warnings.append(message)
+            config._missing_model_warnings.append(message)
         # Model validators run before origins are assigned.
         if (
             config.origin_of("allowed_models") == AdminConfigLayer.NAME
@@ -688,16 +928,6 @@ class VibeConfigSchema(ConfigSchema):  # noqa: PLR0904 - the effective config re
             raise ValueError(
                 "Admin allowed_models matches none of the configured models."
             )
-        if config.origin_of("auto_compact_threshold") != AdminConfigLayer.NAME:
-            return config
-
-        models = {
-            alias: model.model_copy(
-                update={"auto_compact_threshold": config.auto_compact_threshold}
-            )
-            for alias, model in config.models.items()
-        }
-        object.__setattr__(config, "models", models)
         return config
 
     # Models
@@ -902,28 +1132,69 @@ class VibeConfigSchema(ConfigSchema):  # noqa: PLR0904 - the effective config re
         ),
     )
     default_agent: Annotated[str, WithReplaceMerge()] = Field(
-        default=BuiltinAgentName.ACCEPT_EDITS,
+        default=BuiltinAgentName.DEFAULT,
         description=(
-            "Agent profile to use when no --agent flag is passed. "
-            "Builtin: ask, accept-edits, smart-approve, auto-approve. "
-            "Applies in both interactive and programmatic (-p/--prompt) mode."
+            "Agent to use when no --agent flag is passed: 'default' (Vibe's own "
+            "instructions and tools), 'lean', or a custom agent. An approval policy "
+            "name here (ask, accept-edits, smart-approve, auto-approve) still sets "
+            "default_approval_policy, as before agents and policies were split."
+        ),
+    )
+    default_approval_policy: Annotated[str, WithReplaceMerge()] = Field(
+        default=ApprovalPolicyName.ACCEPT_EDITS,
+        description=(
+            "Approval policy to use when no --approval-policy flag is passed and "
+            "the agent names none. Builtin: ask, accept-edits, smart-approve, "
+            "auto-approve. Applies in both interactive and programmatic "
+            "(-p/--prompt) mode."
+        ),
+    )
+    vibe_bot_max_approval_policy: Annotated[str, WithReplaceMerge()] = Field(
+        default=ApprovalPolicyName.ASK,
+        description=(
+            "The most a Vibebot thread may let a session it starts on this machine "
+            "do: ask, accept-edits, smart-approve, or auto-approve. Such a session "
+            "runs the strictest of this, default_approval_policy, and the policy "
+            "the bot asks for."
+        ),
+    )
+    vibe_bot_local_tools: Annotated[
+        list[VibeBotLocalToolsEntry], WithReplaceMerge()
+    ] = Field(
+        default_factory=list,
+        description=(
+            "The local MCP tools a Vibebot thread may call on this machine, by "
+            "server and tool name or glob. None by default. A call runs the "
+            "strictest of the entry's approval and vibe_bot_max_approval_policy. "
+            "Under smart-approve, a tool runs without asking when it is read-only "
+            "as the server declares it (MCP readOnlyHint, the server's own claim): "
+            "list only servers you trust to say so."
+        ),
+    )
+    vibe_bot_local_tool_max_bytes: Annotated[int, WithReplaceMerge()] = Field(
+        default=8 * 1024,
+        gt=0,
+        le=64 * 1024,
+        description=(
+            "The most text a local tool call returns to Vibebot, in bytes; the "
+            "rest is cut and the answer says so."
         ),
     )
     # Kept off by default so smart approve ships dark until a cohort is opted in.
-    # The vibe_cli_default_agent experiment makes a mode the default by setting
-    # default_agent itself.
+    # The vibe_cli_default_agent experiment makes a policy the default through
+    # default_agent, which names a policy there.
     smart_approve_available: Annotated[bool, WithReplaceMerge()] = Field(
         default=False,
         description=(
-            "Expose the smart-approve mode in the mode picker/cycle. "
+            "Expose the smart-approve policy in the picker/cycle. "
             "Set by the vibe_cli_smart_approve experiment; does not change the default."
         ),
     )
     enable_auto_approve: Annotated[bool, WithReplaceMerge()] = Field(
         default=True,
         description=(
-            "Allow the auto-approve (YOLO) mode: the 'auto-approve' agent and the "
-            "--auto-approve/--yolo flag. When false, no agent with the 'yolo' safety "
+            "Allow the auto-approve (YOLO) mode: the 'auto-approve' policy and the "
+            "--auto-approve/--yolo flag. When false, no policy with the 'yolo' safety "
             "level is available and the flag and bypass_tool_permissions are ignored "
             "(per-tool permissions still apply). Intended for admin-managed "
             "(enterprise) config to forbid auto-approving tool calls."
@@ -989,12 +1260,12 @@ class VibeConfigSchema(ConfigSchema):  # noqa: PLR0904 - the effective config re
             " to local config."
         ),
     )
-    experimental_enable_local_projects: Annotated[bool, WithReplaceMerge()] = Field(
+    experimental_enable_storage_usage: Annotated[bool, WithReplaceMerge()] = Field(
         default=False,
         description=(
-            "Experimental, in development: switch Vibe Desktop to local projects"
-            " (local_projects.toml) instead of project links. Not used yet."
-            " Read once when Vibe Desktop starts its app server."
+            "Experimental: show Vibe's disk usage per session (/storage in the"
+            " CLI, the Storage panel in Desktop) and warn when the disk is"
+            " almost full."
         ),
     )
     enable_pr_monitoring: Annotated[bool, WithReplaceMerge()] = Field(
@@ -1010,13 +1281,19 @@ class VibeConfigSchema(ConfigSchema):  # noqa: PLR0904 - the effective config re
         ),
     )
     experimental_local_runtime_session_api: Annotated[bool, WithReplaceMerge()] = Field(
+        default=True,
+        description=(
+            "The app server drives local Sessions through the Session API."
+            " Set to false, or set VIBE_EXPERIMENTAL_LOCAL_RUNTIME_SESSION_API"
+            " to false, to call the local runtime directly instead. Read when a"
+            " Session opens."
+        ),
+    )
+    experimental_target_runtime: Annotated[bool, WithReplaceMerge()] = Field(
         default=False,
         description=(
-            "Experimental: the app server drives local Sessions through the"
-            " Session API instead of calling the local runtime directly. Set by"
-            " the vibe_cli_local_runtime_session_api_migration experiment; the"
-            " VIBE_EXPERIMENTAL_LOCAL_RUNTIME_SESSION_API environment variable"
-            " takes precedence. Read when a Session opens."
+            "Create new Sessions on the target runtime. Not supported yet: while"
+            " this is on, a new Session refuses its first message."
         ),
     )
 
@@ -1051,6 +1328,10 @@ class VibeConfigSchema(ConfigSchema):  # noqa: PLR0904 - the effective config re
         default_factory=list
     )
     disable_welcome_banner_animation: Annotated[bool, WithReplaceMerge()] = False
+    disable_selection_animation: Annotated[bool, WithReplaceMerge()] = Field(
+        default=False,
+        description="Skip the light that sweeps across a selection when it is copied.",
+    )
     cursor_blink: Annotated[bool, WithReplaceMerge()] = Field(
         default=True, description="Blink the input cursor. Disable for a steady cursor."
     )
@@ -1058,9 +1339,12 @@ class VibeConfigSchema(ConfigSchema):  # noqa: PLR0904 - the effective config re
         default=False,
         description="Edit the prompt input with vim Normal and Insert modes.",
     )
-    show_greeting: Annotated[bool, WithReplaceMerge()] = Field(
+    show_dangerous_directory_warning: Annotated[bool, WithReplaceMerge()] = Field(
         default=True,
-        description="Show greeting at startup (Mistral providers only, once per 24h).",
+        description=(
+            "Warn at startup when Vibe runs in a risky folder such as the home "
+            "directory."
+        ),
     )
     autocopy_to_clipboard: Annotated[bool, WithReplaceMerge()] = True
     enable_mouse_capture: Annotated[bool, WithReplaceMerge()] = Field(
@@ -1075,6 +1359,14 @@ class VibeConfigSchema(ConfigSchema):  # noqa: PLR0904 - the effective config re
         description=(
             "Pin the prompt of the conversation section at the top of the "
             "transcript while scrolling; a click scrolls back to it."
+        ),
+    )
+    collapse_turn_details: Annotated[bool, WithReplaceMerge()] = Field(
+        default=False,
+        description=(
+            "Once a turn's final answer arrives, collapse its intermediate "
+            "messages, reasoning and tool calls into one 'Worked for' group "
+            "above the answer; a click on the group shows them."
         ),
     )
     enable_file_autocomplete: Annotated[bool, WithReplaceMerge()] = Field(
@@ -1112,6 +1404,15 @@ class VibeConfigSchema(ConfigSchema):  # noqa: PLR0904 - the effective config re
         le=100,
         description="Maximum number of recent managed worktrees kept locally.",
     )
+    auto_worktree: Annotated[bool, WithReplaceMerge()] = Field(
+        default=False,
+        description=(
+            "Unless the user asks to work in their checkout, agents that "
+            "support worktrees enter a managed worktree before their first "
+            "edit. Off, agents edit the checkout in place and enter a "
+            "worktree only when the user asks for one."
+        ),
+    )
     worktree_copy_on_write: Annotated[bool, WithReplaceMerge()] = Field(
         default=True,
         description=(
@@ -1131,6 +1432,10 @@ class VibeConfigSchema(ConfigSchema):  # noqa: PLR0904 - the effective config re
     )
     enable_telemetry: Annotated[bool, WithReplaceMerge()] = True
     system_prompt_id: Annotated[str, WithReplaceMerge()] = SystemPrompt.CLI
+    # The system prompt's behavior, supplied at runtime by the GrowthBook layer.
+    # When set, the Unified runtime uses it in place of the ``system_prompt_id``
+    # variant's, unless a layer above GrowthBook chose ``system_prompt_id``.
+    system_prompt_behavior: Annotated[str, WithReplaceMerge()] = ""
     managed_shell_tools_enabled: Annotated[bool, WithReplaceMerge()] = False
     enable_background_processes: Annotated[bool, WithReplaceMerge()] = Field(
         default=True,
@@ -1152,7 +1457,8 @@ class VibeConfigSchema(ConfigSchema):  # noqa: PLR0904 - the effective config re
         ge=1,
         description=(
             "Maximum number of subagents that can be alive at once; a spawn "
-            "beyond this fails until a subagent is stopped."
+            "beyond this closes the subagent that has waited longest, and fails "
+            "while none is waiting. A session starts at most 128 subagents."
         ),
     )
     max_concurrent_subagents: Annotated[int, WithReplaceMerge()] = Field(
@@ -1164,7 +1470,11 @@ class VibeConfigSchema(ConfigSchema):  # noqa: PLR0904 - the effective config re
             "finishes its turn."
         ),
     )
-    compaction_prompt_id: Annotated[str, WithReplaceMerge()] = UtilityPrompt.COMPACT
+    compaction_prompt_id: Annotated[str, WithReplaceMerge()] = Field(
+        default="compact",
+        deprecated="No longer used; remove this setting from your config.",
+        description="Retired: accepted for older configs, with no effect.",
+    )
     title_prompt_id: Annotated[str, WithReplaceMerge()] = UtilityPrompt.SESSION_TITLE
     include_commit_signature: Annotated[bool, WithReplaceMerge()] = True
     include_model_info: Annotated[bool, WithReplaceMerge()] = Field(
@@ -1189,11 +1499,29 @@ class VibeConfigSchema(ConfigSchema):  # noqa: PLR0904 - the effective config re
     enable_update_checks: Annotated[bool, WithReplaceMerge()] = True
     enable_auto_update: Annotated[bool, WithReplaceMerge()] = True
     enable_notifications: Annotated[bool, WithReplaceMerge()] = True
+    keep_awake: Annotated[bool, WithReplaceMerge()] = Field(
+        default=False,
+        description=(
+            "Keep the machine from idle-sleeping while a turn runs or waits for"
+            " an approval or a question. The display can still sleep, and closing"
+            " the lid still puts the machine to sleep. macOS (caffeinate), Linux"
+            " (a systemd-inhibit idle lock) and Windows (SetThreadExecutionState)."
+            " Vibe Desktop sessions follow Desktop's own setting instead."
+        ),
+    )
     experimental_enable_tab_status: Annotated[bool, WithReplaceMerge()] = True
-    enable_system_trust_store: Annotated[bool, WithReplaceMerge()] = False
+    enable_system_trust_store: Annotated[bool, WithReplaceMerge()] = True
     api_timeout: Annotated[float, WithReplaceMerge()] = DEFAULT_API_TIMEOUT
     api_retry_max_elapsed_time: Annotated[float, WithReplaceMerge()] = (
         DEFAULT_API_RETRY_MAX_ELAPSED_TIME
+    )
+    max_goal_token_budget: Annotated[int | None, WithReplaceMerge()] = Field(
+        default=None,
+        gt=0,
+        description=(
+            "Highest token budget a /goal may set; a goal set without a budget "
+            "gets this one. Unset allows any budget, and a goal without a budget."
+        ),
     )
     api_stream_idle_timeout: Annotated[float, WithReplaceMerge()] = Field(
         default=DEFAULT_API_STREAM_IDLE_TIMEOUT,
@@ -1286,7 +1614,9 @@ class VibeConfigSchema(ConfigSchema):  # noqa: PLR0904 - the effective config re
     )
 
     def resolve_default_model_alias(self) -> str:
-        available = self.available_models()
+        # When every model is locked, one of them is the default anyway: its
+        # turn is refused with the upsell, where no default fails the config.
+        available = self.runnable_models() or self.available_models()
         if self.routed_default_model and self.routed_default_model in available:
             return self.routed_default_model
         if self.catalog_default_model in available:
@@ -1325,6 +1655,17 @@ class VibeConfigSchema(ConfigSchema):  # noqa: PLR0904 - the effective config re
         # "allow all" rather than bricking model selection; the mismatch already
         # surfaces as a warning.
         return allowed or self.models
+
+    def runnable_models(self) -> dict[str, ModelConfig]:
+        """The available models the user's plan can run: those Vibe may pick on
+        its own. A locked model (``ModelConfig.requires``) runs only when the
+        user picks it, and then its turn is refused.
+        """
+        return {
+            alias: model
+            for alias, model in self.available_models().items()
+            if model.requires is None
+        }
 
     def get_active_model(self) -> ModelConfig:
         if self.active_model and self.active_model not in self.models:
@@ -1386,7 +1727,7 @@ class VibeConfigSchema(ConfigSchema):  # noqa: PLR0904 - the effective config re
         return next(
             (
                 model
-                for model in self.available_models().values()
+                for model in self.runnable_models().values()
                 if model.supports_images and model.provider == active.provider
             ),
             None,
@@ -1467,7 +1808,9 @@ class VibeConfigSchema(ConfigSchema):  # noqa: PLR0904 - the effective config re
         if provider := next(
             (p for p in self.transcribe_providers if p.name == model.provider), None
         ):
-            return provider
+            return self._on_mistral_server(
+                provider, DEFAULT_TRANSCRIBE_PROVIDERS, transcription_server
+            )
         raise ValueError(
             f"Transcribe provider '{model.provider}' for transcribe model '{model.name}' not found in configuration."
         )
@@ -1485,22 +1828,36 @@ class VibeConfigSchema(ConfigSchema):  # noqa: PLR0904 - the effective config re
         if provider := next(
             (p for p in self.tts_providers if p.name == model.provider), None
         ):
-            return provider
+            return self._on_mistral_server(
+                provider, DEFAULT_TTS_PROVIDERS, speech_server
+            )
         raise ValueError(
             f"TTS provider '{model.provider}' for TTS model '{model.name}' not found in configuration."
+        )
+
+    def _on_mistral_server[P: (TranscribeProviderConfig, TTSProviderConfig)](
+        self, provider: P, defaults: list[P], server_for: Callable[[str], str | None]
+    ) -> P:
+        # A voice provider on its built-in address follows the Mistral
+        # provider's server, so a self-hosted or private-cloud deployment does
+        # not send audio to api.mistral.ai. Compared by value, not by layer:
+        # configs from before July 2026 hold the built-in entries Vibe wrote
+        # there, and a layer adding another provider must not stop this one.
+        # A provider given another address keeps it. On the Mistral server it
+        # authenticates as the Mistral provider does: same key variable.
+        built_in = next((p for p in defaults if p.name == provider.name), None)
+        if built_in is None or provider.api_base != built_in.api_base:
+            return provider
+        mistral = self.get_mistral_provider()
+        if mistral is None or (server := server_for(mistral.api_base)) is None:
+            return provider
+        return provider.model_copy(
+            update={"api_base": server, "api_key_env_var": mistral.api_key_env_var}
         )
 
     @property
     def system_prompt(self) -> str:
         return load_system_prompt(self.system_prompt_id)
-
-    @property
-    def compaction_prompt(self) -> str:
-        return load_prompt(
-            self.compaction_prompt_id,
-            setting_name="compaction_prompt_id",
-            builtins={"compact": UtilityPrompt.COMPACT.path},
-        )
 
     @property
     def title_prompt(self) -> str:
@@ -1620,8 +1977,8 @@ class VibeConfigSchema(ConfigSchema):  # noqa: PLR0904 - the effective config re
                 f"Model '{unknown}' is not available — running '{label or fallback}'. "
                 "Pick another model to stop this notice."
             )
-            logger.warning("%s", message)
             self._validation_warnings.append(message)
+            self._missing_model_warnings.append(message)
             object.__setattr__(self, "_missing_pin", unknown)
             object.__setattr__(self, "active_model", UNPINNED_ACTIVE_MODEL)
         return self
@@ -1709,14 +2066,19 @@ class VibeConfigSchema(ConfigSchema):  # noqa: PLR0904 - the effective config re
         )
         return self
 
+    @model_validator(mode="before")
+    @classmethod
+    def _read_policy_default_agent(cls, data: Any) -> Any:
+        return _with_policy_default(data) if isinstance(data, dict) else data
+
     @model_validator(mode="after")
     def _warn_removed_default_agent(self) -> VibeConfigSchema:
         if (replacement := REMOVED_BUILTIN_AGENTS.get(self.default_agent)) is None:
             return self
         self._validation_warnings.append(
             f"Default agent '{self.default_agent}' is no longer built in — sessions "
-            f"start on '{replacement}' unless a custom agent is named "
-            f"'{self.default_agent}'. Set default_agent to another agent."
+            f"start on the '{replacement}' policy unless a custom agent is named "
+            f"'{self.default_agent}'. Set default_approval_policy instead."
         )
         return self
 
@@ -1794,11 +2156,6 @@ class VibeConfigSchema(ConfigSchema):  # noqa: PLR0904 - the effective config re
         return self
 
     @model_validator(mode="after")
-    def _check_compaction_prompt(self) -> VibeConfigSchema:
-        _ = self.compaction_prompt
-        return self
-
-    @model_validator(mode="after")
     def _check_title_prompt(self) -> VibeConfigSchema:
         _ = self.title_prompt
         return self
@@ -1823,3 +2180,21 @@ def create_default_config() -> dict[str, Any]:
     if tool_defaults := discover_tool_defaults():
         config_dict["tools"] = tool_defaults
     return config_dict
+
+
+def _with_policy_default(data: dict[str, Any]) -> dict[str, Any]:
+    """Read a ``default_agent`` naming an approval policy as that layer's
+    ``default_approval_policy``, as it meant before agents and policies split.
+
+    Done per layer, before the merge, so the policy keeps the precedence and
+    the origin of the layer that set it: an experiment's default stays below
+    the user's own.
+    """
+    name = data.get("default_agent")
+    if not isinstance(name, str):
+        return data
+    if name not in BUILTIN_APPROVAL_POLICIES:
+        return data
+    moved = {key: value for key, value in data.items() if key != "default_agent"}
+    moved.setdefault("default_approval_policy", name)
+    return moved

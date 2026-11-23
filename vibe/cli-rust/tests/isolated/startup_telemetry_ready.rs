@@ -73,7 +73,6 @@ impl Startup {
             startup_cache,
             config: ConfigRead {
                 enable_update_checks: false,
-                show_greeting: false,
                 ..ConfigRead::default()
             },
             state: json!({"eventId": 0, "session": {"id": "session"}}),
@@ -144,6 +143,7 @@ async fn ready_sends_one_startup_event_with_agent_ready_after_the_first_frame() 
     assert_eq!(properties["is_cold_start"], true);
     assert_eq!(properties["mouse_capture"], true);
     assert_eq!(properties["vim_keybindings"], false);
+    assert!(properties["environment"].is_object());
 }
 
 #[tokio::test]

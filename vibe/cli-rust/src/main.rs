@@ -183,7 +183,7 @@ async fn run() -> Result<std::process::ExitCode> {
         return Ok(exit_code);
     }
 
-    // No local config read exists here, so the `enableTelemetry` gate is
+    // No local config read exists here, so the `crashReportsEnabled` gate is
     // unknowable before Ready: `SENTRY_DSN` is the operator's opt-in that
     // covers the spawn/handshake window. Ready reconfigures per config.
     observability::sentry::init_pre_ready(
@@ -275,7 +275,7 @@ async fn run() -> Result<std::process::ExitCode> {
         None => vibe_rs::server::signal::install().context("install signal handlers")?,
     };
     // The probe only queries the terminal, so capture can be turned on later with pixel reports.
-    vibe_rs::mouse::pixels::probe();
+    vibe_rs::terminal_probe::run();
     // The cached setting decides capture from the first frame; each redraw then follows the live config.
     let (mut terminal, mut terminal_guard) = terminal::init(startup_config.enable_mouse_capture)?;
     timings.record("terminal_ready");
@@ -358,7 +358,9 @@ async fn run() -> Result<std::process::ExitCode> {
         return Ok(code);
     }
     vibe_rs::event_handler::announce_resume(&mut app);
-    vibe_rs::event_handler::show_dangerous_directory_warning(&mut app);
+    if !show_unready_config {
+        vibe_rs::event_handler::show_dangerous_directory_warning(&mut app);
+    }
     // A worktree run spawned the client pre-TUI and drove the handshake
     // while the gate waited; everything it absorbed is replayed after the
     // channels exist, below. A normal launch spawns behind the drawn frame

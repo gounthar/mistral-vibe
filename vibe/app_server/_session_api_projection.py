@@ -25,6 +25,7 @@ from mistralai_vibe_local_harness.session_api.app_server.session.models import (
     HistoryEntry,
     HistoryEntryAdapter,
     HistoryEntryAddedEvent,
+    HistoryEntryBase,
     HistoryEntryCompletedEvent,
     HistoryEntryPatchedEvent,
     ImageContentBlock,
@@ -299,10 +300,14 @@ def _raw_effect(
         "title": display.get("title") or call.name,
         "detail": cast(Any, detail),
         "state": cast(Any, state),
+        # Only a model's call has an ID of its own to name: a Host effect, such
+        # as a manual shell command, is its own call, and the client already
+        # holds it, as it streamed, without one.
+        **({"toolCallId": call.tool_call_id} if call.tool_call_id != entry_id else {}),
     }
 
 
-def _base(entry: HistoryEntry, session_id: str) -> JsonObject:
+def _base(entry: HistoryEntryBase, session_id: str) -> JsonObject:
     related = entry.annotations.get(VIBE_PREFIX + "relatedEntryId")
     input_entry = entry.annotations.get(VIBE_PREFIX + "inputEntryId")
     return {
@@ -319,7 +324,7 @@ def _base(entry: HistoryEntry, session_id: str) -> JsonObject:
     }
 
 
-def _vibe_fields(entry: HistoryEntry, keys: Sequence[str]) -> JsonObject:
+def _vibe_fields(entry: HistoryEntryBase, keys: Sequence[str]) -> JsonObject:
     return {
         key: entry.annotations[VIBE_PREFIX + key]
         for key in keys

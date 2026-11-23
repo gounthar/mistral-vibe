@@ -147,7 +147,6 @@ CONNECTOR_CATALOG_POLICY: Final = RefreshPolicy(
     fetch_timeout_s=CONNECTOR_CATALOG_FETCH_TIMEOUT_S,
 )
 _MAX_CONNECTORS = 256
-_MAX_TOOLS_PER_CONNECTOR = 128
 _MAX_INPUT_SCHEMA_BYTES = 64 * 1024
 _MAX_DIAGNOSTICS_PER_CONNECTOR = 3
 _MAX_DIAGNOSTIC_CHARACTERS = 512
@@ -1834,7 +1833,7 @@ def _project_catalog_entry(connector: ResolvedConnector) -> ConnectorCatalogEntr
     return ConnectorCatalogEntryView(
         alias=connector.alias,
         display_name=connector.display_name,
-        readiness=_connector_readiness(connector),
+        readiness=connector_readiness(connector),
         auth_action=connector.auth_action,
         tools=[
             ConnectorCatalogToolView(name=tool.raw_name, description=tool.description)
@@ -1844,9 +1843,10 @@ def _project_catalog_entry(connector: ResolvedConnector) -> ConnectorCatalogEntr
     )
 
 
-def _connector_readiness(
+def connector_readiness(
     connector: ResolvedConnector,
 ) -> Literal["ready", "needs_auth", "needs_setup", "needs_connect", "unavailable"]:
+    """What the user must do before the connector's tools load, if anything."""
     if connector.ready:
         return "ready"
     if connector.auth_action == "oauth":
@@ -2186,11 +2186,6 @@ def _resolve_connector_tools(
     raw_connector: _BootstrapConnector, *, raw_id: str
 ) -> tuple[ResolvedConnectorTool, ...]:
     """Resolve one connector's tools, raising on per-connector contract breaches."""
-    if len(raw_connector.tools) > _MAX_TOOLS_PER_CONNECTOR:
-        raise ConnectorCatalogValidationError(
-            f"Connector {raw_id!r} exceeds {_MAX_TOOLS_PER_CONNECTOR} tools",
-            reason="too_many_tools",
-        )
     # Drop a single unusable tool (malformed wire, oversized schema, missing name)
     # on its own so the connector keeps its remaining tools.
     resolved: list[ResolvedConnectorTool] = []

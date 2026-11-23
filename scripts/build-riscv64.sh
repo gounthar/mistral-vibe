@@ -120,18 +120,48 @@ cd "$PROJECT_DIR"
 # riscv64 wheels, forcing source builds. Newer patch releases ship wheels.
 info "Patching pyproject.toml for riscv64 compatibility..."
 cp pyproject.toml pyproject.toml.bak
-trap 'mv -f pyproject.toml.bak pyproject.toml 2>/dev/null || true' EXIT
+cp pyinstaller/unified_runtime.py pyinstaller/unified_runtime.py.bak
+trap 'mv -f pyproject.toml.bak pyproject.toml 2>/dev/null || true; mv -f pyinstaller/unified_runtime.py.bak pyinstaller/unified_runtime.py 2>/dev/null || true' EXIT
 # Relax cryptography upper bound: pinned versions may lack riscv64 wheels
 sed -i 's/"cryptography>=\([0-9.]*\),<=\?[0-9.]*"/"cryptography>=\1"/' pyproject.toml
 # Remove typos from dev deps: its PyPI sdist has a broken pyproject.toml
 # that uv cannot parse, and uv resolves dev deps even with --no-dev
 sed -i '/"typos>=/d' pyproject.toml
-# Drop the Unified Harness runtime: PyPI ships wheels only (no sdist) for
-# x86_64, aarch64, macOS and Windows, so riscv64 has nothing to resolve.
-# Every reference to it under vibe/ is a lazy import guarded by
-# experimental_harness_available(), so the binary runs fine without it --
-# only the --experimental-harness backend is unavailable.
-sed -i '/"mistralai-vibe-local-harness==/d' pyproject.toml
+# Since v3.1.3 the Unified Runtime (mistralai_vibe_local_harness) is built
+# from the in-tree harness/ Rust sources by the maturin backend, so riscv64
+# compiles it like any other platform. The separate target runtime
+# (mistralai.vibe.harness, PyPI dist mistralai-vibe-harness) ships wheels only
+# (no sdist) for x86_64, aarch64, macOS and Windows, so riscv64 has nothing to
+# resolve. Upstream's pyinstaller/unified_runtime.py says no module imports it
+# statically yet; it is only collected so the frozen binary carries it. Drop
+# the dependency and skip its collection in the spec helper.
+sed -i '/"mistralai-vibe-harness==/d; /^mistralai-vibe-harness = /d' pyproject.toml
+python3 - <<'PY'
+from pathlib import Path
+p = Path("pyinstaller/unified_runtime.py")
+s = p.read_text()
+patches = [
+    ("    require_unified_runtime()\n    require_target_runtime()\n",
+     "    require_unified_runtime()\n"),
+    ("    packages = [_RUNTIME_PACKAGE, _TARGET_RUNTIME_PACKAGE]\n",
+     "    packages = [_RUNTIME_PACKAGE]\n"),
+]
+for old, new in patches:
+    if s.count(old) != 1:
+        raise SystemExit(f"unified_runtime.py patch no longer applies: {old!r}")
+    s = s.replace(old, new)
+p.write_text(s)
+PY
+# Dropping the target runtime is only safe while nothing imports it. If
+# upstream starts importing it, --version/--help would still pass while real
+# features break, so refuse to build instead.
+harness_imports="$(grep -rnE '^\s*(from|import)\s+mistralai\.vibe\.harness|import_module\(\s*["'"'"']mistralai\.vibe\.harness|from\s+mistralai\.vibe\s+import\s+harness' \
+  --include='*.py' vibe harness/runtimes/python/python || true)"
+if [[ -n "$harness_imports" ]]; then
+  error "Upstream now imports mistralai.vibe.harness, which has no riscv64 build:"
+  echo "$harness_imports" >&2
+  exit 1
+fi
 
 # Limit concurrent Rust builds to avoid overwhelming riscv64 boards
 export UV_CONCURRENT_BUILDS=1

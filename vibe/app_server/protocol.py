@@ -19,6 +19,7 @@ from pydantic import (
 
 from vibe.app_server._connection_protocol import (
     CallbackKind as CallbackKind,
+    ClientAccount as ClientAccount,
     ClientCapabilities as ClientCapabilities,
     ClientInfo as ClientInfo,
     ClientToolCapability as ClientToolCapability,
@@ -48,6 +49,7 @@ from vibe.app_server.models import (
     AccountView,
     AgentStatsSnapshot,
     AgentSummary,
+    ApprovalPolicySummary,
     ConfigIssue,
     ConnectorCounts,
     ContentBlock,
@@ -71,6 +73,7 @@ from vibe.app_server.models import (
     PublicCallbackEntry,
     PublicChildSession,
     PublicError,
+    PublicGoal,
     PublicHistoryEntry,
     PublicRetryCategory,
     PublicSession,
@@ -128,6 +131,9 @@ SERVER_METHODS: tuple[str, ...] = (
     "config/read",
     "config/reload",
     "config/schema",
+    "config/subscribe",
+    "config/telemetry/read",
+    "config/telemetry/update",
     "config/write",
     "connectors/auth/read",
     "connectors/read",
@@ -146,6 +152,9 @@ SERVER_METHODS: tuple[str, ...] = (
     "imports/discover",
     "imports/read",
     "imports/start",
+    "goal/clear",
+    "goal/get",
+    "goal/set",
     "loops/clear",
     "loops/create",
     "loops/delete",
@@ -178,9 +187,12 @@ SERVER_METHODS: tuple[str, ...] = (
     "projectLinks/save",
     "projectLinks/unlink",
     "projects/create",
+    "projects/link",
     "projects/list",
     "projects/remove",
     "projects/rename",
+    "projects/retireCloud",
+    "projects/setCloud",
     "review/approve",
     "review/baseline",
     "review/hunks",
@@ -189,6 +201,7 @@ SERVER_METHODS: tuple[str, ...] = (
     "review/turnDiff",
     "runtime/read",
     "session/agent/update",
+    "session/approvalPolicy/update",
     "session/backgroundProcess/output",
     "session/backgroundProcess/stop",
     "session/compact",
@@ -235,6 +248,7 @@ SERVER_METHODS: tuple[str, ...] = (
     "shell/run",
     "skills/catalog",
     "skills/convertLocal",
+    "skills/deleteLocal",
     "skills/detail",
     "skills/import",
     "skills/installed",
@@ -251,6 +265,13 @@ SERVER_METHODS: tuple[str, ...] = (
     "skills/setVersion",
     "skills/updates",
     "skills/versions",
+    "storage/leftovers/clean",
+    "storage/sessions/delete",
+    "storage/usage/read",
+    "vibebot/deliver",
+    "vibebot/follow",
+    "vibebot/localTools",
+    "storage/usage/refresh",
     "telemetry/record",
     "session/turn/enqueue",
     "session/turn/queue/edit/cancel",
@@ -266,12 +287,17 @@ SERVER_METHODS: tuple[str, ...] = (
     "turn/start",
     "turn/steer",
     "workspace/git/checkouts",
+    "workspace/git/worktrees/auto/update",
     "workspace/git/worktrees/limit/update",
     "workspace/git/worktrees/list",
     "workspace/git/worktrees/prune",
     "workspace/git/worktrees/remove",
     "workspace/prompt/prepare",
     "workspace/trust/decision",
+    "workspace/trust/folders/add",
+    "workspace/trust/folders/inspect",
+    "workspace/trust/folders/list",
+    "workspace/trust/folders/update",
     "workspace/trust/untrustedConfig",
     "workspace/trust/status",
 )
@@ -394,7 +420,10 @@ class AgentConfig(ProtocolModel):
     cwd: str | None = None
     workspace_roots: list[str] = Field(default_factory=list)
     worktree: WorktreeInput | None = None
+    # The agent; a policy name here is read as ``approval_policy``, as it
+    # meant before agents and policies split.
     agent: str | None = None
+    approval_policy: str | None = None
     auto_approve: bool = False
     enabled_tools: list[str] | None = None
     disabled_tools: list[str] = Field(default_factory=list)
@@ -481,9 +510,14 @@ class SessionStartParams(SessionOpenParams):
     session_only: bool = False
     first_turn: SessionStartTurn | None = None
     # The session that started this one to hand it first_turn; saved with the
-    # session and listed by `session/list`. A session another started cannot
-    # start sessions itself.
+    # session and listed by `session/list`. A session attached to its starter
+    # cannot start sessions itself; a detached one is started without it.
     started_by_session_id: str | None = None
+    # The session whose `session/spawn` asked for this start, attached or
+    # detached: the session then runs that session's approval policy as it is
+    # now, read live or from its saved pin, and a start asking for another
+    # one, or for auto-approve, is refused.
+    spawned_by_session_id: str | None = Field(default=None, min_length=1)
     # How many session messages and starts led to first_turn since a user
     # wrote; see `SessionPeerSendParams.hops`.
     hops: int = Field(default=0, ge=0, exclude_if=lambda value: value == 0)
@@ -538,6 +572,10 @@ class SessionLeaseEnded(ProtocolModel):
 
 class SessionResumeParams(SessionOpenParams):
     session_id: str
+    interrupt_left_turn: bool = False
+    """End the turn a stopped process left running in the session, and in its
+    subagents, as interrupted, instead of carrying it on: nothing is sent, run
+    or asked again."""
 
 
 class SessionResumeResponse(EventWatermarkResponse):
@@ -569,6 +607,8 @@ class SessionForkResponse(EventWatermarkResponse):
 
 class SessionStopParams(ProtocolModel):
     session_id: str
+    # The session_end hooks' reason: ``other`` when the session is deleted. Any
+    # other value, as older clients sent, ends it with ``exit``.
     reason: str | None = None
 
 
@@ -708,6 +748,9 @@ class SessionListParams(ProtocolModel):
     # ``None`` asks for both.
     pinned: bool | None = None
     include_archived: bool = False
+    # Only the sessions that owe another session a reply, which a client
+    # resumes when it starts so the reply goes out.
+    owes_reply: bool = Field(default=False, exclude_if=lambda value: not value)
     # Only the given sessions, read without the others; and extras for the
     # page's sessions when asked for.
     session_ids: list[str] | None = Field(
@@ -716,6 +759,9 @@ class SessionListParams(ProtocolModel):
     include: list[SessionListInclude] = Field(
         default_factory=list, exclude_if=lambda value: not value
     )
+    # Only the root sessions an app server that stopped or died left with a
+    # turn running: a client resumes them so the turn carries on.
+    interrupted: bool = Field(default=False, exclude_if=lambda value: not value)
 
 
 type SessionListInclude = Literal["pullRequests"]
@@ -956,6 +1002,248 @@ class ImportJobReadResponse(ProtocolModel):
 class ImportJobUpdatedParams(ProtocolModel):
     event_id: int = Field(ge=0, strict=True)
     job: ImportJob | None
+
+
+# Storage usage: how much of the disk Vibe uses, per session. Every field a
+# client reads has a default, so an older or newer server still parses.
+type StorageUsageStatus = Literal["up_to_date", "refreshing", "partial", "failed"]
+type StorageSizeKind = Literal["private", "allocated"]
+type StorageOtherKind = Literal[
+    "worktree_template",
+    "worktree_trash",
+    "worktrees_unknown",
+    "shared_scratchpad",
+    "orphan_history",
+    "logs_and_caches",
+]
+type StorageUsageRefreshReason = Literal[
+    "fresh", "already_running", "running_elsewhere"
+]
+STORAGE_USAGE_UPDATED: Final = "storage/usage/updated"
+
+
+class StorageUsageReadParams(ProtocolModel):
+    pass
+
+
+class StorageDiskSpace(ProtocolModel):
+    total_bytes: int = 0
+    free_bytes: int = 0
+    # Free space below it is low: the lower of 10% of the disk and 20 GB.
+    low_threshold_bytes: int = 0
+    is_low: bool = False
+    read_at: int = 0
+
+
+class StorageUsageTotals(ProtocolModel):
+    active_sessions_bytes: int = 0
+    archived_sessions_bytes: int = 0
+    leftover_worktrees_bytes: int = 0
+    other_vibe_data_bytes: int = 0
+    # Each worktree once; worktrees not measured yet are left out.
+    total_bytes: int = 0
+
+
+class StorageSessionUsage(ProtocolModel):
+    session_id: str
+    title: str | None = None
+    cwd: str | None = None
+    archived: bool = False
+    # A process holds the session's lease, checked at read time.
+    open: bool = False
+    last_activity_at: int = 0
+    # Subagent children included.
+    history_bytes: int = 0
+    # The worktree the session works in, when it claims several: the one its
+    # folder is in, else the first.
+    worktree_id: str | None = None
+    # Every worktree the session claims, ``worktree_id`` first. Empty from a
+    # server before this field: ``worktree_id`` alone then.
+    worktree_ids: list[str] = Field(default_factory=list)
+    # The session's own history folder, absolute; its subagent children's
+    # folders are counted in ``history_bytes`` but live beside it. None from a
+    # server before this field. Local clients only, never telemetry.
+    history_path: str | None = None
+    # What ``storage/sessions/delete`` of this session alone frees, set at
+    # read time from the snapshot: its history, and each worktree no other
+    # session claims. None: unknown, from a server or a cache before it.
+    delete_bytes: int | None = None
+    # One of those worktrees is not measured yet: ``delete_bytes`` is a
+    # lower bound.
+    delete_bytes_at_least: bool = False
+
+
+class StorageWorktreeUsage(ProtocolModel):
+    # "<bucket>/<name>"
+    id: str
+    path: str
+    branch: str | None = None
+    repo_name: str | None = None
+    # None: not measured yet.
+    bytes: int | None = None
+    measured_at: int | None = None
+    session_ids: list[str] = Field(default_factory=list)
+    leftover: bool = False
+    # False: a folder with no claim.
+    managed: bool = True
+    is_copy_on_write: bool = False
+
+
+class StorageOtherUsage(ProtocolModel):
+    kind: StorageOtherKind
+    path: str
+    bytes: int = 0
+
+
+class StorageArchiveSuggestion(ProtocolModel):
+    inactive_days: int = 30
+    session_ids: list[str] = Field(default_factory=list)
+    # Unmeasured worktrees count for nothing in it.
+    reclaimable_bytes: int = 0
+    # A worktree the action would free is not measured yet:
+    # ``reclaimable_bytes`` is a lower bound.
+    reclaimable_at_least: bool = False
+
+
+class StorageLeftoverFolder(ProtocolModel):
+    # "<bucket>/<name>", as a worktree id.
+    id: str
+    path: str
+    bytes: int = 0
+
+
+class StorageLeftoverCleanup(ProtocolModel):
+    """What ``storage/leftovers/clean`` would remove: worktrees no session
+    claims, and folders of a worktree bucket with no claim and no ``.git``.
+    The server checks each again when asked to remove it.
+    """
+
+    worktree_ids: list[str] = Field(default_factory=list)
+    unknown_folders: list[StorageLeftoverFolder] = Field(default_factory=list)
+    # The measured worktrees' sizes and the folders' sizes.
+    reclaimable_bytes: int = 0
+
+
+class StorageUsageSnapshot(ProtocolModel):
+    scan_started_at: int
+    measured_at: int
+    duration_ms: int = 0
+    # Every worktree was re-measured.
+    full: bool = False
+    size_kind: StorageSizeKind = "allocated"
+    skipped_entry_count: int = 0
+    not_measured_count: int = 0
+    totals: StorageUsageTotals = Field(default_factory=StorageUsageTotals)
+    sessions: list[StorageSessionUsage] = Field(default_factory=list)
+    worktrees: list[StorageWorktreeUsage] = Field(default_factory=list)
+    other: list[StorageOtherUsage] = Field(default_factory=list)
+    archive_suggestion: StorageArchiveSuggestion = Field(
+        default_factory=StorageArchiveSuggestion
+    )
+    # Archived sessions idle as long, and what deleting them frees: their
+    # histories and each worktree no other session would still use.
+    delete_suggestion: StorageArchiveSuggestion = Field(
+        default_factory=StorageArchiveSuggestion
+    )
+    leftover_cleanup: StorageLeftoverCleanup = Field(
+        default_factory=StorageLeftoverCleanup
+    )
+
+
+class StorageUsageReadResponse(ProtocolModel):
+    status: StorageUsageStatus = "up_to_date"
+    # None before the first scan.
+    snapshot: StorageUsageSnapshot | None = None
+    disk: StorageDiskSpace = Field(default_factory=StorageDiskSpace)
+    # An archive, delete or worktree removal happened after the scan started.
+    stale: bool = False
+
+
+class StorageLeftoversCleanParams(ProtocolModel):
+    worktree_ids: list[str] = Field(default_factory=list)
+    folder_ids: list[str] = Field(default_factory=list)
+
+
+# ``too_large_to_check``: the folder's freshness walk ran out of time or
+# entries before it could tell the folder is unused.
+type StorageLeftoverKeptReason = Literal[
+    "claimed",
+    "in_use",
+    "kept_dirty",
+    "not_found",
+    "unsafe",
+    "error",
+    "too_large_to_check",
+]
+
+
+class StorageLeftoverKept(ProtocolModel):
+    id: str
+    reason: StorageLeftoverKeptReason
+
+
+class StorageLeftoversCleanResponse(ProtocolModel):
+    removed: list[str] = Field(default_factory=list)
+    kept: list[StorageLeftoverKept] = Field(default_factory=list)
+
+
+class StorageSessionsDeleteParams(ProtocolModel):
+    session_ids: list[str] = Field(default_factory=list)
+
+
+type StorageSessionKeptReason = Literal["in_use", "not_found", "error"]
+
+
+class StorageSessionKept(ProtocolModel):
+    id: str
+    reason: StorageSessionKeptReason
+
+
+class StorageSessionsDeleteResponse(ProtocolModel):
+    removed: list[str] = Field(default_factory=list)
+    kept: list[StorageSessionKept] = Field(default_factory=list)
+    # The worktrees the deletes freed, and those kept with why.
+    removed_worktree_ids: list[str] = Field(default_factory=list)
+    kept_worktrees: list[StorageLeftoverKept] = Field(default_factory=list)
+    # The removed sessions' histories and the removed worktrees, as the last
+    # measurement sized them.
+    freed_bytes: int = 0
+    # A removed worktree was not measured yet: ``freed_bytes`` is a floor.
+    freed_bytes_at_least: bool = False
+
+
+class StorageUsageRefreshParams(ProtocolModel):
+    # Skip when the snapshot is younger than this and not stale.
+    max_age_ms: int | None = Field(default=None, ge=0)
+    # Re-measure every worktree.
+    full: bool = False
+    # Wait up to 60 s for the worktree folders of these sessions to go.
+    wait_for_session_ids: list[str] = Field(default_factory=list)
+
+
+class StorageUsageRefreshResponse(ProtocolModel):
+    started: bool
+    reason: StorageUsageRefreshReason | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
+    # The scan whose result answers this request: the ``scanId`` of the
+    # ``storage/usage/updated`` that ends it. None when nothing will
+    # (``fresh``), and from a server before it. With ``waitForSessionIds`` or
+    # ``full`` it always starts after the request; a plain refresh answered
+    # ``already_running`` or ``running_elsewhere`` gets one started before.
+    scan_id: int | None = Field(default=None, exclude_if=lambda value: value is None)
+
+
+class StorageUsageUpdatedParams(StorageUsageReadResponse):
+    # Increases per app-server process.
+    event_id: int = Field(default=0, ge=0)
+    # False when a waited-for worktree was still there after 60 s.
+    complete: bool = True
+    # The scan this event belongs to: sent with ``refreshing`` when it
+    # starts and with its result, success or ``failed``. Increases per
+    # app-server process. None for an event tied to no scan, and from a
+    # server before it.
+    scan_id: int | None = Field(default=None, exclude_if=lambda value: value is None)
 
 
 class BackgroundProcessStopParams(ProtocolModel):
@@ -1352,11 +1640,18 @@ class AgentsListParams(ProtocolModel):
 class AgentsListResponse(ProtocolModel):
     active: AgentSummary
     agents: list[AgentSummary]
+    active_approval_policy: ApprovalPolicySummary
+    approval_policies: list[ApprovalPolicySummary]
 
 
 class AgentSwitchParams(ProtocolModel):
     session_id: str
     agent_name: str
+
+
+class ApprovalPolicySwitchParams(ProtocolModel):
+    session_id: str
+    approval_policy: str
 
 
 type NonNegativeStrictInt = Annotated[StrictInt, Field(ge=0)]
@@ -1378,6 +1673,8 @@ class RuntimeSnapshot(ProtocolModel):
     config: ConfigView
     active_agent: AgentSummary
     agents: list[AgentSummary]
+    active_approval_policy: ApprovalPolicySummary
+    approval_policies: list[ApprovalPolicySummary]
     skills: list[SkillSummary]
     tools: list[ToolSummary]
     stats: AgentStatsSnapshot
@@ -1402,7 +1699,16 @@ class PluginReloadParams(ProtocolModel):
 
 
 class PluginReloadResponse(ProtocolModel):
-    """Empty: reload allocates no identity, and ``plugin/info`` reads the result."""
+    """Reload allocates no identity, and ``plugin/info`` reads the result.
+
+    ``deferred`` is true when a turn is running: the reload then runs at the
+    turn boundary, so a read right after it still sees the previous set. It is
+    left out otherwise, so a client older than it reads ``{}`` as before.
+    """
+
+    deferred: Literal[True] | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
 
 
 class PluginCatalogReadParams(ProtocolModel):
@@ -1498,10 +1804,18 @@ class ConfigFieldWire(ProtocolModel):
     enum_choices: list[str] = Field(default_factory=list)
     value_labels: dict[str, str] = Field(default_factory=dict)
     layer_values: list[ConfigLayerValueWire] = Field(default_factory=list)
+    # The layer the value comes from, the first of ``layer_values`` unless set.
+    origin: str = "default"
+    # Whether that layer sits above every layer a write targets (the
+    # environment, the org's admin config), so a write would not take effect.
+    # Defaulted so a client reading an older server sees every field writable.
+    locked: bool = False
 
-    @property
-    def origin(self) -> str:
-        return self.layer_values[0].layer if self.layer_values else "default"
+    @model_validator(mode="after")
+    def _origin_from_layers(self) -> Self:
+        if "origin" not in self.model_fields_set and self.layer_values:
+            self.origin = self.layer_values[0].layer
+        return self
 
 
 class ConfigEffectiveReadParams(ProtocolModel):
@@ -1564,10 +1878,70 @@ class ConfigWriteResponse(ConfigMutationResponse):
     # Why a rejected write was refused, in words the user can act on.
     reason: str | None = None
     failures: list[str] = Field(default_factory=list)
+    # Paths the write persisted that a higher layer (the environment, the org's
+    # admin config) still decides, so the session does not run the value
+    # written. A warning: the write is kept and takes effect once that layer
+    # lets go.
+    shadowed: list[ConfigShadowedWrite] = Field(default_factory=list)
 
     @property
     def applied(self) -> bool:
         return super().applied and not self.rejected and not self.failures
+
+
+class ConfigShadowedWrite(ProtocolModel):
+    path: str
+    # The layer whose value the session runs instead.
+    origin: str
+
+
+class TelemetrySettingView(ProtocolModel):
+    """``enable_telemetry`` as a session opened now outside any project would
+    run it. A trusted project config or an agent profile may turn it off for
+    its own sessions, never on, so a session runs this value or ``False``.
+
+    ``origin`` is the layer the value comes from; ``locked`` says a write to the
+    user config would not change it, because the environment or the org's
+    admin config decides it.
+    """
+
+    enabled: bool
+    origin: str
+    locked: bool
+
+
+class TelemetrySettingReadParams(ProtocolModel):
+    pass
+
+
+class TelemetrySettingReadResponse(ProtocolModel):
+    setting: TelemetrySettingView
+
+
+class TelemetrySettingUpdateParams(ProtocolModel):
+    enabled: bool
+
+
+class TelemetrySettingUpdateResponse(ProtocolModel):
+    # The setting after the update, or as it stands when refused.
+    setting: TelemetrySettingView
+    rejected: bool = False
+    # Why a rejected update was refused, in words the user can act on.
+    reason: str | None = None
+    failures: list[str] = Field(default_factory=list)
+
+
+class ConfigSubscribeParams(ProtocolModel):
+    pass
+
+
+class ConfigChangedParams(ProtocolModel):
+    """The config a session opened now would run may have changed: re-read it.
+
+    Sent to a connection that called ``config/subscribe`` when the org's admin
+    config or the model catalog the process holds changes, or a session-less
+    settings write lands.
+    """
 
 
 class ConfigReadParams(ProtocolModel):
@@ -1696,6 +2070,9 @@ type LocalSkillRefusalReason = Literal[
 
 class LocalSkillRefusalData(ProtocolModel):
     reason: LocalSkillRefusalReason
+    # For ``namespace_collision``: the plugins that are on under the same
+    # namespace, so a client can name them or turn them off first.
+    collides_with: list[str] = Field(default_factory=list)
 
 
 class PluginsLocalListParams(ProtocolModel):
@@ -1710,6 +2087,30 @@ class LocalPluginComponent(ProtocolModel):
     # What it does, as its own definition says; the command or address of a
     # server, the tools of a connector, the language of a library.
     description: str | None
+
+
+type LocalPluginConnectorStatus = Literal[
+    "connected", "not_connected", "unavailable", "unknown"
+]
+
+
+class LocalPluginConnector(ProtocolModel):
+    """A connector a plugin's ``connectors.json`` needs, as the account has it.
+
+    ``connected``: the account has it connected. ``not_connected``: the
+    account has it but the user has not connected it yet. ``unavailable``: the
+    account has no connector of that name it can connect. ``unknown``: no
+    connector catalog is held yet (signed out, connectors off, or not fetched
+    yet).
+    """
+
+    # As ``connectors.json`` names it: the connector's alias in the catalog.
+    id: str
+    # The catalog's name for it; None when the catalog does not have it.
+    display_name: str | None = None
+    status: LocalPluginConnectorStatus
+    # The tools the plugin uses, as ``connectors.json`` lists them.
+    tools: list[str] = Field(default_factory=list)
 
 
 class LocalPluginSummary(ProtocolModel):
@@ -1730,6 +2131,8 @@ class LocalPluginSummary(ProtocolModel):
     # On, but sharing its namespace with these plugins that are on too, so none
     # of them reaches a session until one is turned off.
     collides_with: list[str] = Field(default_factory=list)
+    # The connectors its ``connectors.json`` needs, in its order.
+    connectors: list[LocalPluginConnector] = Field(default_factory=list)
 
 
 class LocalPluginIssue(ProtocolModel):
@@ -1745,6 +2148,9 @@ class PluginsLocalListResponse(ProtocolModel):
 class PluginsLocalSetEnabledParams(ProtocolModel):
     name: str
     enabled: bool
+    # Turning it on also turns off the plugins on under its namespace, in the
+    # same write, instead of refusing with ``namespace_collision``.
+    turn_off_collisions: bool = False
     project_root: str | None = None
     # Apply the project's own config layers, as a session trusting it would.
     trust_workspace: bool = False
@@ -1752,6 +2158,8 @@ class PluginsLocalSetEnabledParams(ProtocolModel):
 
 class PluginsLocalSetEnabledResponse(ProtocolModel):
     plugin: LocalPluginSummary
+    # The plugins ``turn_off_collisions`` turned off.
+    turned_off: list[str] = Field(default_factory=list)
 
 
 SkillScopeArg = str
@@ -1763,6 +2171,8 @@ class SkillsInstalledParams(ProtocolModel):
 
 class SkillsInstalledResponse(ProtocolModel):
     skills: list[SkillSummary]
+    issues: list[ConfigIssue] = Field(default_factory=list)
+    """Skill files and manifests that failed to load, so a browser can list them."""
 
 
 class SkillsCatalogParams(ProtocolModel):
@@ -1810,6 +2220,7 @@ class SkillsImportParams(ProtocolModel):
     skill_id: str
     version: int | None = None
     alias: str | None = None
+    # "session" pins the skill for this session only and writes no manifest.
     scope: SkillScopeArg = "global"
 
 
@@ -1845,6 +2256,13 @@ class SkillsSetEnabledParams(ProtocolModel):
     enabled: bool
 
 
+class SkillsDeleteLocalParams(ProtocolModel):
+    """Delete the folder of the local skill ``skills/installed`` lists at ``path``."""
+
+    session_id: str
+    path: str
+
+
 class SkillsConvertLocalParams(ProtocolModel):
     session_id: str
     name: str
@@ -1853,6 +2271,13 @@ class SkillsConvertLocalParams(ProtocolModel):
 
 class SkillsConvertResponse(RuntimeMutationResponse):
     converted: bool = False
+
+
+class SkillsSessionImportResponse(RuntimeMutationResponse):
+    """A ``skills/import`` with scope ``session``."""
+
+    skill_name: str
+    """What the session loads the pick as; a clash with another skill renames it."""
 
 
 class DiagnosticsLogsReadParams(ProtocolModel):
@@ -2264,6 +2689,15 @@ class WorkspaceWorktreeLimitUpdateResponse(ProtocolModel):
     failures: list[str] = Field(default_factory=list)
 
 
+class WorkspaceWorktreeAutoUpdateParams(ProtocolModel):
+    auto: bool
+
+
+class WorkspaceWorktreeAutoUpdateResponse(ProtocolModel):
+    auto: bool
+    failures: list[str] = Field(default_factory=list)
+
+
 # No session_id on the wire: the caller is deleting a session that has already
 # closed and dropped its holder, and accepting one would let a client name an
 # arbitrary holder file to unlink.
@@ -2364,6 +2798,65 @@ class WorkspaceUntrustedConfigParams(ProtocolModel):
 
 class WorkspaceUntrustedConfigResponse(ProtocolModel):
     dirs: list[str] = Field(default_factory=list)
+    settings_path: str = ""
+
+
+type TrustFolderState = Literal["trusted", "untrusted", "undecided"]
+# Why a folder cannot be trusted: it would trust nearly every project on the machine.
+type TrustFolderProblem = Literal["home", "root"]
+
+
+class WorkspaceTrustFoldersListParams(ProtocolModel):
+    pass
+
+
+class WorkspaceTrustFoldersUpdateParams(ProtocolModel):
+    # An entry as the list returned it; only stored entries can be edited.
+    path: str = Field(min_length=1)
+    state: TrustFolderState
+
+
+class WorkspaceTrustFoldersInspectParams(ProtocolModel):
+    # As typed: relative paths resolve against `cwd`, `~` against the home directory.
+    path: str
+    cwd: str | None = None
+
+
+class TrustFolderCandidate(ProtocolModel):
+    """A folder the typed path offers to trust, and what trusting it would do."""
+
+    # Absolute and resolved: what `workspace/trust/folders/add` stores.
+    path: str
+    # The field text that selects it, ending in a separator so its children follow.
+    value: str
+    problem: TrustFolderProblem | None = None
+    stored: Literal["trusted", "untrusted"] | None = None
+    # The closest trusted ancestor that already covers the folder.
+    trusted_by: str | None = None
+    # Untrusted entries below the folder, which stay untrusted once it is trusted.
+    untrusted_inside: list[str] = Field(default_factory=list)
+    untrusted_inside_count: int = 0
+
+
+class WorkspaceTrustFoldersInspectResponse(ProtocolModel):
+    """The folders a typed path offers: itself, then the child folders completing it."""
+
+    # The typed path names no folder; the first candidate is its closest existing parent.
+    typed_problem: Literal["missing", "not_directory"] | None = None
+    candidates: list[TrustFolderCandidate] = Field(default_factory=list)
+
+
+class WorkspaceTrustFoldersAddParams(ProtocolModel):
+    # A candidate's `path`; relative paths resolve against `cwd`.
+    path: str = Field(min_length=1)
+    cwd: str | None = None
+
+
+class WorkspaceTrustFoldersResponse(ProtocolModel):
+    """The persisted trust decisions, in the order the trust file stores them."""
+
+    trusted: list[str] = Field(default_factory=list)
+    untrusted: list[str] = Field(default_factory=list)
     settings_path: str = ""
 
 
@@ -2483,6 +2976,7 @@ type ProjectLinksResolveRootRejectReason = Literal[
     "nested_unresolvable",
     "no_commits",
     "git_unavailable",
+    "disk_root",
 ]
 
 
@@ -2555,9 +3049,19 @@ class ProjectLinksUnlinkResponse(ProtocolModel):
 type LocalProjectCloudState = Literal["requested", "creating", "backed", "retired"]
 
 
+class LocalProjectCloudOwner(ProtocolModel):
+    """The account that made a cloud backing: cloud projects belong to one."""
+
+    organization_id: str = Field(min_length=1)
+    workspace_id: str = Field(min_length=1)
+    user_id: str = Field(min_length=1)
+
+
 class LocalProjectCloudView(ProtocolModel):
     project_id: str
     state: LocalProjectCloudState
+    # None for a backing made before owners were kept, or imported from a folder link.
+    owner: LocalProjectCloudOwner | None = None
 
 
 class LocalProjectView(ProtocolModel):
@@ -2565,6 +3069,8 @@ class LocalProjectView(ProtocolModel):
     name: str
     # The first root is the session working folder.
     root_paths: list[str]
+    # Whether the working folder's checkout has commits, which a worktree needs.
+    has_commits: bool
     created_at: int
     updated_at: int
     cloud: LocalProjectCloudView | None = None
@@ -2584,6 +3090,15 @@ class ProjectsCreateParams(ProtocolModel):
     name: str | None = None
 
 
+class ProjectsLinkParams(ProtocolModel):
+    root_path: str = Field(min_length=1)
+    cloud_project_id: str = Field(min_length=1)
+    # The cloud project's name; ignored when another folder's project already goes by it.
+    name: str = Field(min_length=1)
+    # The account that links it; omitted by older clients.
+    owner: LocalProjectCloudOwner | None = None
+
+
 class ProjectsRenameParams(ProtocolModel):
     id: str = Field(min_length=1)
     name: str = Field(min_length=1)
@@ -2593,8 +3108,60 @@ class ProjectsRemoveParams(ProtocolModel):
     id: str = Field(min_length=1)
 
 
+class ProjectsRetireCloudParams(ProtocolModel):
+    # A cloud project that is gone: deleted, or no longer reachable.
+    cloud_project_id: str = Field(min_length=1)
+
+
+class ProjectsSetCloudParams(ProtocolModel):
+    id: str = Field(min_length=1)
+    cloud_project_id: str = Field(min_length=1)
+    # Omitted by older clients.
+    owner: LocalProjectCloudOwner | None = None
+
+
 class ProjectMutationResponse(ProtocolModel):
     project: LocalProjectView
+
+
+class GoalGetParams(ProtocolModel):
+    session_id: str
+
+
+class GoalGetResponse(ProtocolModel):
+    goal: PublicGoal | None = None
+
+
+class GoalSetParams(ProtocolModel):
+    """Create, replace, or edit the session's goal.
+
+    Without a current goal, or with ``replace``, this creates a new goal. Otherwise
+    it edits the current one. An omitted ``token_budget`` keeps the budget; an
+    explicit ``null`` removes it.
+    """
+
+    session_id: str
+    idempotency_key: str | None = None
+    expected_goal_id: str | None = None
+    expected_revision: int | None = None
+    replace: bool = False
+    objective: str | None = None
+    status: Literal["active", "paused"] | None = None
+    token_budget: int | None = None
+
+
+class GoalSetResponse(ProtocolModel):
+    goal: PublicGoal
+
+
+class GoalClearParams(ProtocolModel):
+    session_id: str
+    idempotency_key: str | None = None
+    expected_goal_id: str
+
+
+class GoalClearResponse(ProtocolModel):
+    cleared: bool
 
 
 class LoopsListParams(ProtocolModel):
@@ -2607,8 +3174,17 @@ class LoopsListResponse(ProtocolModel):
 
 class LoopsCreateParams(ProtocolModel):
     session_id: str
-    interval: str
+    # Exactly one of `interval` (`30s`, `10m`, `2h`, `1d`) or a five-field
+    # `cron` expression in the machine's local timezone.
+    interval: str | None = None
+    cron: str | None = Field(default=None, exclude_if=lambda value: value is None)
     prompt: str
+
+    @model_validator(mode="after")
+    def validate_schedule(self) -> LoopsCreateParams:
+        if (self.interval is None) == (self.cron is None):
+            raise ValueError("Exactly one of interval or cron is required.")
+        return self
 
 
 class LoopsCreateResponse(ProtocolModel):
@@ -2709,6 +3285,9 @@ class TurnEnqueueParams(_TurnQueueInputParams):
         default="start_turn", exclude_if=lambda value: value == "start_turn"
     )
     hops: int = Field(default=1, ge=1, exclude_if=lambda value: value == 1)
+    # A session's reply to a turn this one started; the turn it starts sends
+    # none back.
+    reply: bool = Field(default=False, exclude_if=lambda value: not value)
 
     @property
     def from_session(self) -> bool:
@@ -2722,6 +3301,9 @@ class TurnEnqueueResponse(ProtocolModel):
     # Whether it waits behind a running or queued turn, rather than starting
     # at once.
     waits: bool = Field(default=False, exclude_if=lambda value: not value)
+    # For a message from another session that started or joined a turn, that
+    # turn.
+    turn_id: str | None = Field(default=None, exclude_if=lambda value: value is None)
 
 
 class TurnQueueReplaceParams(_TurnQueueInputParams):
@@ -2920,8 +3502,12 @@ class SessionSpawnParams(ProtocolModel):
     model: str
     reasoning_effort: str | None = None
     approval_policy: str
+    agent: str | None = Field(default=None, exclude_if=lambda value: value is None)
     # The client starts the session with these as `session/start`'s.
     hops: int = Field(default=1, ge=1, exclude_if=lambda value: value == 1)
+    # False for a session of its own, which the client does not tie to the
+    # caller; left out when True, so a missing value means attached.
+    attached: bool = Field(default=True, exclude_if=lambda value: value)
 
 
 class SessionSpawnResponse(ProtocolModel):
@@ -3043,6 +3629,15 @@ class SessionPeerSendParams(ProtocolModel):
     # Session messages and starts in a row since a user wrote, this one
     # included; the server refuses a send or start past its limit.
     hops: int = Field(default=1, ge=1, exclude_if=lambda value: value == 1)
+    # Sent by the server when a turn this session started there ends; the
+    # client forwards it on `session/turn/enqueue`.
+    reply: bool = Field(default=False, exclude_if=lambda value: not value)
+    # The ended turn a reply is for. Server-side only: a Vibebot session's
+    # turn end carries it to the bot's workflow; it never goes to the client.
+    reply_turn_id: str | None = Field(default=None, exclude=True)
+    # The bot thread a Vibebot session names, by handle or id. Server-side
+    # only: its bot resolves it; it never goes to the client.
+    bot_to: str | None = Field(default=None, exclude=True)
 
 
 class SessionPeerSendResponse(ProtocolModel):

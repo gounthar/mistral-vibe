@@ -56,6 +56,7 @@ from mistralai_vibe_local_harness.vibe._session_api_entries import (
     TOOL_CALL_SUFFIX,
     TOOL_RESULT_SUFFIX,
     convert_history_entry,
+    history_position_ids,
     model_tool_call_id,
     optional_str,
 )
@@ -340,13 +341,8 @@ class SessionApiView:
         """
         next_index = self.history_index.next_index
         for raw in state.history.entries:
-            entry_id = raw.get("id")
-            if not isinstance(entry_id, str):
-                continue
-            if raw.get("type") == "effect":
-                self.history_index.reserve_tool(entry_id)
-            elif raw.get("type") in ENTRY_BUILDERS:
-                self.history_index.position(entry_id)
+            for api_id in history_position_ids(raw):
+                self.history_index.position(api_id)
         ended = self.turns.observe(state.latest_turn)
         if ended or self.history_index.next_index != next_index:
             self._facts = None
@@ -522,19 +518,24 @@ class SessionApiView:
         """One Turn of ``turn_states``, from the history grouped in ``index``.
 
         The state's own latest Turn is read from the state; older Turns from
-        the outcomes ``observe`` saved.
+        the outcomes ``observe`` saved. A Turn with no outcome that is the
+        Session's active Turn is running: it can publish entries before it
+        becomes the latest Turn.
         """
         latest = state.latest_turn
+        first_created = index.first_created(turn_id)
         record = (
             _turn_record(latest)
             if latest is not None and latest.id == turn_id
             else self.turns.records.get(turn_id)
         )
+        if record is None and turn_id == active_turn_id(state):
+            record = TurnRecord(turn_id, first_created, None, None)
         return _turn_state(
             turn_id,
             index.entry_ids(turn_id),
             record,
-            index.first_created(turn_id),
+            first_created,
             index.last_updated(turn_id),
             blocked=turn_id == blocked_turn_id(state),
         )
@@ -586,8 +587,9 @@ def _turn_state(
             history_entry_ids=entry_ids,
             termination=record.termination,
         )
-    # The Runtime kept no outcome for this Turn. It ended before the latest
-    # Turn, so it reads as completed, as the Runtime's own Turn list does.
+    # The Runtime kept no outcome for this Turn, and it is not the active
+    # Turn. It ended before the latest Turn, so it reads as completed, as the
+    # Runtime's own Turn list does.
     return TurnState(
         id=turn_id,
         status="terminated",
@@ -709,18 +711,22 @@ def _turn_record(turn: PublicTurn) -> TurnRecord:
                     if turn.stop_reason == "limit"
                     else "output_limit"
                     if turn.stop_reason == "length"
+                    else "repeated_tool_failure"
+                    if turn.repeated_tool_failure is not None
                     else "skipped"
                     if turn.skip_reason is not None
                     else "rejected"
                     if turn.reject_reason is not None
                     else None
                 ),
-                # A skipped or rejected Turn has no answer: the hook's reason is
-                # its output, never an earlier assistant entry.
+                # A skipped, rejected or stopped Turn has no answer: the reason is its
+                # output, never an earlier assistant entry.
                 output=(
                     turn.skip_reason
                     if turn.skip_reason is not None
                     else turn.reject_reason
+                    if turn.reject_reason is not None
+                    else turn.repeated_tool_failure
                 ),
             )
         case FailedPublicTurn():

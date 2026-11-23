@@ -20,6 +20,7 @@ from vibe.app_server.protocol import (
     AgentInstallParams,
     AgentsListResponse,
     AgentSwitchParams,
+    ApprovalPolicySwitchParams,
     ArtifactsListParams,
     ArtifactsListResponse,
     ArtifactsMarkViewedParams,
@@ -386,6 +387,9 @@ class SessionBackendEvent:
     params: ProtocolModel | None = None
     session_id: str | None = None
     event_id: int | None = None
+    # An event of one of the root's child sessions, numbered on that child's own
+    # sequence. Only clients that declared `childSessionEvents` receive it.
+    child_session: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -456,6 +460,10 @@ class SessionBackend(Protocol):
 
     async def switch_agent(
         self, params: AgentSwitchParams
+    ) -> SessionBackendResult[RuntimeMutationResponse]: ...
+
+    async def switch_approval_policy(
+        self, params: ApprovalPolicySwitchParams
     ) -> SessionBackendResult[RuntimeMutationResponse]: ...
 
     async def install_agent(
@@ -612,7 +620,7 @@ class SessionBackendRuntimeView(Protocol):
 class SessionBackendOpenCallbacks(Protocol):
     """Optional access to open callbacks owned by a backend."""
 
-    def open_callbacks(self) -> list[PublicCallbackEntry]: ...
+    async def read_open_callbacks(self) -> list[PublicCallbackEntry]: ...
 
     async def reject_callback_delivery(
         self, session_id: str, callback_id: str, error: CallbackResultError
@@ -624,6 +632,13 @@ class SessionBackendRunningTurnAnnouncement(Protocol):
     """Optional re-announcement of a running turn to a newly attached client."""
 
     async def announce_running_turn(self) -> None: ...
+
+
+@runtime_checkable
+class SessionBackendHeldEvents(Protocol):
+    """Optional barrier on the events a backend held for its next subscriber."""
+
+    async def wait_for_held_events(self) -> None: ...
 
 
 @runtime_checkable

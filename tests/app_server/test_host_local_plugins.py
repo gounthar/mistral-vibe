@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Awaitable, Callable
 import json
 from pathlib import Path
 import tomllib
@@ -12,6 +13,14 @@ import pytest
 from tests.stubs.process_services import fake_process_services
 from vibe.app_server._dispatch import RequestFailure
 from vibe.app_server._host import HostRequestHandler
+from vibe.app_server._process_services import ProcessServices
+from vibe.app_server._runtime import HarnessProcess
+from vibe.app_server._session_backend_port import (
+    ConnectorAuthAction,
+    ResolvedConnector,
+    ResolvedConnectorCatalog,
+)
+from vibe.app_server.connector_catalog import ConnectorCatalogService
 from vibe.app_server.protocol import (
     LocalPluginSummary,
     PluginsLocalListResponse,
@@ -262,9 +271,80 @@ async def test_a_plugin_sharing_the_namespace_of_one_that_is_on_stays_off(
         "reports-old": ["reports-old:inspect-data", "reports-old:prepare-report"],
     }
     assert caught.value.code is ProtocolErrorCode.INVALID_PARAMS
-    assert cast(dict[str, Any], caught.value.data)["reason"] == "namespace_collision"
+    assert cast(dict[str, Any], caught.value.data) == {
+        "reason": "namespace_collision",
+        "collidesWith": ["reports"],
+    }
     assert "'reports'" in str(caught.value)
     assert _user_disabled(config_dir) == ["reports-old"]
+
+
+@pytest.mark.asyncio
+async def test_turning_a_plugin_on_can_turn_off_the_ones_under_its_namespace(
+    config_dir: Path,
+) -> None:
+    _mount(config_dir / "plugins" / "reports", name="reports", namespace="shared")
+    _mount(
+        config_dir / "plugins" / "reports-old",
+        name="reports-old",
+        namespace="shared",
+        default_enabled=False,
+    )
+    _mount(config_dir / "plugins" / "other", name="other", namespace="elsewhere")
+    config = config_dir / "config.toml"
+    config.write_text('disabled_plugins = ["reports-old"]\n' + config.read_text())
+    handler = _handler()
+
+    result = await handler.dispatch(
+        "plugins/local/setEnabled",
+        {"name": "reports-old", "enabled": True, "turnOffCollisions": True},
+    )
+    response = cast(PluginsLocalSetEnabledResponse, result.response)
+    listed = {
+        p.name: (p.enabled, p.collides_with) for p in (await _list(handler)).plugins
+    }
+
+    assert response.turned_off == ["reports"]
+    assert (response.plugin.enabled, response.plugin.collides_with) == (True, [])
+    assert listed == {
+        "other": (True, []),
+        "reports": (False, []),
+        "reports-old": (True, []),
+    }
+    assert _user_disabled(config_dir) == ["reports"]
+    assert _user_enabled(config_dir) == ["reports-old"]
+
+
+@pytest.mark.asyncio
+async def test_turning_a_plugin_on_turns_off_an_off_by_default_one_it_collides_with(
+    config_dir: Path,
+) -> None:
+    _mount(
+        config_dir / "plugins" / "reports",
+        name="reports",
+        namespace="shared",
+        default_enabled=False,
+    )
+    _mount(
+        config_dir / "plugins" / "reports-old",
+        name="reports-old",
+        namespace="shared",
+        default_enabled=False,
+    )
+    config = config_dir / "config.toml"
+    config.write_text('enabled_plugins = ["reports"]\n' + config.read_text())
+    handler = _handler()
+
+    result = await handler.dispatch(
+        "plugins/local/setEnabled",
+        {"name": "reports-old", "enabled": True, "turnOffCollisions": True},
+    )
+
+    assert cast(PluginsLocalSetEnabledResponse, result.response).turned_off == [
+        "reports"
+    ]
+    assert _user_enabled(config_dir) == ["reports-old"]
+    assert _user_disabled(config_dir) == ["reports"]
 
 
 @pytest.mark.asyncio
@@ -414,6 +494,24 @@ async def test_reports_a_plugin_that_fails_to_resolve(config_dir: Path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_a_plugin_shipping_several_formats_lists_without_issues(
+    config_dir: Path,
+) -> None:
+    root = config_dir / "plugins" / "superpowers"
+    skill = root / "skills" / "brainstorming" / "SKILL.md"
+    skill.parent.mkdir(parents=True)
+    skill.write_text("---\nname: brainstorming\ndescription: Explore.\n---\n\nb\n")
+    for marker in (".claude-plugin", ".codex-plugin"):
+        (root / marker).mkdir()
+        (root / marker / "plugin.json").write_text(json.dumps({"name": "superpowers"}))
+
+    listed = await _list(_handler())
+
+    assert [plugin.name for plugin in listed.plugins] == ["superpowers"]
+    assert listed.issues == []
+
+
+@pytest.mark.asyncio
 async def test_an_untrusted_projects_plugins_are_not_listed(tmp_path: Path) -> None:
     project = tmp_path / "repo"
     _mount(project / ".vibe" / "plugins" / "productivity")
@@ -450,3 +548,232 @@ async def test_turning_on_an_off_by_default_plugin_writes_both_lists_at_once(
         ["computer-use"],
         [],
     )
+
+
+def _mount_with_connectors(destination: Path, connectors: dict[str, list[str]]) -> Path:
+    """A plugin whose ``connectors.json`` needs ``connectors``, in that order."""
+    _mount(destination, namespace="productivity")
+    (destination / "connectors.json").write_text(
+        json.dumps({
+            "schemaVersion": 1,
+            "connectors": [
+                {"id": source_id, "tools": tools}
+                for source_id, tools in connectors.items()
+            ],
+        })
+    )
+    return destination
+
+
+def _catalog_connector(
+    alias: str, *, ready: bool, auth_action: ConnectorAuthAction = "none"
+) -> ResolvedConnector:
+    return ResolvedConnector(
+        raw_id=f"id-{alias}",
+        alias=alias,
+        display_name=alias.capitalize(),
+        ready=ready,
+        auth_action=auth_action,
+        tools=(),
+    )
+
+
+def _handler_with_catalog(
+    read: Callable[[Any], Awaitable[ResolvedConnectorCatalog | None]],
+) -> HostRequestHandler:
+    return HostRequestHandler(
+        HarnessFilesManager(sources=("user", "project")),
+        builtin_plugin_roots=[],
+        org_config=fake_process_services().org_config,
+        worktrees=fake_process_services().worktrees,
+        experiments=fake_process_services().experiments,
+        model_catalog=fake_process_services().model_catalog,
+        connector_catalog=read,
+    )
+
+
+@pytest.mark.asyncio
+async def test_lists_the_connectors_a_plugin_needs_in_its_order(
+    config_dir: Path,
+) -> None:
+    _mount_with_connectors(
+        config_dir / "plugins" / "productivity",
+        {"slack": ["send_message"], "jira": ["create_issue"]},
+    )
+    catalog = ResolvedConnectorCatalog(
+        provider_fingerprint="account",
+        revision="r1",
+        connectors=(_catalog_connector("slack", ready=True),),
+    )
+
+    async def read(_orchestrator: Any) -> ResolvedConnectorCatalog:
+        return catalog
+
+    [plugin] = (await _list(_handler_with_catalog(read))).plugins
+
+    assert [(c.id, c.display_name, c.status, c.tools) for c in plugin.connectors] == [
+        ("slack", "Slack", "connected", ["send_message"]),
+        # Not in the account's catalog at all.
+        ("jira", None, "unavailable", ["create_issue"]),
+    ]
+
+
+@pytest.mark.parametrize(
+    ("ready", "auth_action", "status"),
+    [
+        (True, "none", "connected"),
+        (True, "oauth", "connected"),
+        (False, "oauth", "not_connected"),
+        (False, "credentials_setup", "not_connected"),
+        (False, "no_auth_connect", "not_connected"),
+        (False, "none", "unavailable"),
+        (False, "unknown", "unavailable"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_a_connector_status_follows_what_the_user_must_do(
+    config_dir: Path, ready: bool, auth_action: ConnectorAuthAction, status: str
+) -> None:
+    _mount_with_connectors(
+        config_dir / "plugins" / "productivity", {"slack": ["send_message"]}
+    )
+    catalog = ResolvedConnectorCatalog(
+        provider_fingerprint="account",
+        revision="r1",
+        connectors=(_catalog_connector("slack", ready=ready, auth_action=auth_action),),
+    )
+
+    async def read(_orchestrator: Any) -> ResolvedConnectorCatalog:
+        return catalog
+
+    [plugin] = (await _list(_handler_with_catalog(read))).plugins
+
+    assert [c.status for c in plugin.connectors] == [status]
+
+
+@pytest.mark.asyncio
+async def test_connectors_are_unknown_while_no_catalog_is_held(
+    config_dir: Path,
+) -> None:
+    """Signed out, connectors off, or not fetched yet: the reader holds none."""
+    _mount_with_connectors(
+        config_dir / "plugins" / "productivity", {"slack": ["send_message"]}
+    )
+
+    async def read(_orchestrator: Any) -> None:
+        return None
+
+    [plugin] = (await _list(_handler_with_catalog(read))).plugins
+
+    assert [(c.id, c.status) for c in plugin.connectors] == [("slack", "unknown")]
+
+
+@pytest.mark.asyncio
+async def test_a_catalog_that_fails_to_read_leaves_the_list_and_says_unknown(
+    config_dir: Path,
+) -> None:
+    _mount_with_connectors(
+        config_dir / "plugins" / "productivity", {"slack": ["send_message"]}
+    )
+
+    async def read(_orchestrator: Any) -> ResolvedConnectorCatalog:
+        raise RuntimeError("the disk cache is unreadable")
+
+    [plugin] = (await _list(_handler_with_catalog(read))).plugins
+
+    assert [(c.id, c.status) for c in plugin.connectors] == [("slack", "unknown")]
+
+
+@pytest.mark.asyncio
+async def test_a_plugin_without_connectors_lists_none(config_dir: Path) -> None:
+    _mount(config_dir / "plugins" / "productivity")
+
+    [plugin] = (await _list(_handler())).plugins
+
+    assert plugin.connectors == []
+
+
+@pytest.mark.asyncio
+async def test_the_status_follows_the_catalog_without_a_reset(config_dir: Path) -> None:
+    """Connecting, then signing out: each list reads the catalog held then."""
+    _mount_with_connectors(
+        config_dir / "plugins" / "productivity", {"slack": ["send_message"]}
+    )
+    held: list[ResolvedConnectorCatalog | None] = [
+        ResolvedConnectorCatalog(
+            provider_fingerprint="account",
+            revision="r1",
+            connectors=(_catalog_connector("slack", ready=False, auth_action="oauth"),),
+        )
+    ]
+
+    async def read(_orchestrator: Any) -> ResolvedConnectorCatalog | None:
+        return held[0]
+
+    handler = _handler_with_catalog(read)
+    statuses = [(await _list(handler)).plugins[0].connectors[0].status]
+    held[0] = ResolvedConnectorCatalog(
+        provider_fingerprint="account",
+        revision="r2",
+        connectors=(_catalog_connector("slack", ready=True),),
+    )
+    statuses.append((await _list(handler)).plugins[0].connectors[0].status)
+    held[0] = None
+    statuses.append((await _list(handler)).plugins[0].connectors[0].status)
+
+    assert statuses == ["not_connected", "connected", "unknown"]
+
+
+@pytest.mark.asyncio
+async def test_toggling_a_plugin_answers_its_connectors_too(config_dir: Path) -> None:
+    _mount_with_connectors(
+        config_dir / "plugins" / "productivity", {"slack": ["send_message"]}
+    )
+    catalog = ResolvedConnectorCatalog(
+        provider_fingerprint="account",
+        revision="r1",
+        connectors=(_catalog_connector("slack", ready=True),),
+    )
+
+    async def read(_orchestrator: Any) -> ResolvedConnectorCatalog:
+        return catalog
+
+    plugin = await _toggle(
+        _handler_with_catalog(read), name="productivity", enabled=False
+    )
+
+    assert [(c.id, c.status) for c in plugin.connectors] == [("slack", "connected")]
+
+
+@pytest.mark.asyncio
+async def test_the_plugins_list_reads_the_catalog_the_process_holds(
+    process_services: ProcessServices, config_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The app server's own wiring: the list reads its connector service."""
+    _mount_with_connectors(
+        config_dir / "plugins" / "productivity", {"slack": ["send_message"]}
+    )
+    reads: list[object] = []
+
+    async def read_cached_catalog(
+        _self: ConnectorCatalogService, orchestrator: object
+    ) -> ResolvedConnectorCatalog:
+        reads.append(orchestrator)
+        return ResolvedConnectorCatalog(
+            provider_fingerprint="account",
+            revision="r1",
+            connectors=(_catalog_connector("slack", ready=True),),
+        )
+
+    monkeypatch.setattr(
+        ConnectorCatalogService, "read_cached_catalog", read_cached_catalog
+    )
+    process = HarnessProcess(services=process_services)
+    try:
+        listed = await _list(cast(HostRequestHandler, process.host_handler))
+    finally:
+        await process.close()
+
+    [plugin] = [p for p in listed.plugins if p.name == "productivity"]
+    assert [(c.id, c.status) for c in plugin.connectors] == [("slack", "connected")]
+    assert len(reads) == 1

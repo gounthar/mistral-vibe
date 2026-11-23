@@ -1,6 +1,8 @@
 //! Transcript reducer: raw JSON and its typed render projection, kept in sync by id.
 
+mod goal_notice;
 pub(crate) mod grouping;
+mod hook_anchor;
 pub(crate) mod local;
 mod older;
 pub(crate) mod patch;
@@ -8,10 +10,12 @@ mod scheduled_loop;
 mod settle;
 mod shown;
 mod subagent;
+mod turn_details;
+mod unanswered;
 
 use std::collections::{HashMap, HashSet};
 
-use crate::server::HistoryEntry;
+use crate::server::{is_discarded_draft, HistoryEntry};
 use serde_json::Value;
 
 use grouping::is_hidden_hook_notice;
@@ -20,6 +24,7 @@ pub use older::HistoryCursor;
 use patch::appended_text;
 pub use patch::apply_json_patch;
 pub use scheduled_loop::{split_prompt as split_loop_prompt, FiredLoop};
+pub use turn_details::{TurnDetails, KEY_PREFIX as TURN_DETAILS_PREFIX};
 
 #[derive(Default)]
 pub struct Transcript {
@@ -105,6 +110,18 @@ pub struct TranscriptEntry<'a> {
     pub entry: &'a HistoryEntry,
 }
 
+/// What every member of one tool group shares, computed once per group.
+struct GroupSpan<'a> {
+    end: usize,
+    visible: Vec<(usize, &'a StoredEntry)>,
+    /// The live trailing group still spins.
+    open: bool,
+    reasoning: bool,
+    /// A reasoning row is still streaming.
+    thinking: bool,
+    hooks: usize,
+}
+
 impl Transcript {
     pub fn snapshot(&self) -> Snapshot {
         Snapshot {
@@ -145,14 +162,15 @@ impl Transcript {
         self.live_tail_open = false;
     }
 
-    /// Most recent non-empty assistant text, for `/copy`, skipping hidden entries.
+    /// Most recent non-empty assistant text, for `/copy`, skipping hidden entries
+    /// and drafts a hook sent back or rejected.
     pub fn last_assistant_message(&self) -> Option<String> {
         self.entries
             .iter()
             .enumerate()
             .rev()
             .find_map(|(index, stored)| {
-                if self.is_hidden(index) {
+                if self.is_hidden(index) || is_discarded_draft(&stored.raw) {
                     return None;
                 }
                 let HistoryEntry::Message(message) = &stored.typed else {
@@ -350,14 +368,16 @@ impl Transcript {
         }
         // The queued run is pinned to the bottom, so content arriving for the
         // running turn slots in above it; a bottom-pinned banner stays below even
-        // the queue. A pre-tool hook notice slots in ahead of its paired tool entry.
-        let at = grouping::pre_tool_anchor(&stored.typed)
-            .and_then(|anchor| self.indices.get(&anchor).copied())
+        // the queue. A tool and its pre-tool hook notices slot in next to each other.
+        let at = hook_anchor::above_its_tool(&stored.typed, &self.entries)
+            .or_else(|| hook_anchor::below_its_hook_lines(&stored.typed, &self.entries))
             .unwrap_or_else(|| match (stored.pinned_bottom, stored.pending) {
                 (true, _) => self.entries.len(),
                 (false, true) => self.first_pinned(),
                 (false, false) => self.first_pending().min(self.first_pinned()),
             });
+        // A goal notice tied to a turn sits with that turn's output.
+        let at = goal_notice::anchor(&self.entries[..at], &stored.typed, &stored.raw).unwrap_or(at);
         if let Some(notification) = subagent::notification(&stored.typed) {
             let previous = [
                 subagent::EffectMatch::ChildSession,
@@ -490,12 +510,16 @@ impl Transcript {
 
     /// Shown entries in order, minus hidden hook notices and hidden reasoning.
     pub fn lines_from(&self, start: usize) -> impl Iterator<Item = TranscriptEntry<'_>> + '_ {
+        let mut span = None;
         self.entries
             .iter()
             .enumerate()
             .skip(start)
             .filter(|(index, _)| !self.is_hidden(*index))
-            .map(|(index, stored)| self.borrow(index, stored))
+            .map(move |(index, stored)| {
+                let group = self.group_at(index, stored, &mut span);
+                self.borrow(index, stored, group)
+            })
     }
 
     fn is_hidden(&self, index: usize) -> bool {
@@ -516,13 +540,18 @@ impl Transcript {
         !self.show_reasoning && matches!(stored.typed, HistoryEntry::Reasoning(_))
     }
 
-    fn borrow<'a>(&'a self, index: usize, stored: &'a StoredEntry) -> TranscriptEntry<'a> {
+    fn borrow<'a>(
+        &'a self,
+        index: usize,
+        stored: &'a StoredEntry,
+        group: Option<Group<'a>>,
+    ) -> TranscriptEntry<'a> {
         TranscriptEntry {
             index,
             id: &stored.id,
             rev: stored.rev,
             local: stored.local,
-            group: self.group_at(index, stored),
+            group,
             pending: stored.pending,
             follows_user: stored.follows_user,
             followed_by_user: stored.followed_by_user,
@@ -557,10 +586,52 @@ impl Transcript {
     }
 
     /// The visible part of the consecutive effect/reasoning group, or `None` for a single member.
-    fn group_at<'a>(&'a self, index: usize, stored: &'a StoredEntry) -> Option<Group<'a>> {
+    /// `span` carries the group's shared facts from one member to the next.
+    fn group_at<'a>(
+        &'a self,
+        index: usize,
+        stored: &'a StoredEntry,
+        span: &mut Option<GroupSpan<'a>>,
+    ) -> Option<Group<'a>> {
         if !groups_with_tools(&stored.typed) || (stored.local && !stored.historical) {
             return None;
         }
+        if span.as_ref().is_none_or(|span| index >= span.end) {
+            *span = Some(self.group_span(index));
+        }
+        let span = span.as_ref()?;
+        if span.visible.len() < 2 {
+            return None;
+        }
+        let (first_index, first_entry) = span.visible.first()?;
+        let first = index == *first_index;
+        let finalized = stored.local || stored.historical || !span.open;
+        let (running, kinds) = if first {
+            let effects = span
+                .visible
+                .iter()
+                .filter_map(|(_, entry)| match &entry.typed {
+                    HistoryEntry::Effect(effect) => Some(effect.as_ref()),
+                    _ => None,
+                });
+            grouping::count_kinds(effects, !finalized)
+        } else {
+            (Vec::new(), Vec::new())
+        };
+        Some(Group {
+            key: format!("{}{}", grouping::KEY_PREFIX, first_entry.id),
+            first,
+            last: index == span.visible.last()?.0,
+            finalized,
+            kinds,
+            running,
+            reasoning: span.reasoning,
+            thinking: !finalized && span.thinking,
+            hooks: span.hooks,
+        })
+    }
+
+    fn group_span(&self, index: usize) -> GroupSpan<'_> {
         let start = self.entries[..index]
             .iter()
             .enumerate()
@@ -581,16 +652,6 @@ impl Transcript {
             })
             .map(|(offset, entry)| (start + offset, entry))
             .collect::<Vec<_>>();
-        if visible.len() < 2 {
-            return None;
-        }
-        let (first_index, first_entry) = visible.first()?;
-        let last_index = visible.last()?.0;
-        let first = index == *first_index;
-        let effects = visible.iter().filter_map(|(_, entry)| match &entry.typed {
-            HistoryEntry::Effect(effect) => Some(effect.as_ref()),
-            _ => None,
-        });
         // A group whose only calls still running are hidden waits reads as done:
         // the waiting status line says the rest.
         let mut live = self.entries[start..end]
@@ -601,33 +662,21 @@ impl Transcript {
             })
             .peekable();
         let only_waits = live.peek().is_some() && live.all(|stored| self.is_live_wait(stored));
-        let finalized = stored.local
-            || stored.historical
-            || end < self.entries.len()
-            || !self.live_tail_open
-            || only_waits;
-        let (running, kinds) = if first {
-            grouping::count_kinds(effects, !finalized)
-        } else {
-            (Vec::new(), Vec::new())
-        };
-        let reasoning = visible
-            .iter()
-            .any(|(_, entry)| matches!(entry.typed, HistoryEntry::Reasoning(_)));
-        let thinking = !finalized
-            && visible.iter().any(|(_, entry)| {
+        GroupSpan {
+            end,
+            open: end == self.entries.len() && self.live_tail_open && !only_waits,
+            reasoning: visible
+                .iter()
+                .any(|(_, entry)| matches!(entry.typed, HistoryEntry::Reasoning(_))),
+            thinking: visible.iter().any(|(_, entry)| {
                 matches!(entry.typed, HistoryEntry::Reasoning(_)) && entry.typed.in_progress()
-            });
-        Some(Group {
-            key: format!("{}{}", grouping::KEY_PREFIX, first_entry.id),
-            first,
-            last: index == last_index,
-            finalized,
-            kinds,
-            running,
-            reasoning,
-            thinking,
-        })
+            }),
+            hooks: visible
+                .iter()
+                .filter(|(_, entry)| matches!(entry.typed, HistoryEntry::Notice(_)))
+                .count(),
+            visible,
+        }
     }
 
     /// Borrow renderable entries in order without rebuilding their typed values.
@@ -676,7 +725,7 @@ impl Transcript {
     /// Borrow one entry by its stable position in the append-only transcript.
     pub fn entry(&self, index: usize) -> Option<TranscriptEntry<'_>> {
         let stored = self.entries.get(index)?;
-        Some(self.borrow(index, stored))
+        Some(self.borrow(index, stored, self.group_at(index, stored, &mut None)))
     }
 
     /// Whether any entry would render (cheaper than building `lines`). A
@@ -703,8 +752,11 @@ impl Transcript {
             .is_some_and(|&index| self.entries[index].pending)
     }
 
-    /// Whether the entry `id` toggles on click: a tool row, reasoning trace, or loop prompt.
+    /// Whether the entry `id` toggles on click: a tool row, reasoning trace, loop prompt or `Worked for` group.
     pub fn is_expandable(&self, id: &str) -> bool {
+        if let Some(prompt) = id.strip_prefix(turn_details::KEY_PREFIX) {
+            return self.contains(prompt);
+        }
         if let Some(entry_id) = id.strip_prefix(grouping::KEY_PREFIX) {
             return self
                 .indices

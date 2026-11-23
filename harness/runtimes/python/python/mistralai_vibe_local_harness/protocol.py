@@ -177,7 +177,7 @@ class RustKnowledgeFolderDefinition(RustProtocolModel):
 class RustAgentTypeDefinition(RustProtocolModel):
     name: str
     description: str
-    path: str
+    path: str = Field(default="", exclude_if=lambda value: not value)
 
 
 class RustHarnessHookToolKey(RustProtocolModel):
@@ -420,6 +420,11 @@ RustOutputLimitRecovery = Annotated[
 
 class RustTurnSettings(RustProtocolModel):
     max_iterations: Annotated[int, Field(gt=0)] | None = None
+    # Omitted while unset, as Core omits it, so configs and digests recorded
+    # before the setting existed still match.
+    max_identical_tool_failures: Annotated[int, Field(gt=0)] | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
     # Omitted while disabled, as Core omits it, so configs and digests recorded
     # before the setting existed still match.
     output_limit_recovery: RustOutputLimitRecovery = Field(
@@ -479,6 +484,11 @@ class RustModelFacts(RustProtocolModel):
         return self
 
 
+class RustInstructionsSettings(RustProtocolModel):
+    max_tokens: int = Field(gt=0)
+    max_threshold_percent: int = Field(ge=1, le=100)
+
+
 class RustContextSettings(RustProtocolModel):
     compaction: RustCompactionPolicy
     notifications: RustNotificationSettings = Field(
@@ -489,6 +499,10 @@ class RustContextSettings(RustProtocolModel):
     # `model_facts.input_modalities`; omitted when compaction uses the agent
     # model.
     compaction_model_input_modalities: list[RustInputModality] | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
+    # The bound on the live instructions; omitted means Core's defaults.
+    instructions: RustInstructionsSettings | None = Field(
         default=None, exclude_if=lambda value: value is None
     )
 
@@ -548,10 +562,33 @@ class RustToolSettings(RustProtocolModel):
     bash_timeout: RustBashTimeoutSettings | None = None
 
 
+class RustCustomGuidance(RustProtocolModel):
+    """Guidance text used as written. Empty text omits that paragraph."""
+
+    intro: str
+    autonomy: str
+
+
+type RustGuidanceSettings = Literal["none", "stock"] | RustCustomGuidance
+
+
+class RustPromptSettings(RustProtocolModel):
+    guidance: RustGuidanceSettings = "none"
+
+
 class RustHarnessSettings(RustProtocolModel):
     turn: RustTurnSettings
     context: RustContextSettings
     tools: RustToolSettings
+    prompts: RustPromptSettings = Field(default_factory=RustPromptSettings)
+
+
+# Letters, digits, `.`, `_`, `:` and `-`: a note shows a key in a tag attribute
+# without escaping.
+RustInstructionsKey = Annotated[
+    str, Field(min_length=1, max_length=128, pattern=r"^[A-Za-z0-9._:-]+$")
+]
+RustInstructionsContent = Annotated[str, Field(pattern=r"\S")]
 
 
 class RustHarnessConfig(RustProtocolModel):
@@ -1136,6 +1173,9 @@ class RustPreToolCallHookInput(RustProtocolModel):
 class RustPostToolCallHookInput(RustProtocolModel):
     tool_call: RustHookToolCall
     tool_result: RustToolResult
+    # Sessions stored by earlier releases hold pending post-tool hook actions
+    # without a duration; those report 0.
+    duration_ms: int = Field(default=0, ge=0)
 
 
 class RustHookCallActionBase(RustProtocolModel):
@@ -1243,7 +1283,7 @@ class RustAgentResultError(RustProtocolModel):
 
 
 type RustTurnStopReason = Literal[
-    "iteration_limit", "skipped", "rejected", "output_limit"
+    "iteration_limit", "skipped", "rejected", "output_limit", "repeated_tool_failure"
 ]
 
 
@@ -1442,6 +1482,7 @@ type RustWarningCode = Literal[
     "compaction_summary_cut_off",
     "compaction_inputs_reduced",
     "post_tool_call_result_inconsistent",
+    "pre_tool_call_arguments_invalid",
 ]
 
 
@@ -1684,6 +1725,17 @@ class RustContextMessageEvent(RustProtocolModel):
     content: list[RustContentBlock] = Field(min_length=1)
 
 
+class RustInstructionsUpsertEvent(RustProtocolModel):
+    type: Literal["instructions_upsert"] = "instructions_upsert"
+    key: RustInstructionsKey
+    content: RustInstructionsContent
+
+
+class RustInstructionsDeleteEvent(RustProtocolModel):
+    type: Literal["instructions_delete"] = "instructions_delete"
+    key: RustInstructionsKey
+
+
 class RustCompactEvent(RustProtocolModel):
     type: Literal["compact"] = "compact"
     extra_instructions: str = ""
@@ -1911,6 +1963,8 @@ RustEvent = Annotated[
     RustUserMessageEvent
     | RustAgentMessageEvent
     | RustContextMessageEvent
+    | RustInstructionsUpsertEvent
+    | RustInstructionsDeleteEvent
     | RustCompactEvent
     | RustReconfigureEvent
     | RustNotificationEvent
@@ -2226,6 +2280,7 @@ __all__ = [
     "RustContextCompactionFailedObservation",
     "RustContextMessageEvent",
     "RustContextSettings",
+    "RustCustomGuidance",
     "RustDeterminismContext",
     "RustDisabledCommandEnvironment",
     "RustDisabledCompactionPolicy",
@@ -2254,6 +2309,7 @@ __all__ = [
     "RustFilesystemWriteResult",
     "RustFixedImageCostRule",
     "RustGitBashCommandEnvironment",
+    "RustGuidanceSettings",
     "RustHarnessCapabilitySet",
     "RustHarnessConfig",
     "RustHarnessConfigUpdate",
@@ -2277,6 +2333,9 @@ __all__ = [
     "RustImageCostRule",
     "RustInMemoryBashCommandEnvironment",
     "RustInputConflictRejection",
+    "RustInstructionsDeleteEvent",
+    "RustInstructionsSettings",
+    "RustInstructionsUpsertEvent",
     "RustInterruptEvent",
     "RustInterruptedTurn",
     "RustInvalidCommandRejection",
@@ -2337,6 +2396,7 @@ __all__ = [
     "RustPreToolCallHookAction",
     "RustPreToolCallHookResult",
     "RustProgrammaticToolSettings",
+    "RustPromptSettings",
     "RustProtocolError",
     "RustProtocolModel",
     "RustProvidedToolCall",

@@ -121,6 +121,8 @@ class Scenario:
     mouse_tracking_seen: bool | None = None
     """Whether mouse reports must have been turned on at any point of the run."""
     skip_reason: str | None = None
+    keep_braille: bool = False
+    """Keep braille cells instead of masking them, for scenarios pinning them at scripted times."""
     exit_after_last_step: bool = False
     settle_per_key: bool = False
     """Settle after every keypress, for scenarios needing each key in its own read."""
@@ -128,6 +130,8 @@ class Scenario:
     """Terminal output queries and their input replies."""
     exit_responses: Mapping[str, str] = field(default_factory=dict)
     """Post-exit output triggers and their input replies, FIFO."""
+    typeahead: str = ""
+    """Input typed at launch, before the client takes the terminal."""
     client_args: tuple[str, ...] = ()
     """Extra CLI args appended to the client command (e.g. `--continue`)."""
     stdout_before_completion: tuple[Mapping[str, Any], ...] = ()
@@ -242,10 +246,12 @@ def _build_scenario(module: ModuleType, name: str, origin: str) -> Scenario:
         mouse_tracking=getattr(module, "mouse_tracking", None),
         mouse_tracking_seen=getattr(module, "mouse_tracking_seen", None),
         skip_reason=getattr(module, "skip", None),
+        keep_braille=getattr(module, "keep_braille", False),
         exit_after_last_step=exits,
         settle_per_key=getattr(module, "settle_per_key", False),
         terminal_responses=getattr(module, "terminal_responses", {}),
         exit_responses=getattr(module, "exit_responses", {}),
+        typeahead=getattr(module, "typeahead", ""),
         client_args=tuple(getattr(module, "client_args", ())),
         stdout_before_completion=tuple(getattr(module, "stdout_before_completion", ())),
         headless_returncode=getattr(module, "headless_returncode", 0),

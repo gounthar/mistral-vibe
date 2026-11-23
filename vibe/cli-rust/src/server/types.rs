@@ -23,6 +23,8 @@ pub mod method {
     pub const SESSION_RESUME: &str = "session/resume";
     pub const SESSION_CONTINUE: &str = "session/continue";
     pub const SESSION_DELETE: &str = "session/delete";
+    /// Archive or unarchive a saved session (app-server `SessionArchiveParams`).
+    pub const SESSION_ARCHIVE: &str = "session/archive";
     pub const SESSION_LEASE_SUBSCRIBE: &str = "session/lease/subscribe";
     pub const SESSION_READY_WAIT: &str = "session/ready/wait";
     /// Experimental: wait until no subagent of the session has a turn running.
@@ -42,6 +44,14 @@ pub mod method {
     pub const WORKSPACE_TRUST_DECISION: &str = "workspace/trust/decision";
     /// Untrusted local config folders the client warns about once per folder.
     pub const WORKSPACE_TRUST_UNTRUSTED_CONFIG: &str = "workspace/trust/untrustedConfig";
+    /// Every persisted trust decision, browsed by `/trusted-folders`.
+    pub const WORKSPACE_TRUST_FOLDERS_LIST: &str = "workspace/trust/folders/list";
+    /// Move one persisted decision to the other list, or drop it.
+    pub const WORKSPACE_TRUST_FOLDERS_UPDATE: &str = "workspace/trust/folders/update";
+    /// Check a typed path and list the directories completing it.
+    pub const WORKSPACE_TRUST_FOLDERS_INSPECT: &str = "workspace/trust/folders/inspect";
+    /// Trust a new folder and everything under it.
+    pub const WORKSPACE_TRUST_FOLDERS_ADD: &str = "workspace/trust/folders/add";
     /// Queue a user turn.
     pub const TURN_ENQUEUE: &str = "session/turn/enqueue";
     /// Start a turn immediately, bypassing the queue.
@@ -58,6 +68,8 @@ pub mod method {
     pub const SESSION_HISTORY_CLEAR: &str = "session/history/clear";
     /// Switch the session's agent.
     pub const SESSION_AGENT_UPDATE: &str = "session/agent/update";
+    /// Switch the session's approval policy.
+    pub const SESSION_APPROVAL_POLICY_UPDATE: &str = "session/approvalPolicy/update";
     /// Whether rewinding to a history entry would restore files on disk.
     pub const SESSION_REWIND_READ: &str = "session/rewind/read";
     /// Truncate the conversation at a user entry, optionally restoring files.
@@ -94,6 +106,10 @@ pub mod method {
     /// Live session logs paged into the `/debug` console.
     pub const DIAGNOSTICS_LOGS_READ: &str = "diagnostics/logs/read";
     pub const SESSION_RENAME: &str = "session/rename";
+    /// Create, replace, edit, pause or resume the session's goal.
+    pub const GOAL_SET: &str = "goal/set";
+    pub const GOAL_CLEAR: &str = "goal/clear";
+    pub const BACKGROUND_PROCESS_STOP: &str = "session/backgroundProcess/stop";
     pub const IDENTITY_READ: &str = "identity/read";
     pub const ACCOUNT_READ: &str = "account/read";
     /// Redacted active-provider snapshot behind the `/status` section.
@@ -110,6 +126,10 @@ pub mod method {
     pub const CONNECTOR_CATALOG_REFRESH: &str = "connector_catalog/refresh";
     /// Create the connection a no-auth connector needs, then re-fetch the catalog.
     pub const CONNECTOR_CONNECT: &str = "connector_catalog/connect";
+    /// Schedule a loop from an `interval` or a `cron`.
+    pub const LOOPS_CREATE: &str = "loops/create";
+    /// Delete one scheduled loop.
+    pub const LOOPS_DELETE: &str = "loops/delete";
     pub const MCP_ADD: &str = "mcp_catalog/add";
     pub const MCP_REMOVE: &str = "mcp_catalog/remove";
     pub const MCP_LOGIN: &str = "mcp_catalog/login";
@@ -138,6 +158,8 @@ pub mod method {
     pub const SKILLS_REMOVE: &str = "skills/remove";
     /// Turn a skill on or off for every scope it is installed in.
     pub const SKILLS_SET_ENABLED: &str = "skills/setEnabled";
+    /// Delete the folder of a local skill `skills/installed` lists.
+    pub const SKILLS_DELETE_LOCAL: &str = "skills/deleteLocal";
     /// Install or uninstall an `install_required` agent such as `lean`.
     pub const AGENTS_INSTALL: &str = "agents/install";
     pub const AGENTS_UNINSTALL: &str = "agents/uninstall";
@@ -159,6 +181,14 @@ pub mod method {
     pub const ARTIFACTS_SYNC: &str = "artifacts/sync";
     /// Mark PR/MR artifacts as seen (app-server `artifacts/markViewed`).
     pub const ARTIFACTS_MARK_VIEWED: &str = "artifacts/markViewed";
+    /// Vibe's disk usage from the shared cache, answered at once.
+    pub const STORAGE_USAGE_READ: &str = "storage/usage/read";
+    /// Start a storage scan; the result comes as `storage/usage/updated`.
+    pub const STORAGE_USAGE_REFRESH: &str = "storage/usage/refresh";
+    /// Remove leftover worktrees and unknown folders; a removal starts a refresh.
+    pub const STORAGE_LEFTOVERS_CLEAN: &str = "storage/leftovers/clean";
+    /// Delete sessions, then the worktrees no session still claims; then a refresh.
+    pub const STORAGE_SESSIONS_DELETE: &str = "storage/sessions/delete";
 }
 
 /// Callback kinds the client advertises at `initialize` and knows how to answer.
@@ -213,6 +243,8 @@ pub mod notification {
     pub const SESSION_LEASE_UPDATED: &str = "session/lease/updated";
     /// The server's lease watch died; held locks can no longer be trusted.
     pub const SESSION_LEASE_ENDED: &str = "session/lease/ended";
+    /// Sessionless: a storage scan started (`refreshing`) or ended with its result.
+    pub const STORAGE_USAGE_UPDATED: &str = "storage/usage/updated";
     /// A session artifact (PR/MR) was detected or discovered.
     pub const ARTIFACTS_CREATED: &str = "artifacts/created";
     /// A session artifact changed (markViewed, provider sync).
@@ -376,6 +408,8 @@ pub struct SessionStartParams {
     pub history_limit: u32,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort: Option<String>,
     #[serde(skip_serializing_if = "skip_default_bool")]
     pub session_only: bool,
     /// `"ephemeral"` for a session started only to warm the engine up before a
@@ -410,6 +444,8 @@ pub struct AgentConfig {
     pub cwd: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub agent: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub approval_policy: Option<String>,
     #[serde(skip_serializing_if = "skip_default_bool")]
     pub auto_approve: bool,
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
@@ -640,7 +676,7 @@ pub struct PublicSessionState {
     /// Child (subagent) sessions in creation order.
     #[serde(default)]
     pub child_sessions: Vec<crate::server::PublicChildSession>,
-    /// The session's background processes; only their status is read.
+    /// The session's background processes.
     #[serde(default, deserialize_with = "crate::utils::json::lenient")]
     pub background_processes: Vec<PublicBackgroundProcess>,
 }
@@ -649,6 +685,18 @@ pub struct PublicSessionState {
 #[derive(Debug, Clone, Deserialize)]
 pub struct PublicBackgroundProcess {
     pub status: String,
+    #[serde(rename = "processId")]
+    pub process_id: String,
+    #[serde(default)]
+    pub command: String,
+}
+
+/// Stop one background process; the next session snapshot reports it stopped.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BackgroundProcessStopParams {
+    pub session_id: String,
+    pub process_id: String,
 }
 
 /// A provider retry in progress: which turn, why, and the transport detail.
@@ -699,9 +747,31 @@ pub struct PublicSession {
     pub worktree: Option<Box<PublicSessionWorktree>>,
     #[serde(default)]
     pub token_usage: Option<TokenUsage>,
+    /// Omitted while the session has no goal.
+    #[serde(default, deserialize_with = "super::proto_goal::lenient_goal")]
+    pub goal: Option<Box<super::proto_goal::PublicGoal>>,
     // Boxed like `worktree`: the state rides `UiEvent`, whose variant sizes clippy bounds.
     #[serde(default)]
     pub status: Option<Box<PublicSessionStatus>>,
+    /// The session's scheduled loops.
+    #[serde(default, deserialize_with = "crate::utils::json::lenient")]
+    pub loops: Vec<ScheduledLoop>,
+}
+
+/// `ScheduledLoop`: a recurring prompt the session sends itself.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ScheduledLoop {
+    pub id: String,
+    /// The prompt it sends; its first line is the loop's title.
+    pub prompt: String,
+    #[serde(default)]
+    pub interval_seconds: Option<u64>,
+    /// A five-field cron expression in the machine's local timezone.
+    #[serde(default)]
+    pub cron: Option<String>,
+    /// Unix seconds of the next run.
+    pub next_fire_at: f64,
 }
 
 /// `PublicSessionStatus`: only the turn a running or blocked session is on is read.
@@ -726,6 +796,12 @@ pub enum HistoryEntry {
     Interrupt(InterruptEntry),
     #[serde(other)]
     Unknown,
+}
+
+/// Whether a stored entry `Value` is a draft that never became the answer: one a
+/// hook sent back or rejected. An interrupted answer counts, partial as it is.
+pub fn is_discarded_draft(entry: &Value) -> bool {
+    entry["outcome"]["type"] == "discarded" && entry["outcome"]["cause"] != "interrupt"
 }
 
 impl HistoryEntry {
@@ -866,6 +942,19 @@ pub struct NoticeDetail {
     /// `ScheduledLoopFiredNoticeDetail`: the loop whose prompt started this turn.
     #[serde(default, rename = "loopId")]
     pub loop_id: Option<String>,
+    /// `GoalNoticeDetail`: what happened to the goal; `status` holds the goal status.
+    #[serde(default)]
+    pub event: Option<String>,
+    #[serde(default)]
+    pub objective: Option<String>,
+    #[serde(default)]
+    pub continuation: Option<u64>,
+    #[serde(default, rename = "tokensUsed")]
+    pub tokens_used: Option<u64>,
+    #[serde(default, rename = "tokenBudget")]
+    pub token_budget: Option<u64>,
+    #[serde(default, rename = "timeUsedSeconds")]
+    pub time_used_seconds: Option<u64>,
 }
 
 /// `workspace/git/worktrees/remove` params. `force`, `deleteBranch`, and

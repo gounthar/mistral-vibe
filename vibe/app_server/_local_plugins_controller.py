@@ -7,8 +7,9 @@ A plugin is addressed by its manifest name, which is also what
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Awaitable, Callable, Sequence
+from collections.abc import Awaitable, Callable, Sequence, Set as AbstractSet
 from dataclasses import replace
+import logging
 from pathlib import Path
 from typing import Any, cast
 
@@ -17,9 +18,16 @@ from pydantic import ValidationError
 from vibe.app_server._dispatch import RequestFailure, method_not_found
 from vibe.app_server._model import ProtocolModel, validate_wire
 from vibe.app_server._projection import writable_list_field
+from vibe.app_server._session_backend_port import (
+    ResolvedConnector,
+    ResolvedConnectorCatalog,
+)
+from vibe.app_server.connector_catalog import connector_readiness
 from vibe.app_server.models import PluginComponentKind, PluginScope
 from vibe.app_server.protocol import (
     LocalPluginComponent,
+    LocalPluginConnector,
+    LocalPluginConnectorStatus,
     LocalPluginIssue,
     LocalPluginSummary,
     LocalSkillRefusalData,
@@ -42,16 +50,24 @@ from vibe.core.plugins import (
     ResolvedPluginSet,
     is_required_plugin,
     set_plugin_enabled,
+    user_facing_issues,
 )
 from vibe.core.skills.models import SkillScope
 
-__all__ = ["LOCAL_PLUGIN_METHODS", "LocalPluginsController"]
+__all__ = ["LOCAL_PLUGIN_METHODS", "ConnectorCatalogReader", "LocalPluginsController"]
+
+logger = logging.getLogger(__name__)
 
 LOCAL_PLUGIN_METHODS = frozenset({"plugins/local/list", "plugins/local/setEnabled"})
 
 type SessionFiles = Callable[[Path | None], HarnessFilesManager]
 type OrchestratorLoader = Callable[
     [HarnessFilesManager], Awaitable[ConfigOrchestrator[VibeConfigSchema]]
+]
+# The connector catalog the process holds for the account a config names,
+# never waiting on the service; None when it holds none.
+type ConnectorCatalogReader = Callable[
+    [ConfigOrchestrator[VibeConfigSchema]], Awaitable[ResolvedConnectorCatalog | None]
 ]
 
 
@@ -61,11 +77,13 @@ class LocalPluginsController:
         session_files: SessionFiles,
         load_orchestrator: OrchestratorLoader,
         builtin_plugin_roots: Callable[[], Sequence[Path]],
+        connector_catalog: ConnectorCatalogReader | None = None,
     ) -> None:
         """``session_files(None)`` is the user's own config, the one toggles write."""
         self._session_files = session_files
         self._load_orchestrator = load_orchestrator
         self._builtin_plugin_roots = builtin_plugin_roots
+        self._connector_catalog = connector_catalog
 
     async def dispatch(self, method: str, raw_params: dict[str, Any]) -> ProtocolModel:
         try:
@@ -89,14 +107,15 @@ class LocalPluginsController:
             project_root, params.trust_workspace
         )
         toggles = _toggles(orchestrator)
+        catalog = await self._read_connector_catalog(orchestrator)
         return PluginsLocalListResponse(
             plugins=[
-                _summary(plugin, resolution, toggles)
+                _summary(plugin, resolution, toggles, catalog)
                 for plugin in _listed(resolution, project_root)
             ],
             issues=[
                 LocalPluginIssue(file=str(issue.file), message=issue.message)
-                for issue in resolution.issues
+                for issue in user_facing_issues(resolution.issues)
             ],
         )
 
@@ -114,11 +133,23 @@ class LocalPluginsController:
                 ProtocolErrorCode.NOT_FOUND, f"No plugin named {params.name!r}"
             )
         toggles = _toggles(orchestrator)
-        _refuse_toggle(plugin, params.enabled, toggles, resolution)
+        turn_off = (
+            _rival_plugins(plugin, resolution)
+            if params.enabled and params.turn_off_collisions
+            else []
+        )
+        _refuse_toggle(
+            plugin,
+            params.enabled,
+            toggles,
+            resolution,
+            turning_off={rival.descriptor.name for rival in turn_off},
+        )
         mutation = await set_plugin_enabled(
             await self._load_orchestrator(self._session_files(None)),
             plugin.descriptor,
             params.enabled,
+            turn_off=[rival.descriptor for rival in turn_off],
         )
         if mutation.failures:
             raise RequestFailure(
@@ -128,9 +159,32 @@ class LocalPluginsController:
         # What the write did, without resolving again: an unlocked plugin is now
         # exactly what was asked, and the refusal above ruled out a collision.
         status: InstalledPluginStatus = "loaded" if params.enabled else "disabled"
+        catalog = await self._read_connector_catalog(orchestrator)
         return PluginsLocalSetEnabledResponse(
-            plugin=_summary(replace(plugin, status=status), resolution, toggles)
+            plugin=_summary(
+                replace(plugin, status=status), resolution, toggles, catalog
+            ),
+            turned_off=[rival.descriptor.name for rival in turn_off],
         )
+
+    async def _read_connector_catalog(
+        self, orchestrator: ConfigOrchestrator[VibeConfigSchema]
+    ) -> ResolvedConnectorCatalog | None:
+        """The catalog held for the account, or None.
+
+        Never waits for a fetch: reading it starts a background refresh when
+        the catalog is old or missing, which the next list shows. A failure to read it leaves
+        every connector ``unknown`` rather than failing the list.
+        """
+        if self._connector_catalog is None:
+            return None
+        try:
+            return await self._connector_catalog(orchestrator)
+        except Exception:
+            logger.exception(
+                "Failed to read the connector catalog for the plugins list"
+            )
+            return None
 
     async def _read(
         self, project_root: Path | None, trust_workspace: bool
@@ -149,11 +203,29 @@ class LocalPluginsController:
         return orchestrator, await asyncio.to_thread(resolver.resolve)
 
 
+def _rival_plugins(
+    plugin: InstalledPlugin, resolution: ResolvedPluginSet
+) -> list[InstalledPlugin]:
+    """The plugins on under its namespace that config can turn off.
+
+    Vibe's own plugin stays on whatever config says, so it stays a rival and
+    the toggle is refused. Another locked plugin is off, so it is no rival.
+    """
+    rivals = set(_namespace_rivals(plugin, resolution))
+    return [
+        p
+        for p in resolution.installed
+        if p.descriptor.name in rivals and not is_required_plugin(p.descriptor)
+    ]
+
+
 def _refuse_toggle(
     plugin: InstalledPlugin,
     enabled: bool,
     toggles: PluginToggles,
     resolution: ResolvedPluginSet,
+    *,
+    turning_off: AbstractSet[str] = frozenset(),
 ) -> None:
     name = plugin.descriptor.name
     if toggles.locked(plugin.descriptor):
@@ -167,14 +239,21 @@ def _refuse_toggle(
             f"{name!r} {reason}",
             LocalSkillRefusalData(reason="locked").model_dump(mode="json"),
         )
-    rival = _namespace_rival(plugin, resolution)
-    if enabled and rival is not None:
+    rivals = [
+        rival
+        for rival in _namespace_rivals(plugin, resolution)
+        if rival not in turning_off
+    ]
+    if enabled and rivals:
         namespace = plugin.descriptor.namespace
+        rival = rivals[0]
         raise RequestFailure(
             ProtocolErrorCode.INVALID_PARAMS,
             f"{name!r} shares the namespace {namespace!r} with {rival!r}, which is "
             f"on: turn {rival!r} off first",
-            LocalSkillRefusalData(reason="namespace_collision").model_dump(mode="json"),
+            LocalSkillRefusalData(
+                reason="namespace_collision", collides_with=rivals
+            ).model_dump(mode="json"),
         )
 
 
@@ -200,16 +279,10 @@ def _listed(
     )
 
 
-def _namespace_rival(
-    plugin: InstalledPlugin, resolution: ResolvedPluginSet
-) -> str | None:
-    """Another plugin that is on under the same namespace: both would drop out of sessions."""
-    return next(iter(_namespace_rivals(plugin, resolution)), None)
-
-
 def _namespace_rivals(
     plugin: InstalledPlugin, resolution: ResolvedPluginSet
 ) -> list[str]:
+    """The other plugins on under the same namespace: all would drop out of sessions."""
     return sorted(
         other.descriptor.name
         for other in resolution.installed
@@ -220,7 +293,10 @@ def _namespace_rivals(
 
 
 def _summary(
-    plugin: InstalledPlugin, resolution: ResolvedPluginSet, toggles: PluginToggles
+    plugin: InstalledPlugin,
+    resolution: ResolvedPluginSet,
+    toggles: PluginToggles,
+    catalog: ResolvedConnectorCatalog | None,
 ) -> LocalPluginSummary:
     descriptor = plugin.descriptor
     return LocalPluginSummary(
@@ -239,7 +315,46 @@ def _summary(
         collides_with=_namespace_rivals(plugin, resolution)
         if plugin.status == "collides"
         else [],
+        connectors=_connectors(plugin, catalog),
     )
+
+
+def _connectors(
+    plugin: InstalledPlugin, catalog: ResolvedConnectorCatalog | None
+) -> list[LocalPluginConnector]:
+    """Matched by alias, as a session matches them (``RegistryConnectorCatalog``)."""
+    by_alias = (
+        {connector.alias: connector for connector in catalog.connectors}
+        if catalog is not None
+        else {}
+    )
+    return [
+        LocalPluginConnector(
+            id=definition.source_id,
+            display_name=(
+                found.display_name
+                if (found := by_alias.get(definition.source_id)) is not None
+                else None
+            ),
+            status=("unknown" if catalog is None else _connector_status(found)),
+            tools=list(definition.tools),
+        )
+        for definition in plugin.connectors
+    ]
+
+
+def _connector_status(
+    connector: ResolvedConnector | None,
+) -> LocalPluginConnectorStatus:
+    if connector is None:
+        return "unavailable"
+    match connector_readiness(connector):
+        case "ready":
+            return "connected"
+        case "needs_auth" | "needs_setup" | "needs_connect":
+            return "not_connected"
+        case "unavailable":
+            return "unavailable"
 
 
 def _components(plugin: InstalledPlugin) -> list[LocalPluginComponent]:

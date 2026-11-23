@@ -53,6 +53,7 @@ fn draw_box(app: &App, f: &mut Frame, area: Rect, title: Line<'static>) -> Optio
         .border_style(border)
         .title(title)
         .title_bottom(vim_mode.left_aligned())
+        .title_bottom(composer_title::stash_hint(app))
         .title_alignment(Alignment::Right);
 
     // A slow agent switch, then recording, replace the prompt marker with their own glyph.
@@ -71,8 +72,11 @@ fn draw_box(app: &App, f: &mut Frame, area: Rect, title: Line<'static>) -> Optio
         theme::muted_style()
     };
     // While searching, the bottom bar owns the caret and the composer previews the match.
-    let owns_keys =
-        editable && !selecting && !app.subagents.list.focused && app.reverse_search.is_none();
+    let owns_keys = editable
+        && !selecting
+        && !app.subagents.list.focused
+        && !app.rail.focused
+        && app.reverse_search.is_none();
     let caret_on = owns_keys && app.main_input_cursor_on();
     // Vim Insert mode shows the terminal's bar cursor instead of a painted block.
     let bar = inserting && crate::input::composer_owns_key(app);

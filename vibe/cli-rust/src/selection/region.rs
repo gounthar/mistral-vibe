@@ -7,6 +7,7 @@ use crate::app::App;
 use crate::selection::flow::{resolve, Flow};
 use crate::selection::fold::{self, Folds};
 use crate::selection::table;
+use crate::selection::RowChrome;
 
 /// The scrolling document owned by a selectable region.
 #[derive(Clone, Copy, Default, PartialEq, Eq)]
@@ -22,7 +23,10 @@ pub enum ScrollTarget {
 pub enum RegionId {
     Main,
     Loading,
+    Goal,
     BottomApp,
+    RailWindow,
+    CodePreview,
 }
 
 /// The screen region a drag can select, published by whichever surface painted it.
@@ -91,7 +95,10 @@ pub fn get(app: &App, id: RegionId) -> Region {
     match id {
         RegionId::Main => app.view.selection_region,
         RegionId::Loading => app.view.loading_selection_region,
+        RegionId::Goal => app.view.goal_selection_region,
         RegionId::BottomApp => app.view.bottom_app_selection_region,
+        RegionId::RailWindow => app.view.rail_window_selection_region,
+        RegionId::CodePreview => app.code_preview.selection,
     }
 }
 
@@ -125,7 +132,8 @@ pub fn spans(app: &App, buf: &Buffer, chat: Rect) -> Vec<RowSpan> {
         _ => area,
     };
     let chrome = selection.owner == RegionId::Main;
-    let gutters: &[RowSpan] = if chrome { &app.view.diff_hitmap } else { &[] };
+    let row_chrome: &[RowChrome] = if chrome { &app.view.chrome_hitmap } else { &[] };
+    let raw: &[(u16, u16)] = if chrome { &app.view.raw_hitmap } else { &[] };
     let spans = resolve(
         Flow {
             selection: (selection.anchor, selection.head),
@@ -136,13 +144,15 @@ pub fn spans(app: &App, buf: &Buffer, chat: Rect) -> Vec<RowSpan> {
         app.selection.granularity,
         buf,
         area,
-        gutters,
+        row_chrome,
+        raw,
         false,
     );
     if !chrome {
         // A bottom-app box cuts its chrome cells (option prefixes, scrollbars) out of its row spans.
         let gaps = match selection.owner {
             RegionId::BottomApp => &app.view.bottom_app_selection_chrome,
+            RegionId::CodePreview => &app.code_preview.gutters,
             _ => return spans,
         };
         return spans
@@ -177,6 +187,7 @@ pub fn extract_document(app: &App) -> Option<String> {
             &document.buffer,
             document.area,
             &[],
+            &[],
             true,
         );
         return Some(document.extract(&spans));
@@ -196,7 +207,8 @@ pub fn extract_document(app: &App) -> Option<String> {
         app.selection.granularity,
         &document.buffer,
         document.area,
-        &document.gutters,
+        &document.chrome,
+        &document.raw,
         true,
     );
     spans.retain(|(y, _, _)| document.margins.binary_search(y).is_err());
@@ -214,6 +226,7 @@ pub fn selectable(app: &App, at: (u16, u16), owner: RegionId) -> bool {
     let chrome = match owner {
         RegionId::Main => &app.view.selection_chrome,
         RegionId::BottomApp => &app.view.bottom_app_selection_chrome,
+        RegionId::CodePreview => &app.code_preview.gutters,
         _ => return true,
     };
     !chrome
@@ -264,6 +277,10 @@ pub fn extract(buf: &Buffer, spans: &[RowSpan]) -> String {
 pub fn folds(app: &App, id: RegionId) -> Folds {
     match id {
         RegionId::BottomApp => app.view.bottom_app_selection_folds.clone(),
-        RegionId::Main | RegionId::Loading => Folds::default(),
+        RegionId::Main
+        | RegionId::Loading
+        | RegionId::CodePreview
+        | RegionId::Goal
+        | RegionId::RailWindow => Folds::default(),
     }
 }
