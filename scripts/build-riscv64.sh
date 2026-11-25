@@ -155,8 +155,33 @@ PY
 # Dropping the target runtime is only safe while nothing imports it. If
 # upstream starts importing it, --version/--help would still pass while real
 # features break, so refuse to build instead.
-harness_imports="$(grep -rnE '^\s*(from|import)\s+mistralai\.vibe\.harness|import_module\(\s*["'"'"']mistralai\.vibe\.harness|from\s+mistralai\.vibe\s+import\s+harness' \
+harness_hits="$(grep -rnE '^\s*(from|import)\s+mistralai\.vibe\.harness|import_module\(\s*["'"'"']mistralai\.vibe\.harness|from\s+mistralai\.vibe\s+import\s+harness' \
   --include='*.py' vibe harness/runtimes/python/python || true)"
+# A module that only tests import never loads in the binary, so its import
+# does not count. Since v3.1.5 vibe/app_server/_target_session_errors.py is
+# such a module. Anything else importing the module (absolute, relative,
+# "from pkg import mod", or a dotted name in a lazy-import table) keeps the
+# hit and fails the build.
+harness_imports=""
+while IFS= read -r hit; do
+  [[ -z "$hit" ]] && continue
+  file="${hit%%:*}"
+  mod="${file%.py}"
+  mod="${mod#harness/runtimes/python/python/}"
+  mod="${mod//\//.}"
+  base="${mod##*.}"
+  if [[ "$base" == "__init__" ]]; then
+    harness_imports+="$hit"$'\n'
+    continue
+  fi
+  mod_re="${mod//./\\.}"
+  if grep -rqE "^\s*(from|import)\s+${mod_re}\b|^\s*from\s+\.+${base}\s+import|^\s*from\s+[.[:alnum:]_]+\s+import\s+.*\b${base}\b|[\"']${mod_re}[\"']" \
+    --include='*.py' vibe harness/runtimes/python/python 2>/dev/null; then
+    harness_imports+="$hit"$'\n'
+  else
+    info "Ignoring $file: only tests import it"
+  fi
+done <<<"$harness_hits"
 if [[ -n "$harness_imports" ]]; then
   error "Upstream now imports mistralai.vibe.harness, which has no riscv64 build:"
   echo "$harness_imports" >&2
