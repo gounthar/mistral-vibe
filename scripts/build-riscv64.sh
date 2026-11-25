@@ -202,8 +202,8 @@ for root in (Path("vibe"), Path("harness/runtimes/python/python")):
         package = name.split(".") if is_pkg else name.split(".")[:-1]
         try:
             tree = ast.parse(path.read_text(encoding="utf-8"), str(path))
-        except (SyntaxError, UnicodeDecodeError) as exc:
-            print(f"{path}: cannot parse ({exc}), counting it as an importer")
+        except (OSError, SyntaxError, UnicodeDecodeError) as exc:
+            print(f"{path}: cannot read or parse ({exc}), counting it as an importer")
             sys.exit(0)
         for node in ast.walk(tree):
             names = []
@@ -222,7 +222,9 @@ for root in (Path("vibe"), Path("harness/runtimes/python/python")):
             if any(hits(n) for n in names):
                 print(f"{path}:{node.lineno} imports {target}")
                 sys.exit(0)
-sys.exit(1)
+# Only this exit code means "not imported". Any other status, including a
+# crash of this script, keeps the hit.
+sys.exit(3)
 PY
 }
 
@@ -230,10 +232,14 @@ harness_imports=""
 while IFS= read -r hit; do
   [[ -z "$hit" ]] && continue
   file="${hit%%:*}"
-  if [[ "$(basename "$file")" == "__init__.py" ]] || module_imported "$file"; then
-    harness_imports+="$hit"$'\n'
-  else
+  rc=0
+  if [[ "$(basename "$file")" != "__init__.py" ]]; then
+    module_imported "$file" || rc=$?
+  fi
+  if [[ $rc -eq 3 ]]; then
     info "Ignoring $file: nothing in vibe/ or the local harness imports it"
+  else
+    harness_imports+="$hit"$'\n'
   fi
 done <<<"$harness_hits"
 if [[ -n "$harness_imports" ]]; then
