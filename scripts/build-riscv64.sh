@@ -159,27 +159,81 @@ harness_hits="$(grep -rnE '^\s*(from|import)\s+mistralai\.vibe\.harness|import_m
   --include='*.py' vibe harness/runtimes/python/python || true)"
 # A module that only tests import never loads in the binary, so its import
 # does not count. Since v3.1.5 vibe/app_server/_target_session_errors.py is
-# such a module. Anything else importing the module (absolute, relative,
-# "from pkg import mod", or a dotted name in a lazy-import table) keeps the
-# hit and fails the build.
+# such a module. The check parses every module under vibe/ and the local
+# harness with ast, so multi-line and relative imports resolve like Python
+# resolves them; the dotted name as a string (lazy-import tables) counts too.
+# A file that does not parse counts as an importer: fail closed.
+module_imported() {
+  python3 - "$1" <<'PY'
+import ast
+import sys
+from pathlib import Path
+
+target_file = Path(sys.argv[1])
+roots = [Path("harness/runtimes/python/python"), Path(".")]
+
+
+def module_name(path):
+    for root in roots:
+        try:
+            rel = path.relative_to(root)
+        except ValueError:
+            continue
+        parts = list(rel.with_suffix("").parts)
+        is_pkg = parts[-1] == "__init__"
+        if is_pkg:
+            parts = parts[:-1]
+        return ".".join(parts), is_pkg
+    raise SystemExit(f"{path} is outside the scanned roots")
+
+
+target, _ = module_name(target_file)
+
+
+def hits(name):
+    return name == target or name.startswith(target + ".")
+
+
+for root in (Path("vibe"), Path("harness/runtimes/python/python")):
+    for path in sorted(root.rglob("*.py")):
+        if path == target_file:
+            continue
+        name, is_pkg = module_name(path)
+        package = name.split(".") if is_pkg else name.split(".")[:-1]
+        try:
+            tree = ast.parse(path.read_text(encoding="utf-8"), str(path))
+        except (SyntaxError, UnicodeDecodeError) as exc:
+            print(f"{path}: cannot parse ({exc}), counting it as an importer")
+            sys.exit(0)
+        for node in ast.walk(tree):
+            names = []
+            if isinstance(node, ast.Import):
+                names = [a.name for a in node.names]
+            elif isinstance(node, ast.ImportFrom):
+                if node.level:
+                    keep = len(package) - (node.level - 1)
+                    base = package[:keep] if keep > 0 else []
+                    mod = ".".join(base + ([node.module] if node.module else []))
+                else:
+                    mod = node.module or ""
+                names = [mod] + [f"{mod}.{a.name}" for a in node.names]
+            elif isinstance(node, ast.Constant) and isinstance(node.value, str):
+                names = [node.value]
+            if any(hits(n) for n in names):
+                print(f"{path}:{node.lineno} imports {target}")
+                sys.exit(0)
+sys.exit(1)
+PY
+}
+
 harness_imports=""
 while IFS= read -r hit; do
   [[ -z "$hit" ]] && continue
   file="${hit%%:*}"
-  mod="${file%.py}"
-  mod="${mod#harness/runtimes/python/python/}"
-  mod="${mod//\//.}"
-  base="${mod##*.}"
-  if [[ "$base" == "__init__" ]]; then
-    harness_imports+="$hit"$'\n'
-    continue
-  fi
-  mod_re="${mod//./\\.}"
-  if grep -rqE "^\s*(from|import)\s+${mod_re}\b|^\s*from\s+\.+${base}\s+import|^\s*from\s+[.[:alnum:]_]+\s+import\s+.*\b${base}\b|[\"']${mod_re}[\"']" \
-    --include='*.py' vibe harness/runtimes/python/python 2>/dev/null; then
+  if [[ "$(basename "$file")" == "__init__.py" ]] || module_imported "$file"; then
     harness_imports+="$hit"$'\n'
   else
-    info "Ignoring $file: only tests import it"
+    info "Ignoring $file: nothing in vibe/ or the local harness imports it"
   fi
 done <<<"$harness_hits"
 if [[ -n "$harness_imports" ]]; then
